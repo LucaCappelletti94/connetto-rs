@@ -1293,6 +1293,7 @@ dependencies = [
  "rustix",
  "rustls",
  "security-framework",
+ "send_wrapper",
  "serde",
  "serde_bytes",
  "serde_json",

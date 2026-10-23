@@ -26,13 +26,15 @@ use crate::auth::{KeyringKeyStore, NativeAuthenticator, remembered_account};
 use crate::builder::content::{AttachContent, ContentPlace};
 use crate::builder::core::{
     Base, BoxedDialer, ClientBuilder, CoreClient, CoreDurable, CorePump, CoreSignedIn, DialFailure,
-    Located, ReplicaPlace, ShareKeys, base_setters,
+    Located, ReplicaPlace, base_setters,
 };
 use crate::builder::gate::Gate;
 use crate::builder::schema::SyncSchema;
 #[cfg(feature = "native-auth")]
 use crate::builder::sign_in::{AccountChoice, Keyring};
-use crate::builder::sign_in::{HeldCredential, NativeSignIn, NoKeyring, SignInKind, StorageMarker};
+use crate::builder::sign_in::{
+    Held, HeldCredential, NativeSignIn, NoKeyring, SignInKind, StorageMarker,
+};
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
 #[cfg(feature = "peer")]
@@ -42,6 +44,9 @@ use crate::enrolment::{CertificateError, DeviceKeys, EnrolHandle, Enroller, Plat
 use crate::reconnect::ReconnectPolicy;
 #[cfg(feature = "native-auth")]
 use crate::replica::encode_identity;
+#[cfg(feature = "native-auth")]
+use crate::share_keys::share_key_record;
+use crate::share_keys::{ErasedShareKeyStore, RefreshStoreShareKeys, ShareKeyStore};
 use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
@@ -250,8 +255,8 @@ where
 ///
 /// The `K` marker says where the credentials live, and so which durable
 /// step compiles. A keyring sign-in moves to `durable(dir)`, a stored
-/// sign-in to `durable(dir, key_store)`, and a held credential to the
-/// latter, because it names no keyring.
+/// sign-in to `durable(dir, key_store)`, and a held credential to
+/// `durable(dir, key_store, share_key_store)`, because it names no keyring.
 pub struct NativeSignedIn<T: Transport, C, K: StorageMarker> {
     base: Base<T, C>,
     kind: SignInKind,
@@ -371,6 +376,7 @@ where
             storage: self.storage,
             data_dir: data_dir.into(),
             key_store,
+            share_key_store: None,
             gate: Gate::default(),
             mechanism: None,
             #[cfg(feature = "device-identity")]
@@ -425,6 +431,7 @@ where
             storage: self.storage,
             data_dir: data_dir.into(),
             key_store,
+            share_key_store: None,
             gate: Gate::default(),
             mechanism: None,
             #[cfg(feature = "device-identity")]
@@ -433,17 +440,60 @@ where
     }
 }
 
-/// The durable stage, a replica file under a key beside a content
-/// directory, gated on the away input when the gate is on.
+impl<T, C> NativeSignedIn<T, C, Held>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+    C: AttachContent<T>,
+{
+    /// Move to the durable stage, naming the replica-key store and the
+    /// share-key store the build will use.
+    ///
+    /// A held credential names no keyring, so the durable step takes both
+    /// stores itself, and the share-key store persists the build's share
+    /// keys beside its other records.
+    #[must_use]
+    pub fn durable<KS, SS>(
+        self,
+        data_dir: impl Into<PathBuf>,
+        key_store: KS,
+        share_key_store: SS,
+    ) -> NativeDurable<T, C, Held, KS>
+    where
+        KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+        SS: ShareKeyStore<Error = ClientError> + Send + Sync + 'static,
+    {
+        let share_key_store: Option<ErasedShareKeyStore> = Some(Arc::new(share_key_store));
+        NativeDurable {
+            base: self.base,
+            kind: self.kind,
+            storage: self.storage,
+            data_dir: data_dir.into(),
+            key_store,
+            share_key_store,
+            gate: Gate::default(),
+            mechanism: None,
+            #[cfg(feature = "device-identity")]
+            device: DeviceSetup::default(),
+        }
+    }
+}
+
+/// The durable stage, a replica file under a key beside its share keys and
+/// a content directory, gated on the away input when the gate is on.
 ///
 /// Only this stage has the data directory, the key store and the gate,
-/// because a build that names a file names its key and its lock together.
+/// because a build that names a file names its key, its keys and its lock
+/// together.
 pub struct NativeDurable<T: Transport, C, K: StorageMarker, KS> {
     base: Base<T, C>,
     kind: SignInKind,
     storage: K,
     data_dir: PathBuf,
     key_store: KS,
+    /// The share-key store the build named, if it named one, the refresh
+    /// store standing in for it otherwise.
+    share_key_store: Option<ErasedShareKeyStore>,
     gate: Gate,
     mechanism: Option<Arc<dyn GateMechanism>>,
     #[cfg(feature = "device-identity")]
@@ -778,11 +828,15 @@ where
         let (session, teardown) = {
             let name = resolved.credential.replica_name().to_owned();
             let (session, authenticator) = resolved.provider.unzip();
+            let share_key_store = core.share_key_store.clone();
+            let share_record = share_key_record(&name);
             let teardown: Box<dyn Forget> = Box::new(ReplicaTeardown {
                 authenticator,
                 path: core.place.0.join(&name),
                 name,
                 key_store,
+                share_key_store,
+                share_record,
             });
             (session, Some(teardown))
         };
@@ -1108,11 +1162,26 @@ where
             .into_iter()
             .collect();
         let key_store = Arc::new(self.key_store);
+        let share_key_store = self
+            .share_key_store
+            .clone()
+            .or_else(|| {
+                let store: ErasedShareKeyStore = self
+                    .storage
+                    .refresh_store()
+                    .map(RefreshStoreShareKeys)
+                    .map(Arc::new)?;
+                Some(store)
+            })
+            .ok_or_else(|| {
+                ClientError::Auth("the durable build named no store for its share keys".to_owned())
+            })?;
         let core = CoreDurable {
             base: self.base,
             credential: resolved.credential.clone(),
             place: DataDir(self.data_dir),
             key_store: SharedKeys(Arc::clone(&key_store)),
+            share_key_store,
             claims,
             gate: self.gate,
             mechanism,
@@ -1664,6 +1733,8 @@ struct ReplicaTeardown<KS> {
     path: PathBuf,
     name: String,
     key_store: Arc<KS>,
+    share_key_store: ErasedShareKeyStore,
+    share_record: String,
 }
 
 #[cfg(feature = "native-auth")]
@@ -1677,7 +1748,7 @@ where
         force: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>> {
         Box::pin(async move {
-            match &self.authenticator {
+            let forgotten = match &self.authenticator {
                 Some(authenticator) => {
                     forget_device(
                         authenticator,
@@ -1698,7 +1769,15 @@ where
                 )
                 .await
                 .map_err(ForgetError::from),
+            };
+            // Local secret cleanup is required even when revocation cannot be confirmed.
+            if matches!(forgotten, Ok(()) | Err(ForgetError::NotRevoked(_))) {
+                self.share_key_store
+                    .clear(&self.share_record)
+                    .await
+                    .map_err(|err| ForgetError::Purge(PurgeError::KeyStore(err.to_string())))?;
             }
+            forgotten
         })
     }
 }

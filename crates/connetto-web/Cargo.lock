@@ -409,6 +409,7 @@ dependencies = [
  "libsqlite3-sys",
  "parking_lot",
  "rustix",
+ "send_wrapper",
  "serde",
  "serde_json",
  "sha2",

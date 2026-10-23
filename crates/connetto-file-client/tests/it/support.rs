@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use connetto_client::live::ConnettoClient;
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Gate, Grant, HeldCredential,
-    Located, ReplicaKey, ReplicaPlace, SyncSchema,
+    Located, MemoryRefreshStore, ReplicaKey, ReplicaPlace, SyncSchema,
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
@@ -320,7 +320,11 @@ where
         HeldCredential::new(Grant::new("user:tester"), "tester")
             .expect("a string identity serializes"),
     )
-    .durable(At(path.to_path_buf()), FixedKey)
+    .durable(
+        At(path.to_path_buf()),
+        FixedKey,
+        MemoryRefreshStore::default(),
+    )
     .with_gate(Gate::off())
     .open_driven()
     .await

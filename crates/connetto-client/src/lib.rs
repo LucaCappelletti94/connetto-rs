@@ -7,8 +7,11 @@ pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
 #[cfg(feature = "peer")]
 pub use connetto_peer::{CloseReason, LinkError, Refusal};
+use share_keys::ShareKeyPersistence;
+pub use share_keys::{ShareKeyFuture, ShareKeySet, ShareKeyStore};
 
 use connetto_core::SUBJECTS_FUNCTION;
+use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::chain::{GENESIS, entry_hash};
 #[cfg(feature = "peer")]
 use connetto_core::device_cert::DeviceIdentity;
@@ -17,8 +20,8 @@ use connetto_core::device_cert::DeviceKey;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
-    MutationReject, MutationRejectReason, Ping, Provenance, RetireWriter, Subscribe,
-    SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
+    MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys, RetireWriter,
+    Subscribe, SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -83,6 +86,7 @@ mod memory_stores;
 mod multicast;
 pub mod reconnect;
 pub mod replica;
+pub mod share_keys;
 mod subscriptions;
 mod synced_schema;
 
@@ -745,19 +749,14 @@ pub struct ResidualPressure {
 #[derive(Debug, Clone)]
 struct SubjectSource {
     function: String,
-    separator: char,
-    keys: Vec<(Grant, String)>,
+    set: ShareKeySet,
 }
 
 impl SubjectSource {
-    /// The value the registered function answers at `now`, or `None` when the
-    /// caller holds no key that is still alive.
-    ///
-    /// Sorted and deduplicated, so one holder renders one value whatever order
-    /// its keys arrived in, and joined by the deployment's own separator, which
-    /// no single key may contain.
-    fn rendered(&self, now: i64) -> Option<String> {
+    /// The live subjects at `now`, sorted and deduplicated.
+    fn live_subjects(&self, now: i64) -> Vec<&str> {
         let mut alive: Vec<&str> = self
+            .set
             .keys
             .iter()
             .filter(|(grant, _)| !grant_expiry::has_expired(grant, now))
@@ -765,12 +764,23 @@ impl SubjectSource {
             .collect();
         alive.sort_unstable();
         alive.dedup();
-        (!alive.is_empty()).then(|| alive.join(&self.separator.to_string()))
+        alive
+    }
+
+    /// The value the registered function answers at `now`, or `None` when the
+    /// caller holds no key that is still alive.
+    ///
+    /// Sorted and deduplicated, so one holder renders one value whatever order
+    /// its keys arrived in, and joined by the deployment's own separator, which
+    /// no single key may contain.
+    fn rendered(&self, now: i64) -> Option<String> {
+        let alive = self.live_subjects(now);
+        (!alive.is_empty()).then(|| alive.join(&self.set.separator.to_string()))
     }
 
     /// Every grant the handshake should present for these keys.
     fn grants(&self) -> impl Iterator<Item = &Grant> {
-        self.keys.iter().map(|(grant, _)| grant)
+        self.set.keys.iter().map(|(grant, _)| grant)
     }
 }
 
@@ -918,8 +928,7 @@ impl ClientConfig {
     ) -> Self {
         self.subjects = Some(SubjectSource {
             function: SUBJECTS_FUNCTION.to_owned(),
-            separator,
-            keys,
+            set: ShareKeySet::rendered(separator, keys),
         });
         self
     }
@@ -1331,6 +1340,11 @@ pub enum ClientEvent {
         /// The host's device.
         host: crate::bluetooth::HostId,
     },
+    /// The server accepted a share-key replacement and queued its authorization resends.
+    ShareKeysReplaced {
+        /// The correlation token the swap it answers carried.
+        request_id: String,
+    },
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -1423,6 +1437,58 @@ impl ResendTimer {
         self.wait
     }
 }
+
+/// Computed declarations awaiting a correlated server-processing fence.
+#[derive(Debug, Clone)]
+struct DeclarationFence {
+    /// The nonce the pong must carry, drawn from the high-bit namespace so it
+    /// cannot collide with the application's own pings.
+    nonce: u64,
+    /// The instant the answer bound expires.
+    deadline: Duration,
+    /// The declarations counted when the fence went out.
+    count: u64,
+    /// The computed `sub_id`s declared before the fence, dropped on the pong.
+    sub_ids: Vec<String>,
+}
+
+/// A share-key replacement awaiting its correlated answer.
+#[derive(Debug, Clone)]
+struct ShareKeyRequest {
+    /// The correlation token the answer quotes.
+    request_id: String,
+    /// The generation the swap carried.
+    generation: u64,
+    /// The instant the answer bound expires.
+    deadline: Duration,
+}
+
+/// The next share-key wake for a pump driver.
+#[derive(Debug, Clone, Copy)]
+pub struct ShareKeyTimer {
+    /// How many times the timer was armed, so a pump tells a fresh one from the
+    /// one it sleeps on.
+    armed: u64,
+    /// The instant the next share-key work is due.
+    deadline: Duration,
+}
+
+impl ShareKeyTimer {
+    /// How long to wait before the next share-key work.
+    #[must_use]
+    pub fn wait(&self) -> Duration {
+        self.deadline
+            .saturating_sub(crate::away::SystemClock.monotonic())
+    }
+}
+
+impl PartialEq for ShareKeyTimer {
+    fn eq(&self, other: &Self) -> bool {
+        self.armed == other.armed
+    }
+}
+
+impl Eq for ShareKeyTimer {}
 
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
@@ -1522,7 +1588,7 @@ fn count_ops(changeset: &[u8]) -> u32 {
 
 /// DDL for the replica-local metadata, written only under capture suspension.
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
-    (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
+    (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL, cursor_subjects BLOB); \
     CREATE TABLE IF NOT EXISTS _connetto_writers \
     (id TEXT NOT NULL PRIMARY KEY, next_seq INTEGER NOT NULL, head BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
@@ -2291,44 +2357,55 @@ fn replica_columns(db: &mut SqliteConnection, table: &str) -> Result<Vec<String>
     Ok(rows.into_iter().map(|row| row.name).collect())
 }
 
-/// Record `cursor` in the replica's metadata table.
-///
-/// **Invariant: a resume position is never recorded for data this replica has
-/// not applied.** A resume position is a promise that everything up to it is
-/// already here, and the next attach asks the server only for what follows, so
-/// recording one early loses the rows in between with nothing on either side
-/// able to notice.
-///
-/// Two callers hold it two ways. `apply_patch` writes the rows and the cursor
-/// in one transaction, so a crash cannot separate them. The `SnapshotEnd` arm
-/// of `handle_control` has no rows of its own to bind to and relies on the
-/// server having sent the snapshot first, which it does because the completion
-/// frame shares the delivery queue with the rows it completes (R33). Asserted
-/// by `no_resume_position_is_persisted_for_rows_that_never_arrived`.
-fn persist_cursor(db: &mut SqliteConnection, cursor: &Cursor) -> Result<(), ClientError> {
-    diesel::sql_query(
-        "INSERT INTO _connetto_meta (id, cursor) VALUES (1, ?) \
-         ON CONFLICT (id) DO UPDATE SET cursor = excluded.cursor",
-    )
-    .bind::<diesel::sql_types::Binary, _>(cursor.as_bytes())
-    .execute(db)?;
+mod cursor_metadata {
+    diesel::table! {
+        _connetto_meta (id) {
+            id -> Integer,
+            cursor -> Binary,
+            cursor_subjects -> Nullable<Binary>,
+        }
+    }
+}
+
+use cursor_metadata::_connetto_meta;
+
+/// Persist coverage with the cursor only after its data has been applied.
+fn persist_cursor_and_subjects(
+    db: &mut SqliteConnection,
+    cursor: &Cursor,
+    subjects: Option<&[String]>,
+) -> Result<(), ClientError> {
+    let cursor = cursor.as_bytes();
+    let subjects = subjects
+        .map(|subjects| serde_json::to_vec(subjects).expect("compact JSON of subject names"));
+    diesel::insert_into(_connetto_meta::table)
+        .values((
+            _connetto_meta::id.eq(1),
+            _connetto_meta::cursor.eq(cursor),
+            _connetto_meta::cursor_subjects.eq(subjects.as_deref()),
+        ))
+        .on_conflict(_connetto_meta::id)
+        .do_update()
+        .set((
+            _connetto_meta::cursor.eq(cursor),
+            _connetto_meta::cursor_subjects.eq(subjects.as_deref()),
+        ))
+        .execute(db)
+        .map_err(|_| ClientError::Protocol("durable cursor write".into()))?;
     Ok(())
 }
 
-/// The cursor persisted by a previous run against this replica, if any.
-fn load_cursor(db: &mut SqliteConnection) -> Option<Cursor> {
-    #[derive(diesel::QueryableByName)]
-    struct MetaRow {
-        #[diesel(sql_type = diesel::sql_types::Binary)]
-        cursor: Vec<u8>,
-    }
-    let rows: Vec<MetaRow> = diesel::sql_query("SELECT cursor FROM _connetto_meta WHERE id = 1")
-        .load(db)
+/// The cursor the server had when the last applied patch arrived, with the
+/// coverage that was applied at that cursor, or `None` before the first
+/// applied patch.
+fn load_cursor_and_subjects(db: &mut SqliteConnection) -> Option<(Cursor, Option<Vec<String>>)> {
+    let (bytes, subjects) = _connetto_meta::table
+        .find(1)
+        .select((_connetto_meta::cursor, _connetto_meta::cursor_subjects))
+        .first::<(Vec<u8>, Option<Vec<u8>>)>(&mut *db)
         .ok()?;
-    rows.into_iter()
-        .next()
-        .map(|row| Cursor::new(row.cursor))
-        .filter(|cursor| !cursor.is_empty())
+    let subjects = subjects.and_then(|subjects| serde_json::from_slice(&subjects).ok());
+    Some((Cursor::new(bytes), subjects)).filter(|(cursor, _)| !cursor.is_empty())
 }
 
 /// The client sequence as the storage integer.
@@ -2760,10 +2837,16 @@ struct HandshakeInput<'a> {
     settled_through: Option<u64>,
     /// The replica's clock, used to drop a share key whose expiry passed.
     now: i64,
+    /// The coverage last applied at the resume cursor, presented with it.
+    cursor_subjects: Option<&'a [String]>,
 }
 
 /// Run the opening handshake and read the ack, shared by the first connect
 /// and every resume.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The opening exchange keeps its ordered protocol checks together."
+)]
 async fn exchange_handshake<T>(
     transport: &mut T,
     input: HandshakeInput<'_>,
@@ -2780,12 +2863,13 @@ where
         writer,
         settled_through,
         now,
+        cursor_subjects,
     } = input;
     let mut grants = Vec::with_capacity(
         1 + config
             .subjects
             .as_ref()
-            .map_or(0, |subjects| subjects.keys.len()),
+            .map_or(0, |subjects| subjects.set.keys.len()),
     );
     match token_source {
         Some(source) => grants.push(Grant::new(source.token().await?)),
@@ -2811,6 +2895,9 @@ where
     }
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
+        if let Some(subjects) = cursor_subjects {
+            handshake = handshake.with_cursor_subjects(subjects.iter().cloned());
+        }
     }
     // The credential proving the previous run's handle is this caller's. The
     // server refuses one it did not sign, and an identified run takes its
@@ -2941,6 +3028,29 @@ struct Run {
     schema_version: Option<SchemaVersion>,
 }
 
+/// The bound a share-key swap or a declaration fence waits on its answer for.
+const SHARE_KEY_REQUEST_WAIT: Duration = Duration::from_secs(30);
+
+static NEXT_SHARE_KEY_REQUEST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh request id for a share-key swap this connection will send.
+fn share_key_request_id() -> String {
+    format!(
+        "share-key-{}",
+        NEXT_SHARE_KEY_REQUEST.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+static NEXT_DECLARATION_FENCE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// A fresh declaration-fence nonce in the high-bit namespace, disjoint from
+/// the nonces an application hands its own pings.
+fn declaration_fence_nonce() -> u64 {
+    (1u64 << 63) | NEXT_DECLARATION_FENCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// One live socket and the label the server gave it.
 ///
 /// Present exactly while this connection can reach a server. Absent before the
@@ -3032,6 +3142,10 @@ impl Stale {
 /// it and capturing writes into the pending queue all work with nothing to talk
 /// to, and [`attach`](Self::attach) is what later gives it a server. That is
 /// what lets an application start with no network and sync when one appears.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent capture, replay and persistence obligations can overlap."
+)]
 pub struct ConnettoConnection<T: Transport> {
     /// The live socket, absent when no server is reachable.
     wire: Option<Wire<T>>,
@@ -3131,6 +3245,43 @@ pub struct ConnettoConnection<T: Transport> {
     /// Whether this connection already emptied every subscribed table for a
     /// cursor past where its timeline ended (R73).
     history_cleared: bool,
+    /// Subjects durably covering the cursor, or `None` while coverage is unknown.
+    cursor_subjects: Option<Vec<String>>,
+    /// Row declarations and deliveries awaiting their ordered completion.
+    open_snapshots: HashSet<String>,
+    /// Tables already emptied by the current attach or key-replacement batch.
+    authorization_cleared: Option<HashSet<String>>,
+    /// Computed declarations awaiting a successful fence or retirement.
+    unfenced_computed: HashSet<String>,
+    /// Declarations awaiting an ordered server-processing fence.
+    unfenced_count: u64,
+    /// The correlated declaration-processing fence in flight.
+    declaration_fence: Option<DeclarationFence>,
+    /// Generation advanced by accepted additions, removals and expiry.
+    share_key_generation: u64,
+    /// Latest key generation accepted by a handshake or replacement.
+    share_key_settled: u64,
+    /// The share-key swap sent and awaiting its answer, at most one at a time.
+    share_key_request: Option<ShareKeyRequest>,
+    /// When a rate-limited swap may go out again, absent when none owes a
+    /// delay.
+    share_key_retry_at: Option<Duration>,
+    /// The durable share-key set's persistence, present on a store-backed
+    /// connection.
+    share_key_persistence: Option<ShareKeyPersistence>,
+    /// A changed share-key set still owed its save to the store.
+    share_key_save_pending: bool,
+    /// The earliest parsed expiry of a held key, refreshed at every set
+    /// change, so an unrelated frame never parses a grant.
+    share_key_expiry: Option<i64>,
+    /// Earliest expiry, retry or correlated-answer deadline.
+    share_key_deadline: Option<Duration>,
+    /// How many times the share-key timer was armed, so a pump tells a fresh
+    /// one from the one it sleeps on.
+    share_key_armed: u64,
+    /// Whether the durable share-key set is already loaded into the subject
+    /// source this connection, so a reconnect re-attach skips it.
+    share_key_loaded: bool,
     /// Whether the replica is backed by a file rather than `:memory:`. An
     /// in-memory replica has no durable key, so `custody()` overrides the
     /// configured level to `Ephemeral` whenever this is false.
@@ -3150,6 +3301,7 @@ pub struct ConnettoConnection<T: Transport> {
 }
 
 /// The schema and metadata tables an open installs, in dependency order.
+#[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
     sqlite_ddl: Option<&str>,
@@ -3163,6 +3315,12 @@ fn install_replica_schema(
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
     check_recorded_tables(db, "main", &config.unrecorded_tables)?;
     db.batch_execute(META_DDL)?;
+    match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
+        Ok(()) => {}
+        Err(diesel::result::Error::DatabaseError(_, info))
+            if info.message().contains("duplicate column name") => {}
+        Err(error) => return Err(error.into()),
+    }
     db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
     // After the subscription tables, since it references `_connetto_query`.
     db.batch_execute(aggregates::AGGREGATE_DDL)?;
@@ -3247,6 +3405,10 @@ where
     /// Shared open body: open the database, unlock the page codec, apply the
     /// schema when it arrives as DDL, and hook the capture session. No
     /// handshake happens here, which is the whole point.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Replica initialization establishes the connection's state together."
+    )]
     fn open_inner<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
         sqlite_ddl: Option<&str>,
@@ -3311,7 +3473,16 @@ where
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
         // queues a previous run left, entries and all, come along for replay.
-        let resume = resume.or_else(|| load_cursor(&mut db));
+        let stored = if resume.is_none() {
+            load_cursor_and_subjects(&mut db)
+        } else {
+            None
+        };
+        let (resume, cursor_subjects) = match (resume, stored) {
+            (Some(resume), _) => (Some(resume), None),
+            (None, Some((cursor, subjects))) => (Some(cursor), subjects),
+            (None, None) => (None, None),
+        };
         let (writers, next_position) = load_writer_queues(&mut db)?;
         #[cfg(feature = "device-identity")]
         let retired_keys = load_retired_keys(&mut db)?;
@@ -3378,6 +3549,22 @@ where
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
             history_cleared: false,
+            cursor_subjects,
+            open_snapshots: HashSet::new(),
+            authorization_cleared: None,
+            unfenced_computed: HashSet::new(),
+            unfenced_count: 0,
+            declaration_fence: None,
+            share_key_generation: 0,
+            share_key_settled: 0,
+            share_key_request: None,
+            share_key_retry_at: None,
+            share_key_persistence: None,
+            share_key_save_pending: false,
+            share_key_expiry: None,
+            share_key_deadline: None,
+            share_key_armed: 0,
+            share_key_loaded: false,
             // A key is what custody is about, so the absence of one is the
             // signal rather than the path: `Replica::in_memory` is the only
             // constructor that carries none, and `encrypted_file` refuses
@@ -3391,6 +3578,8 @@ where
             list_sink: None,
         };
         conn.attach_tier(replica.tier())?;
+        conn.refresh_share_key_expiry();
+        conn.recompute_share_key_deadline();
         Ok(conn)
     }
 
@@ -3504,6 +3693,8 @@ where
     /// transport, and one that had nothing stays usable for local reads.
     pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
         let now = clock::now_secs(&mut self.db)?;
+        // Durable authorization is loaded before the first handshake.
+        self.prepare_share_keys().await?;
         let (writer, settled_through) = self.writer_handshake()?;
         let ack = match exchange_handshake(
             &mut transport,
@@ -3511,6 +3702,7 @@ where
                 config: &self.config,
                 token_source: self.token_source.as_ref(),
                 resume: self.last_cursor.as_ref(),
+                cursor_subjects: self.cursor_subjects.as_deref(),
                 resume_token: self.run.as_ref().map(|run| run.resume_token.as_str()),
                 writer,
                 settled_through,
@@ -3550,6 +3742,8 @@ where
         });
         self.history_cleared = false;
         self.bound_writer = bound;
+        self.share_key_settled = self.share_key_generation;
+        self.authorization_cleared = Some(HashSet::new());
         self.attach_replay = AttachReplay::Pending { frontier };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
@@ -4420,6 +4614,15 @@ where
         }
         #[cfg(feature = "device-identity")]
         self.enrol_waiters.clear();
+        // Desired keys and durable coverage survive a transport failure.
+        self.share_key_request = None;
+        self.declaration_fence = None;
+        self.share_key_retry_at = None;
+        self.open_snapshots.clear();
+        self.authorization_cleared = None;
+        self.unfenced_computed.clear();
+        self.unfenced_count = 0;
+        self.recompute_share_key_deadline();
         if self.wire.take().is_some() {
             self.notices
                 .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
@@ -4429,6 +4632,455 @@ where
     /// Drop the current transport while preserving the resumable session.
     pub fn disconnect(&mut self) {
         self.disconnected();
+    }
+
+    /// Run due share-key work, deferring secret writes while `persist` is `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when checkpoint or secret persistence fails.
+    pub async fn process_share_keys(&mut self, persist: bool) -> Result<bool, ClientError> {
+        self.check_share_key_deadlines();
+        let due = self
+            .share_key_deadline
+            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at);
+        let changed = if due {
+            self.expire_share_keys(persist).await?
+        } else {
+            false
+        };
+        if persist
+            && self.share_key_save_pending
+            && let Some(store) = &self.share_key_persistence
+        {
+            let set = self.share_key_set();
+            store.save(set).await?;
+            self.share_key_save_pending = false;
+        }
+        Ok(changed)
+    }
+
+    /// The next share-key wake, if any, for a driver to sleep on and rerun
+    /// [`process_share_keys`](Self::process_share_keys) when it lands.
+    #[must_use]
+    pub fn share_key_timer(&self) -> Option<ShareKeyTimer> {
+        self.share_key_deadline.map(|deadline| ShareKeyTimer {
+            armed: self.share_key_armed,
+            deadline,
+        })
+    }
+
+    /// Set the secret store before preparing the durable connection.
+    pub(crate) fn initialize_share_key_store(&mut self, store: ShareKeyPersistence) {
+        self.share_key_persistence = Some(store);
+    }
+
+    /// Merge stored and builder keys before exposing a durable replica.
+    pub(crate) async fn prepare_share_keys(&mut self) -> Result<(), ClientError> {
+        if self.share_key_loaded {
+            return Ok(());
+        }
+        let now = clock::now_secs(&mut self.db)?;
+        self.load_share_key_store(now).await?;
+        self.share_key_loaded = true;
+        Ok(())
+    }
+
+    /// The share keys this connection holds, as the durable set renders them.
+    fn share_key_set(&self) -> &ShareKeySet {
+        static EMPTY: ShareKeySet = ShareKeySet {
+            separator: ' ',
+            keys: Vec::new(),
+        };
+        self.config
+            .subjects
+            .as_ref()
+            .map_or(&EMPTY, |source| &source.set)
+    }
+
+    /// Refresh the cached earliest expiry of a held key, at a set change
+    /// alone, so an unrelated frame never parses a grant.
+    fn refresh_share_key_expiry(&mut self) {
+        self.share_key_expiry = self
+            .config
+            .subjects
+            .iter()
+            .flat_map(|subjects| subjects.set.keys.iter().map(|(grant, _)| grant))
+            .filter_map(grant_expiry::expiry_of)
+            .min();
+    }
+
+    /// Recompute the instant the next share-key work is due, arming the timer
+    /// when it moves.
+    fn recompute_share_key_deadline(&mut self) {
+        let now = crate::away::SystemClock.monotonic();
+        let mut deadline = self.share_key_retry_at.filter(|at| *at > now);
+        if let Some(expiry) = self.share_key_expiry {
+            let remaining = if expiry <= 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(u64::try_from(expiry).expect("a positive i64 fits a u64"))
+                    .saturating_sub(crate::away::SystemClock.wall())
+            };
+            deadline = Some(match deadline {
+                Some(armed) => armed.min(now + remaining),
+                None => now + remaining,
+            });
+        }
+        if let Some(request) = &self.share_key_request {
+            deadline = match deadline {
+                Some(armed) => Some(armed.min(request.deadline)),
+                None => Some(request.deadline),
+            };
+        }
+        if let Some(fence) = &self.declaration_fence {
+            deadline = match deadline {
+                Some(armed) => Some(armed.min(fence.deadline)),
+                None => Some(fence.deadline),
+            };
+        }
+        if deadline != self.share_key_deadline {
+            self.share_key_deadline = deadline;
+            self.share_key_armed += 1;
+        }
+    }
+
+    /// Drop the connection when a share-key answer overran its bound.
+    fn check_share_key_deadlines(&mut self) {
+        if self
+            .share_key_request
+            .as_ref()
+            .is_some_and(|request| crate::away::SystemClock.monotonic() >= request.deadline)
+            || self
+                .declaration_fence
+                .as_ref()
+                .is_some_and(|fence| crate::away::SystemClock.monotonic() >= fence.deadline)
+        {
+            tracing::warn!("a share-key answer overran its bound, dropping the connection");
+            self.disconnected();
+        }
+    }
+
+    /// Persist unknown coverage before authorization changes.
+    fn invalidate_coverage(&mut self) -> Result<(), ClientError> {
+        if self.cursor_subjects.is_some() {
+            if let Some(cursor) = &self.last_cursor {
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                persist_cursor_and_subjects(&mut self.db, cursor, None)?;
+            }
+            self.cursor_subjects = None;
+        }
+        Ok(())
+    }
+
+    /// Publish the durable coverage now that every frame before the cursor is
+    /// owed by the server, so the cursor may be claimed on a resume.
+    fn publish_coverage(&mut self) -> Result<(), ClientError> {
+        if self.cursor_subjects.is_some()
+            || self.share_key_request.is_some()
+            || self.declaration_fence.is_some()
+            || self.unfenced_count != 0
+            || !self.unfenced_computed.is_empty()
+            || self.share_key_generation != self.share_key_settled
+            || !self.resyncing.is_empty()
+            || !self.open_snapshots.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(cursor) = &self.last_cursor else {
+            return Ok(());
+        };
+        let subjects = if let Some(source) = &self.config.subjects {
+            source
+                .live_subjects(clock::now_secs(&mut self.db)?)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        persist_cursor_and_subjects(&mut self.db, cursor, Some(&subjects))?;
+        self.cursor_subjects = Some(subjects);
+        self.authorization_cleared = None;
+        Ok(())
+    }
+
+    /// Hide expired grants before attempting secret persistence.
+    async fn expire_share_keys(&mut self, persist: bool) -> Result<bool, ClientError> {
+        let now = clock::now_secs(&mut self.db)?;
+        if self.config.subjects.as_ref().is_none_or(|subjects| {
+            !subjects
+                .set
+                .keys
+                .iter()
+                .any(|(grant, _)| grant_expiry::has_expired(grant, now))
+        }) {
+            self.recompute_share_key_deadline();
+            return Ok(false);
+        }
+        self.invalidate_coverage()?;
+        if let Some(source) = &mut self.config.subjects {
+            source
+                .set
+                .keys
+                .retain(|(grant, _)| !grant_expiry::has_expired(grant, now));
+        }
+        self.share_key_generation += 1;
+        self.refresh_share_key_expiry();
+        self.rerender_subjects()?;
+        self.recompute_share_key_deadline();
+        if let Some(store) = &self.share_key_persistence {
+            if persist {
+                let set = self.share_key_set();
+                if let Err(error) = store.save(set).await {
+                    self.share_key_save_pending = true;
+                    return Err(error);
+                }
+                self.share_key_save_pending = false;
+            } else {
+                self.share_key_save_pending = true;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Re-register the subjects function against the replica's clock and mark
+    /// every table changed, so a query filtered on the keys re-runs.
+    fn rerender_subjects(&mut self) -> Result<(), ClientError> {
+        let Some(source) = &self.config.subjects else {
+            return Ok(());
+        };
+        let rendered = source.rendered(clock::now_secs(&mut self.db)?);
+        register_subjects(&mut self.db, &source.function, rendered)?;
+        let tables: Vec<String> = sqlite_catalog::table
+            .select(sqlite_catalog::name)
+            .filter(sqlite_catalog::kind.eq_any(["table", "view"]))
+            .load(&mut self.db)?;
+        self.changed
+            .lock()
+            .expect("the changed-tables lock")
+            .extend(tables);
+        Ok(())
+    }
+
+    /// Persist and install an accepted key change before advancing its generation.
+    async fn commit_share_key_change(&mut self) -> Result<(), ClientError> {
+        self.invalidate_coverage()?;
+        if let Some(store) = &self.share_key_persistence {
+            let set = self.share_key_set();
+            store.save(set).await?;
+            self.share_key_save_pending = false;
+        }
+        self.rerender_subjects()?;
+        self.share_key_generation += 1;
+        self.refresh_share_key_expiry();
+        self.recompute_share_key_deadline();
+        Ok(())
+    }
+
+    /// Add `grant` for `subject` to the durable share-key set.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write and
+    /// [`ClientError::Auth`] when the store refuses the save. A failed change
+    /// leaves the held set unchanged.
+    pub async fn add_share_key<K: CapabilityKey>(
+        &mut self,
+        grant: &Grant,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        let rendered = subject.key().to_string();
+        let changed = match &mut self.config.subjects {
+            Some(source) => {
+                if source
+                    .set
+                    .keys
+                    .iter()
+                    .any(|(held, subject_held)| held == grant && subject_held == &rendered)
+                {
+                    false
+                } else {
+                    source.set.keys.push((grant.clone(), rendered));
+                    true
+                }
+            }
+            None => false,
+        };
+        if !changed {
+            return Ok(());
+        }
+        if let Err(error) = self.commit_share_key_change().await {
+            if let Some(source) = &mut self.config.subjects {
+                source.set.keys.pop();
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Drop every key `subject` renders as from the durable share-key set.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica rejects the write and
+    /// [`ClientError::Auth`] when the store refuses the save. A failed change
+    /// leaves the held set unchanged.
+    pub async fn remove_share_key<K: CapabilityKey>(
+        &mut self,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        let rendered = subject.key().to_string();
+        let removed: Vec<(Grant, String)> = match &mut self.config.subjects {
+            Some(source) => source
+                .set
+                .keys
+                .extract_if(.., |(_, subject_held)| *subject_held == rendered)
+                .collect(),
+            None => Vec::new(),
+        };
+        if removed.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.commit_share_key_change().await {
+            if let Some(source) = &mut self.config.subjects {
+                source.set.keys.extend(removed);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Send the swap carrying every live held key, one in flight at a time.
+    async fn send_share_key_replacement(&mut self) -> Result<(), ClientError> {
+        let now = clock::now_secs(&mut self.db)?;
+        let keys = self
+            .config
+            .subjects
+            .iter()
+            .flat_map(|subjects| subjects.set.keys.iter().map(|(grant, _)| grant.clone()))
+            .filter(|grant| !grant_expiry::has_expired(grant, now))
+            .collect();
+        let request_id = share_key_request_id();
+        let generation = self.share_key_generation;
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
+                request_id: request_id.clone(),
+                keys,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.authorization_cleared = Some(HashSet::new());
+        self.share_key_request = Some(ShareKeyRequest {
+            request_id,
+            generation,
+            deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
+        });
+        self.share_key_retry_at = None;
+        self.recompute_share_key_deadline();
+        Ok(())
+    }
+
+    /// Fence every declaration preceding a correlated ping.
+    async fn declare_fence(&mut self) -> Result<(), ClientError> {
+        let nonce = declaration_fence_nonce();
+        let sub_ids: Vec<String> = self.unfenced_computed.iter().cloned().collect();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::Ping(Ping { nonce }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        self.declaration_fence = Some(DeclarationFence {
+            nonce,
+            deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
+            count: self.unfenced_count,
+            sub_ids,
+        });
+        self.recompute_share_key_deadline();
+        Ok(())
+    }
+
+    /// Drive replacements, declaration fences, expiry and checkpoint publication.
+    async fn step_share_keys(&mut self) -> Result<(), ClientError> {
+        if self.wire.is_some() && matches!(self.attach_replay, AttachReplay::Idle) {
+            if self.share_key_request.is_none()
+                && self.share_key_generation > self.share_key_settled
+                && self.unfenced_count == 0
+                && self
+                    .share_key_retry_at
+                    .is_none_or(|at| crate::away::SystemClock.monotonic() >= at)
+            {
+                self.send_share_key_replacement().await?;
+            } else if self.declaration_fence.is_none()
+                && self.cursor_subjects.is_none()
+                && self.unfenced_count > 0
+            {
+                self.declare_fence().await?;
+            }
+        }
+        if self
+            .share_key_deadline
+            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at)
+        {
+            self.expire_share_keys(false).await?;
+        }
+        self.publish_coverage()?;
+        Ok(())
+    }
+
+    /// Settle only the key generation carried by this replacement.
+    fn settle_share_key_replacement(&mut self, request_id: &str) -> Result<(), ClientError> {
+        let Some(request) = self.share_key_request.take() else {
+            return Err(ClientError::Protocol(
+                "a share-key answer arrived with nothing in flight".to_owned(),
+            ));
+        };
+        if request.request_id != request_id {
+            self.share_key_request = Some(request);
+            return Err(ClientError::Protocol(
+                "the share-key answer names a foreign request".to_owned(),
+            ));
+        }
+        self.share_key_settled = request.generation;
+        self.recompute_share_key_deadline();
+        self.publish_coverage()?;
+        Ok(())
+    }
+
+    /// Merge stored and builder keys before exposing the durable replica.
+    async fn load_share_key_store(&mut self, now: i64) -> Result<(), ClientError> {
+        let Some(store) = &self.share_key_persistence else {
+            return Ok(());
+        };
+        let stored = store.load().await?;
+        let mut set = match (&self.config.subjects, &stored) {
+            (None, Some(stored)) => ShareKeySet::rendered(stored.separator(), Vec::new()),
+            _ => self.share_key_set().clone(),
+        };
+        if let Some(stored) = &stored {
+            set.union(stored.pairs());
+        }
+        set.remove_expired(now);
+        if stored.as_ref() != Some(&set) {
+            self.invalidate_coverage()?;
+            self.share_key_persistence
+                .as_ref()
+                .expect("a durable store was loaded")
+                .save(&set)
+                .await?;
+            self.share_key_save_pending = false;
+        }
+        let function = self.config.subjects.take().map_or_else(
+            || connetto_core::SUBJECTS_FUNCTION.to_owned(),
+            |source| source.function,
+        );
+        self.config.subjects = Some(SubjectSource { function, set });
+        self.refresh_share_key_expiry();
+        self.rerender_subjects()?;
+        self.recompute_share_key_deadline();
+        Ok(())
     }
 
     /// Whether a handshake currently stands.
@@ -5027,6 +5679,17 @@ where
         sub_id: &str,
         spec: SubscriptionSpec,
     ) -> Result<(), ClientError> {
+        // A computed declaration carries no coverage to prove it, so it owes
+        // its replay until a fence or a swap settles it (R95).
+        let computed = crate::live::coverage_of(&spec).is_ok_and(|coverage| coverage.is_none());
+        self.invalidate_coverage()?;
+        if computed {
+            if self.unfenced_computed.insert(sub_id.to_owned()) {
+                self.unfenced_count += 1;
+            }
+        } else {
+            self.open_snapshots.insert(sub_id.to_owned());
+        }
         self.wire()?
             .transport
             .send_control(ControlMessage::Subscribe(Subscribe {
@@ -5034,7 +5697,8 @@ where
                 spec,
             }))
             .await
-            .map_err(|e| ClientError::Transport(e.to_string()))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        Ok(())
     }
 
     /// Record `sub_id` as a pin under the application's `name`.
@@ -5259,6 +5923,9 @@ where
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             subscriptions::end(&mut self.db, sub_id)?;
         }
+        self.open_snapshots.remove(sub_id);
+        self.resyncing.remove(sub_id);
+        self.unfenced_computed.remove(sub_id);
         Ok(())
     }
 
@@ -5270,6 +5937,8 @@ where
     /// [`ClientError`] on a transport, apply, or protocol failure.
     pub async fn pump_one(&mut self) -> Result<ClientEvent, ClientError> {
         loop {
+            self.check_share_key_deadlines();
+            self.step_share_keys().await?;
             self.check_writer_deadlines();
             if let Some(notice) = self.notices.pop_front() {
                 return Ok(notice);
@@ -5298,6 +5967,8 @@ where
         // A writer answer that overran its bound drops the connection before
         // the next frame is waited on, so the pump redials without stalling.
         self.check_writer_deadlines();
+        self.check_share_key_deadlines();
+        self.step_share_keys().await?;
         // Ahead of the transport, and ahead of the cancel, because a state
         // change already happened and holding it back would leave a caller
         // showing stale data with nothing to tell it otherwise.
@@ -5383,16 +6054,20 @@ where
         Ok(Some(event))
     }
 
-    /// Send a keepalive probe. The matching [`ClientEvent::Pong`] from a later
-    /// [`pump_one`](Self::pump_one) doubles as a barrier: the server processes
-    /// frames in order, so a pong proves every preceding frame was handled.
+    /// Send a lower-63-bit keepalive whose matching [`ClientEvent::Pong`] fences preceding requests.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Transport`] when the ping cannot be sent.
+    /// [`ClientError::Transport`] when the ping cannot be sent and
+    /// [`ClientError::Protocol`] when its nonce uses the reserved high bit.
     pub async fn ping(&mut self, nonce: u64) -> Result<(), ClientError> {
-        self.wire()?
-            .transport
+        let wire = self.wire()?;
+        if nonce & (1_u64 << 63) != 0 {
+            return Err(ClientError::Protocol(
+                "the ping nonce uses the reserved high bit".to_owned(),
+            ));
+        }
+        wire.transport
             .send_control(ControlMessage::Ping(Ping { nonce }))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
@@ -5754,8 +6429,15 @@ where
             .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
+    fn refuse_declaration(&mut self, related_to: Option<&str>) {
+        if let (Some(related_to), Some(fence)) = (related_to, &mut self.declaration_fence) {
+            fence.sub_ids.retain(|sub_id| sub_id != related_to);
+        }
+    }
+
     /// A server throttle, deferring the pending write it names.
     fn rate_limited(&mut self, limited: connetto_core::messages::RateLimited) -> ClientEvent {
+        self.refuse_declaration(limited.related_to.as_deref());
         // A mutation is correlated by its sequence, and one still pending waits for its resend.
         let throttled_write = limited
             .related_to
@@ -5769,17 +6451,38 @@ where
         if throttled_write {
             self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
         }
+        // A swap its limit refused is deferred by the server's bound, not
+        // dropped.
+        if limited.related_to.as_deref().is_some_and(|related| {
+            self.share_key_request
+                .as_ref()
+                .is_some_and(|request| request.request_id == related)
+        }) {
+            self.share_key_request = None;
+            self.share_key_retry_at = Some(
+                crate::away::SystemClock.monotonic()
+                    + Duration::from_millis(limited.retry_after_ms),
+            );
+            self.recompute_share_key_deadline();
+        }
         ClientEvent::RateLimited {
             related_to: limited.related_to,
             retry_after_ms: limited.retry_after_ms,
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Each control frame has one explicit protocol dispatch arm."
+    )]
     async fn handle_control(&mut self, msg: ControlMessage) -> Result<ClientEvent, ClientError> {
         match msg {
-            ControlMessage::SnapshotBegin(begin) => Ok(ClientEvent::SnapshotBegin {
-                sub_id: begin.sub_id,
-            }),
+            ControlMessage::SnapshotBegin(begin) => {
+                self.open_snapshots.insert(begin.sub_id.clone());
+                Ok(ClientEvent::SnapshotBegin {
+                    sub_id: begin.sub_id,
+                })
+            }
             ControlMessage::SnapshotEnd(end) => {
                 // This records a resume position for rows delivered on the
                 // other plane, so it depends on the server having sent them
@@ -5789,12 +6492,15 @@ where
                 // it regress a real one, in memory or in the replica.
                 if !end.cursor.is_empty() {
                     let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                    persist_cursor(&mut self.db, &end.cursor)?;
+                    let coverage = self.cursor_subjects.as_deref();
+                    persist_cursor_and_subjects(&mut self.db, &end.cursor, coverage)?;
                     self.last_cursor = Some(end.cursor);
                 }
+                self.open_snapshots.remove(&end.sub_id);
                 if self.resyncing.remove(&end.sub_id) {
                     self.reapply_pending()?;
                 }
+                self.publish_coverage()?;
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
             ControlMessage::AggregateUpdate(update) => {
@@ -5820,6 +6526,11 @@ where
                 })
             }
             ControlMessage::FullResyncRequired(resync) => {
+                if resync.reason == FullResyncReason::AuthorizationChange {
+                    // The swap re-renders the coverage, so the durable claim
+                    // is unknown again before the clear runs.
+                    self.invalidate_coverage()?;
+                }
                 let aggregate = self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
                 // The replacement snapshot lands after this, so the pending writes
                 // this clear took off the replica go back on its `SnapshotEnd`, not
@@ -5850,15 +6561,37 @@ where
                 })
             }
             ControlMessage::WriterAnswer(answer) => self.settle_writer_task(&answer).await,
-            ControlMessage::Pong(pong) => Ok(ClientEvent::Pong { nonce: pong.nonce }),
+            ControlMessage::Pong(pong) => {
+                let fence = if self
+                    .declaration_fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.nonce == pong.nonce)
+                {
+                    self.declaration_fence.take()
+                } else {
+                    None
+                };
+                if let Some(fence) = fence {
+                    // Refused declarations remain outstanding after this fence.
+                    self.unfenced_count = self.unfenced_count.saturating_sub(fence.count);
+                    self.unfenced_computed
+                        .retain(|sub_id| !fence.sub_ids.contains(sub_id));
+                    self.recompute_share_key_deadline();
+                    self.publish_coverage()?;
+                }
+                Ok(ClientEvent::Pong { nonce: pong.nonce })
+            }
             ControlMessage::ContentTicketGrant(grant) => Ok(ClientEvent::ContentTicket {
                 request_id: grant.request_id,
                 url: grant.url,
             }),
-            ControlMessage::NonFatalError(err) => Ok(ClientEvent::NonFatal {
-                related_to: err.related_to,
-                detail: err.detail,
-            }),
+            ControlMessage::NonFatalError(err) => {
+                self.refuse_declaration(err.related_to.as_deref());
+                Ok(ClientEvent::NonFatal {
+                    related_to: err.related_to,
+                    detail: err.detail,
+                })
+            }
             ControlMessage::RateLimited(limited) => Ok(self.rate_limited(limited)),
             // A relay saying whether IT can reach the server. For a tab that is
             // the answer that matters, because a tab whose own link is fine
@@ -5896,6 +6629,12 @@ where
                 Ok(ClientEvent::MembershipOpened {
                     sub_id: opened.sub_id,
                     member_table: opened.member_table,
+                })
+            }
+            ControlMessage::ShareKeysReplaced(ack) => {
+                self.settle_share_key_replacement(&ack.request_id)?;
+                Ok(ClientEvent::ShareKeysReplaced {
+                    request_id: ack.request_id,
                 })
             }
             other => Err(ClientError::Protocol(format!(
@@ -6058,7 +6797,23 @@ where
                 self.clear_aggregate_resting(sub_id)?;
                 Ok(true)
             }
-            Some(resyncing) => {
+            Some(mut resyncing) => {
+                if *reason == FullResyncReason::AuthorizationChange
+                    && let Some(cleared) = &self.authorization_cleared
+                {
+                    resyncing.tables.retain(|table| !cleared.contains(table));
+                    self.delete_uncovered(
+                        &resyncing.tables,
+                        None,
+                        &Stale::Everything,
+                        &HashMap::new(),
+                    )?;
+                    self.authorization_cleared
+                        .as_mut()
+                        .expect("an authorization batch is active")
+                        .extend(resyncing.tables);
+                    return Ok(false);
+                }
                 let stale = match reason {
                     // Compared case-insensitively because the server names it from the
                     // catalog and a subscription names it as its query spelled it.
@@ -6454,6 +7209,9 @@ where
         // into `applied_rows` only after the transaction commits and is cleared
         // on rollback, so a failed apply leaves no phantom counts.
         self.apply_counting.store(true, Ordering::Relaxed);
+        // The coverage the cursor carries, materialized before the closure so
+        // the pair writes in the same statement as the cursor.
+        let coverage = self.cursor_subjects.as_deref();
         let applied = self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,
@@ -6463,7 +7221,7 @@ where
                     .map_err(|e| ClientError::Apply(e.to_string()))?;
             }
             if let Some(cursor) = cursor {
-                persist_cursor(conn, cursor)?;
+                persist_cursor_and_subjects(conn, cursor, coverage)?;
             }
             Ok(())
         });

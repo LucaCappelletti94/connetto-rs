@@ -24,7 +24,7 @@ use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
     ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices,
-    MemoryKeyStore, SyncSchema,
+    MemoryKeyStore, MemoryRefreshStore, SyncSchema,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::ReplicaKeyStore as _;
@@ -396,7 +396,7 @@ where
     let (running, pump) = ClientBuilder::new(schema(ddl), dial)
         .with_reconnect(ReconnectPolicy::default())
         .signed_in(credential)
-        .durable(DataDir::new(dir), keys)
+        .durable(DataDir::new(dir), keys, MemoryRefreshStore::default())
         .with_gate(Gate::off())
         .connect_with_pump()
         .await

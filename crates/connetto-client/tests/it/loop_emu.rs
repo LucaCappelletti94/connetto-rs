@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use connetto_client::{
     AffectedRow, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
-    KeyValue, LiveQuery, Watchable,
+    KeyValue, LiveQuery, MemoryRefreshStore, Watchable,
 };
 use connetto_core::messages::{MutationRejectReason, SUBSCRIPTION_REFUSED};
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
@@ -621,7 +621,11 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -793,7 +797,11 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -953,7 +961,11 @@ async fn connection_is_a_diesel_connection() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -1073,7 +1085,11 @@ async fn rejected_write_rolls_back_locally() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -1208,7 +1224,11 @@ async fn a_withheld_write_is_refused_as_unauthorized() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -1288,7 +1308,11 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -1405,7 +1429,11 @@ async fn connect_client(
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect")
@@ -3409,7 +3437,11 @@ async fn watch_fn_drives_a_boxed_row_query() {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect");
@@ -4336,9 +4368,8 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
     assert!(
         !seen
             .iter()
-            .any(|event| matches!(event, ClientEvent::SnapshotEnd { .. })),
-        "the log survived, so the server could prove what the client had and \
-         owed it no snapshot: {seen:?}",
+            .any(|event| matches!(event, ClientEvent::SnapshotBegin { .. })),
+        "incremental resume opened a snapshot, events {seen:?}",
     );
     assert_eq!(
         orders(client.conn()),
@@ -4430,7 +4461,11 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
         super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(db.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen offline");

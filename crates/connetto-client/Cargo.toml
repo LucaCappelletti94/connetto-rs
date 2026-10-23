@@ -307,6 +307,9 @@ web-sys = { version = "0.3", features = ["Window", "Performance"] }
 # feature on wasm (the native getrandom path is the default there).
 uuid = { version = "1", default-features = false, features = ["js"] }
 
+# A thread-bound browser store satisfies the `diesel::Connection` requirement for `Send`.
+send_wrapper = "0.6"
+
 [dev-dependencies]
 parking_lot = "0.12"
 # The bot registration tests mint and verify the Ed25519 key the exchange signs with.

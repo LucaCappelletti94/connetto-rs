@@ -8,7 +8,9 @@
 //! `CREATE TABLE prefs (name TEXT, value TEXT)` is a keyed table by SQLite's
 //! rules, so nothing warned the developer and the write was never uploaded.
 
-use connetto_client::{ClientBuilder, ClientError, DataDir, ReplicaKey, SyncSchema};
+use connetto_client::{
+    ClientBuilder, ClientError, DataDir, MemoryRefreshStore, ReplicaKey, SyncSchema,
+};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -187,7 +189,11 @@ async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open the replica");
@@ -253,7 +259,11 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
             super::support::NeverDial::<FakeTransport>::default(),
         )
         .signed_in(first)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await
         .expect("the accepted tier opens"),
@@ -267,7 +277,11 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
             super::support::NeverDial::<FakeTransport>::default(),
         )
         .signed_in(second)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await,
     );

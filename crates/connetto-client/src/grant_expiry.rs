@@ -33,7 +33,7 @@ pub(crate) fn has_expired(grant: &Grant, now: i64) -> bool {
 }
 
 /// The `exp` claim in `grant`'s payload, or `None` when there is none to read.
-fn expiry_of(grant: &Grant) -> Option<i64> {
+pub(crate) fn expiry_of(grant: &Grant) -> Option<i64> {
     let mut parts = grant.as_str().split('.');
     let payload = parts.nth(1)?;
     // Three segments exactly: a two-segment string is an unsigned JWT and a

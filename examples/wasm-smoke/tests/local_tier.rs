@@ -75,6 +75,7 @@ async fn connect(
         .durable(
             build::SuitePlace::new(DB_NAME, !first_boot),
             build::keys_for(credential, replica_key()).await,
+            build::share_store().await,
         )
         .with_gate(Gate::off())
         .connect_driven()
