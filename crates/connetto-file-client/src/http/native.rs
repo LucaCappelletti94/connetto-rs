@@ -267,3 +267,191 @@ impl Activity {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    const BOUND: Duration = Duration::from_millis(500);
+
+    /// How long a server is given to finish once its request is answered or aborted.
+    const CEILING: Duration = Duration::from_secs(4);
+
+    /// How long the whole test may take, in case the runner starves the trickled link.
+    const BUDGET: Duration = Duration::from_secs(30);
+
+    /// Bytes consumed per server read.
+    const TRICKLE_READ: usize = 1024 * 1024;
+
+    /// How long a trickling server waits between reads, well inside the bound.
+    const TRICKLE_PAUSE: Duration = Duration::from_millis(25);
+
+    /// Large enough to outlast the idle bound at the trickle rate.
+    const TRICKLED: usize = 64 * 1024 * 1024;
+
+    /// A reply that closes the connection, so no test waits on a reused one.
+    const NO_CONTENT: &str =
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// A local listener and the address to send it requests at.
+    async fn local_listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("a bound address");
+        (listener, address)
+    }
+
+    async fn read_head(stream: &mut TcpStream) {
+        let mut tail = [0_u8; 4];
+        let mut byte = [0_u8; 1];
+        while tail != *b"\r\n\r\n" {
+            match stream.read(&mut byte).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    tail.rotate_left(1);
+                    tail[3] = byte[0];
+                }
+            }
+        }
+    }
+
+    /// Reads a complete chunked body at the given rate and counts its payload.
+    async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> Option<usize> {
+        let mut buffer = vec![0_u8; step];
+        let mut body = Vec::new();
+        while !body.ends_with(b"0\r\n\r\n") {
+            let read = match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            body.extend_from_slice(&buffer[..read]);
+            tokio::time::sleep(pause).await;
+        }
+        chunked_payload(&body)
+    }
+
+    /// Counts the payload only when every chunk and delimiter is complete.
+    fn chunked_payload(body: &[u8]) -> Option<usize> {
+        let mut rest = body;
+        let mut payload = 0_usize;
+        loop {
+            let line = rest.windows(2).position(|pair| pair == b"\r\n")?;
+            let size = usize::from_str_radix(core::str::from_utf8(&rest[..line]).ok()?, 16).ok()?;
+            rest = rest.get(line.saturating_add(2)..)?;
+            if size == 0 {
+                return rest.starts_with(b"\r\n").then_some(payload);
+            }
+            if rest.get(size..size.saturating_add(2))? != b"\r\n" {
+                return None;
+            }
+            payload = payload.saturating_add(size);
+            rest = rest.get(size.saturating_add(2)..)?;
+        }
+    }
+
+    /// Answers one request head with `reply`, once the request has fully arrived.
+    async fn write_reply(stream: &mut TcpStream, reply: &str) {
+        let _ = stream.write_all(reply.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// A server that reads a request at the trickle rate and then answers it.
+    fn trickling_server(listener: TcpListener) -> JoinHandle<Option<usize>> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_head(&mut stream).await;
+            let payload = drain_body(&mut stream, TRICKLE_READ, TRICKLE_PAUSE).await;
+            write_reply(&mut stream, NO_CONTENT).await;
+            payload
+        })
+    }
+
+    /// Returns the same activity the watchdog and body stream observe.
+    async fn moving_attempt(
+        transport: &ReqwestHttp,
+        url: &str,
+    ) -> Result<(HttpReply, Activity), (HttpFailure<ReqwestHttpError>, Activity)> {
+        let activity = Activity::new();
+        let request = transport
+            .client
+            .put(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(streamed(vec![7_u8; TRICKLED], &activity));
+        match transport.run(request, url, &activity).await {
+            Ok(reply) => Ok((reply, activity)),
+            Err(failure) => Err((failure, activity)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_moving_upload_outlasts_its_bound() {
+        let transport = ReqwestHttp::new().with_idle_bound(BOUND);
+        let budget_end = Instant::now() + BUDGET;
+        loop {
+            let (listener, address) = local_listener().await;
+            let mut server = trickling_server(listener);
+            let url = format!("http://{address}/chunks/deadbeef?t=ticket");
+            let started = Instant::now();
+
+            match tokio::time::timeout(
+                budget_end.duration_since(Instant::now()),
+                moving_attempt(&transport, &url),
+            )
+            .await
+            {
+                Err(_) => {
+                    server.abort();
+                    panic!("the runner starved the trickled link for the whole {BUDGET:?}");
+                }
+                Ok(Ok((reply, _activity))) => {
+                    assert_eq!(reply.status, 204, "the server answered the chunk");
+                    assert!(
+                        started.elapsed() > BOUND,
+                        "the upload must outlast the bound for this to prove anything, took {:?}",
+                        started.elapsed()
+                    );
+                    let payload = tokio::time::timeout(CEILING, &mut server)
+                        .await
+                        .expect("the server is done once it answered the chunk")
+                        .expect("server");
+                    assert_eq!(
+                        payload,
+                        Some(TRICKLED),
+                        "every payload byte arrived, framing aside"
+                    );
+                    return;
+                }
+                Ok(Err((HttpFailure::Transport(ReqwestHttpError::Idle { bound }), activity))) => {
+                    // The single-threaded runtime keeps the watchdog's record stable until this read.
+                    let last = activity.last.load(Ordering::Relaxed);
+                    let silence = activity.start.elapsed().as_millis() - u128::from(last);
+                    assert!(
+                        silence >= bound.as_millis(),
+                        "the transport aborted a moving upload, with only {silence}ms of client-visible silence against a {bound:?} bound"
+                    );
+                    match tokio::time::timeout(CEILING, &mut server).await {
+                        Ok(Err(join)) => panic!("the trickling server panicked: {join}"),
+                        Ok(Ok(_)) => {}
+                        Err(_) => {
+                            server.abort();
+                        }
+                    }
+                    assert!(
+                        Instant::now() < budget_end,
+                        "the runner starved the trickled link for the whole {BUDGET:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(Err((other, _activity))) => {
+                    panic!("a moving upload is never aborted, it got {other}")
+                }
+            }
+        }
+    }
+}
