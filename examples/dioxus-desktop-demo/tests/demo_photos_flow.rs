@@ -82,7 +82,7 @@ fn sqlite_ddl() -> String {
         .expect("parse schema.sql")
         .translate_to_sql(&opts)
         .expect("translate schema.sql to SQLite");
-    let mut ddl = stmts.join(";\n");
+    let mut ddl = stmts.into_vec().join(";\n");
     ddl.push(';');
     ddl
 }
