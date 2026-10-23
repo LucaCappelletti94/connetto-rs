@@ -196,7 +196,8 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     let report = translator
         .translate_with_report(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
-    let ddl = statements_to_ddl(&report.statements);
+    let statements = report.script.into_vec();
+    let ddl = statements_to_ddl(&statements);
     validate(&ddl, "replica")?;
     let manifest = translator
         .translation_manifest(&options)
@@ -211,7 +212,7 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
         policies_sql,
         ddl,
         pairs,
-        view_names(&report.statements),
+        view_names(&statements),
         None::<&str>,
     ))
 }
@@ -262,7 +263,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
         let report = tier
             .translate_with_report(&options)
             .map_err(|err| SchemaError::Translate(err.to_string()))?;
-        let ddl = statements_to_ddl(&report.statements);
+        let ddl = statements_to_ddl(&report.script.into_vec());
         validate(&ddl, "local tier")?;
         bundle = bundle.with_local_tier(ddl);
     }
@@ -669,8 +670,9 @@ mod tests {
         let report = translator
             .translate_with_report(&options)
             .expect("translate the deployment");
-        let ddl = statements_to_ddl(&report.statements);
-        let derived = view_names(&report.statements);
+        let statements = report.script.into_vec();
+        let ddl = statements_to_ddl(&statements);
+        let derived = view_names(&statements);
         let built = sqlite_views(&ddl);
         assert!(!derived.is_empty(), "the deployment's policies build views");
         assert_eq!(

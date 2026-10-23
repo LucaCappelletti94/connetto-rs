@@ -92,7 +92,7 @@ connetto-schema = { path = "crates/connetto-schema", version = "0.0.0" }
 # and deep nesting refused before anything walks the tree.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
-subql = { git = "https://github.com/LucaCappelletti94/subql", branch = "main", default-features = false, features = [
+subql = { git = "https://github.com/connetto-rs/subql", branch = "main", default-features = false, features = [
   "std",
 ] }
 
@@ -105,7 +105,7 @@ subql = { git = "https://github.com/LucaCappelletti94/subql", branch = "main", d
 # rev, because pinning it by revision put two copies of `sql-traits` in one
 # graph with two incompatible `ParserDB` types, which `[patch]` refuses to
 # merge.
-rls2fga = { git = "https://github.com/LucaCappelletti94/rls2fga", branch = "main", features = [
+rls2fga = { git = "https://github.com/connetto-rs/rls2fga", branch = "main", features = [
   "client",
 ] }
 

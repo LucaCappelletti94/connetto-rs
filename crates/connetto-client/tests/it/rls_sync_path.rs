@@ -169,7 +169,8 @@ fn translation_for(pg_ddl: &str) -> (String, Vec<(String, String)>, Vec<String>)
         .sql(pg_ddl)
         .expect("parse the Postgres document")
         .translate_to_sql(&options())
-        .expect("translate to SQLite");
+        .expect("translate to SQLite")
+        .into_vec();
     let mut ddl = statements.join(";\n");
     ddl.push(';');
 

@@ -81,7 +81,7 @@ connetto-file-server = { path = "../../crates/connetto-file-server" }
 connetto-server = { path = "../../crates/connetto-server", features = ["test-seams"] }
 tempfile = "3"
 axum = "0.8"
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 
 [[test]]
 name = "demo_photos_flow"

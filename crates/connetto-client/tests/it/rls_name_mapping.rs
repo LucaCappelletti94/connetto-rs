@@ -94,7 +94,8 @@ fn build_db(ddl: &str, user: &'static str) -> (SqliteConnection, Arc<AtomicBool>
         .sql(ddl)
         .expect("parse postgres ddl")
         .translate_to_sql(&options())
-        .expect("translate to sqlite");
+        .expect("translate to sqlite")
+        .into_vec();
     for statement in &statements {
         conn.batch_execute(statement)
             .unwrap_or_else(|e| panic!("ddl failed: {e}\n{statement}"));
