@@ -8,7 +8,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -78,9 +78,9 @@ async fn next_status(tab: &mut LoopbackTransport) -> SyncStatus {
     }
 }
 
-/// A silent upstream is dropped after the probe and answer bounds, the tab
-/// hears offline, and the hub redials an answering upstream and the tab hears
-/// connected again.
+/// A silent upstream is dropped after the probe and answer bounds, and the tab
+/// hears offline while the redial is still pending. Once the redial reaches
+/// an answering upstream the tab hears connected again.
 #[wasm_bindgen_test]
 async fn a_silent_upstream_is_dropped_and_the_hub_redials() {
     let silent_pings = Rc::new(Cell::new(0));
@@ -98,15 +98,25 @@ async fn a_silent_upstream_is_dropped_and_the_hub_redials() {
         .await
         .expect("worker connect");
 
+    // The first redial hangs until the test has seen the tab told offline, as
+    // a dial to a frozen server does.
+    let (release, released) = futures_channel::oneshot::channel::<()>();
+    let released = Rc::new(RefCell::new(Some(released)));
     let dials = Rc::new(Cell::new(0_u32));
     let reconnect = HubReconnect {
         factory: {
             let dials = Rc::clone(&dials);
             move || {
                 dials.set(dials.get() + 1);
+                let hold = released.borrow_mut().take();
                 let (server, client) = loopback();
                 spawn_local(upstream(server, true, Rc::new(Cell::new(0))));
-                async move { Ok::<LoopbackTransport, LoopbackError>(client) }
+                async move {
+                    if let Some(hold) = hold {
+                        let _ = hold.await;
+                    }
+                    Ok::<LoopbackTransport, LoopbackError>(client)
+                }
             }
         },
         sleeper: |_duration: Duration| async {},
@@ -132,8 +142,9 @@ async fn a_silent_upstream_is_dropped_and_the_hub_redials() {
     assert_eq!(
         next_status(&mut tab).await,
         SyncStatus::Offline,
-        "the silent upstream is noticed"
+        "the tab hears the silent upstream was dropped while the redial is pending"
     );
+    release.send(()).expect("the redial waits on the release");
     assert!(
         silent_pings.get() >= 1,
         "the probe went out into the silence before the drop"

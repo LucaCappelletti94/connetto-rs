@@ -1477,6 +1477,17 @@ where
                 let Some(driver) = reconnect else {
                     return Ok(false);
                 };
+                // The drop queued its `Offline` on the worker, and the tabs must hear it
+                // before a redial that can hang for as long as the server stays frozen.
+                while let Some(notice) = self
+                    .worker
+                    .pump_one_or(core::future::ready(()))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    handle_worker_event(&mut self.worker, &mut self.state, notice)?;
+                }
                 if !self.recover(driver).await? {
                     return Ok(false);
                 }
