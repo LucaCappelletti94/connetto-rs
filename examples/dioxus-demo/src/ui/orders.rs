@@ -139,12 +139,12 @@ pub fn OrdersPane() -> Element {
     }
 }
 
-/// `quantity: count` pairs in quantity order, or `pending` before the first answer.
+/// `quantity: count` pairs in quantity order, or `none` for an empty snapshot.
 fn grouped_label(counts: &std::collections::HashMap<i64, i64>) -> String {
     let mut sorted: Vec<(i64, i64)> = counts.iter().map(|(q, c)| (*q, *c)).collect();
     sorted.sort_unstable();
     if sorted.is_empty() {
-        return "pending".to_owned();
+        return "none".to_owned();
     }
     sorted
         .iter()
