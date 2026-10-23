@@ -17,8 +17,8 @@ use connetto_client::teardown::{
     ForgetError, PurgeError, content_dir, purge_replica, wipe_replica,
 };
 use connetto_client::{
-    ClientBuilder, ClientError, DataDir, Gate, NativeClientBuilder, ReplicaKey, SyncSchema,
-    UnsyncedWrite, provision_replica_key,
+    ClientBuilder, ClientError, DataDir, Gate, MemoryRefreshStore, NativeClientBuilder, ReplicaKey,
+    SyncSchema, UnsyncedWrite, provision_replica_key,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -65,7 +65,11 @@ async fn seed_replica(
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.to_path_buf()), keys.clone())
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        keys.clone(),
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("first connect");
@@ -97,7 +101,11 @@ async fn read_back(
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await?;
     items::table
@@ -182,7 +190,11 @@ async fn seed_replica_with_tier(
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.to_path_buf()), keys.clone())
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        keys.clone(),
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("first connect");
@@ -341,7 +353,11 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("reopen from the cached key after re-authentication");
@@ -402,7 +418,11 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("rebuild after the purge");
@@ -431,7 +451,7 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
         NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
             .with_dialer(super::support::NeverDial::<FakeTransport>::default())
             .signed_in(credential)
-            .durable(dir.path(), keys.clone())
+            .durable(dir.path(), keys.clone(), MemoryRefreshStore::default())
             .with_gate(Gate::off())
             .connect(),
     )
@@ -520,7 +540,7 @@ CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls WHERE owner_id = curre
         NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
             .with_dialer(super::support::NeverDial::<FakeTransport>::default())
             .signed_in(credential)
-            .durable(dir.path(), keys.clone())
+            .durable(dir.path(), keys.clone(), MemoryRefreshStore::default())
             .with_gate(Gate::off())
             .connect(),
     )

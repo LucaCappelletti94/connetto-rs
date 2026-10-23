@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use connetto_client::{
     ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant, HeldCredential,
+    MemoryRefreshStore,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
@@ -88,7 +89,11 @@ async fn connect(
         super::support::Once::new(transport),
     )
     .signed_in(held)
-    .durable(DataDir::new(dir.to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect")
@@ -103,7 +108,11 @@ async fn open_offline(dir: &std::path::Path) -> ConnettoConnection<WebSocketTran
         super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(held)
-    .durable(DataDir::new(dir.to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server")

@@ -11,8 +11,8 @@ use std::process::Command;
 
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Gate, Grant, HeldCredential,
-    KeyFile, KeyringKeyStore, KeyringStore, LinuxStore, Located, ReplicaPlace, SyncSchema,
-    provision_replica_key, teardown,
+    KeyFile, KeyringKeyStore, KeyringStore, LinuxStore, Located, MemoryRefreshStore, ReplicaPlace,
+    SyncSchema, provision_replica_key, teardown,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -111,6 +111,7 @@ async fn open(url: &str, fresh: bool) -> ConnettoConnection<FakeTransport> {
             exists: !fresh,
         },
         stores().1,
+        MemoryRefreshStore::default(),
     )
     .with_gate(Gate::off())
     .connect_driven()

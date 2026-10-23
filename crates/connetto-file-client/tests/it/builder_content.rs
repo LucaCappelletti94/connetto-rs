@@ -6,7 +6,8 @@
 //! written in the same transaction, and the staged bytes resolve locally.
 
 use connetto_client::{
-    Grant, HeldCredential, MemoryKeyStore, NativeClientBuilder, SyncSchema, TransportFactory,
+    Grant, HeldCredential, MemoryKeyStore, MemoryRefreshStore, NativeClientBuilder, SyncSchema,
+    TransportFactory,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -125,7 +126,11 @@ async fn builder_content_stages_a_file_durable() {
             .signed_in(
                 HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
             )
-            .durable(dir.path(), MemoryKeyStore::default())
+            .durable(
+                dir.path(),
+                MemoryKeyStore::default(),
+                MemoryRefreshStore::default(),
+            )
             .connect(),
     )
     .await
@@ -214,7 +219,11 @@ async fn a_closed_client_with_unsent_content_reopens_at_once() {
                     HeldCredential::new(Grant::new("user:bob"), "bob")
                         .expect("the credential holds"),
                 )
-                .durable(dir.path(), SharedKeys(std::sync::Arc::clone(&keys)))
+                .durable(
+                    dir.path(),
+                    SharedKeys(std::sync::Arc::clone(&keys)),
+                    MemoryRefreshStore::default(),
+                )
                 .connect(),
         )
         .await

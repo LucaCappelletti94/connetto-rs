@@ -39,6 +39,18 @@ pub trait MaybeSend {}
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl<T> MaybeSend for T {}
 
+/// A native `Sync` bound with no browser-thread requirement.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl<T: Sync> MaybeSync for T {}
+
+/// A native `Sync` bound with no browser-thread requirement.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub trait MaybeSync {}
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl<T> MaybeSync for T {}
+
 /// Incoming frame delivered by [`Transport::recv`].
 ///
 /// The transport layer distinguishes control from bulk at the wire boundary

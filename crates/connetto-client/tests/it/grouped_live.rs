@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant, Watchable,
+    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
+    MemoryRefreshStore, Watchable,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
@@ -98,7 +99,11 @@ async fn connect(
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("client connect")
@@ -280,7 +285,11 @@ async fn a_restart_reads_the_last_synced_map_from_the_resting_table() {
         super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen offline");
@@ -396,7 +405,11 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
         super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen offline");

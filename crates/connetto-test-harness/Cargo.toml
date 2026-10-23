@@ -51,7 +51,7 @@ openfga-client = { version = "0.6.1", default-features = false }
 rls2fga = { workspace = true }
 # Naming the caller mapping reverse translation rewrites the client's local
 # caller function with, mirroring the server binary's materializer wiring.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = [
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = [
   "std",
 ] }
 anyhow.workspace = true

@@ -92,7 +92,7 @@ cargo install wasm-pack --locked --version $WASM_PACK_VERSION
 rm -rf ~/.cargo/registry
 ln -s $CACHE/cargo-registry ~/.cargo/registry
 # Every git dependency main locks, fetched into the image, so a job fetches only what moved since.
-git clone -q --depth 1 https://github.com/LucaCappelletti94/connetto-rs /tmp/connetto-rs
+git clone -q --depth 1 https://github.com/connetto-rs/connetto-rs /tmp/connetto-rs
 for lock in /tmp/connetto-rs/Cargo.lock /tmp/connetto-rs/crates/*/Cargo.lock /tmp/connetto-rs/examples/*/Cargo.lock; do
   (cd "\$(dirname "\$lock")" && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked)
 done

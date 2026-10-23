@@ -19,6 +19,7 @@ use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_client::share_keys::{ShareKeyFuture, ShareKeySet, ShareKeyStore, share_key_record};
 use connetto_client::{ClientError, UnsyncedWrite};
 use connetto_core::ReplicaKey;
 use connetto_core::custody::Custody;
@@ -463,7 +464,8 @@ const KEY_STORE_DB: &str = "connetto-key-store";
 const STORE_KEK: &str = "kek";
 /// Object store holding per-identity IV-plus-ciphertext records.
 ///
-/// Record keys are `"{name}#{holder}"` where `holder` is the base64url-no-pad
+/// Record keys are `"{name}#{holder}"` where `name` is the replica name or the
+/// identity-scoped share-key record beside it, and `holder` is the base64url-no-pad
 /// credential id for enrolled profiles, or the empty string for the ungated rung.
 const STORE_WRAPPED: &str = "wrapped";
 /// Object store holding enrolled credential ids in the clear.
@@ -473,7 +475,8 @@ const KEK_KEY: u32 = 1;
 /// AES-GCM IV length in bytes.
 const AES_GCM_IV_LEN: usize = 12;
 
-/// Wraps and unwraps per-identity replica keys in `IndexedDB`.
+/// Wraps and unwraps the per-identity records in `IndexedDB`, the replica key
+/// and the share-key set beside it.
 ///
 /// Two rungs exist: an ungated rung backed by a stored non-extractable AES-GCM
 /// key in `kek`, used while nobody has enrolled, and a passkey-derived rung
@@ -668,25 +671,10 @@ impl IdbKeyStore {
             let Some(raw) = raw else {
                 continue;
             };
-            let buf = js_sys::Uint8Array::new(&raw).to_vec();
-            if buf.len() <= AES_GCM_IV_LEN {
-                return Err(AuthError::Store("adopt: record truncated".into()));
-            }
             let stored_kek_ref = stored_kek
                 .as_ref()
                 .ok_or_else(|| AuthError::Store("adopt: no stored kek to re-wrap".into()))?;
-            let (iv_bytes, ct_bytes) = buf.split_at(AES_GCM_IV_LEN);
-            let iv = js_sys::Uint8Array::from(iv_bytes);
-            let params = aes_gcm_params(&iv);
-            let ct_buf = ct_bytes.to_vec();
-            let plain_js = JsFuture::from(
-                subtle()?
-                    .decrypt_with_object_and_u8_array(&params, stored_kek_ref, &ct_buf)
-                    .map_err(|e| AuthError::Store(format!("adopt decrypt: {e:?}")))?,
-            )
-            .await
-            .map_err(|e| AuthError::Store(format!("adopt decrypt await: {e:?}")))?;
-            let plain = js_sys::Uint8Array::new(&plain_js).to_vec();
+            let plain = unwrap_record(&raw, stored_kek_ref).await?;
             let new_record = encrypt_with_kek(derived_kek, &plain).await?;
             rewrapped.push((old_key.clone(), format!("{base}#{holder}"), new_record));
         }
@@ -891,6 +879,165 @@ impl IdbKeyStore {
         let kek = self.get_or_create_kek().await?;
         Ok((kek, format!("{name}#")))
     }
+
+    /// Reject malformed decrypted records without echoing their contents.
+    fn decode_share_set(plain: &[u8]) -> Result<ShareKeySet, AuthError> {
+        serde_json::from_slice(plain).map_err(|err: serde_json::Error| {
+            AuthError::Store(format!(
+                "share keys could not be decoded at line {} column {}",
+                err.line(),
+                err.column(),
+            ))
+        })
+    }
+
+    /// The share-key set stored under `record` for the effective holder, or
+    /// `None` when none was stored.
+    ///
+    /// `record` is the identity-scoped share-key record of the replica this
+    /// store serves, the name the client's durable step names. The read rides
+    /// the same rung and gate as the replica key, a locked store refuses, and
+    /// a device with no wrapping key reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB, `SubtleCrypto` or decode failure.
+    /// [`AuthError::Locked`] when a credential is enrolled and no derived key
+    /// is held.
+    pub(crate) async fn load_share_record(
+        &self,
+        record: &str,
+    ) -> Result<Option<ShareKeySet>, AuthError> {
+        let Some((kek, record_key)) = self.resolve_kek_for_read(record).await? else {
+            return Ok(None);
+        };
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .build()
+            .map_err(|e| AuthError::Store(format!("share load tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("share load store: {e}")))?;
+        let record_value: Option<JsValue> = store
+            .get(record_key.as_str())
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("share load get: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("share load get await: {e}")))?;
+        let Some(record_value) = record_value else {
+            return Ok(None);
+        };
+        let plain = unwrap_record(&record_value, &kek).await?;
+        Ok(Some(Self::decode_share_set(&plain)?))
+    }
+
+    /// Persist `set` under `record`, replacing any prior set, under the same
+    /// rung and gate as the replica key.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB, `SubtleCrypto` or encode failure.
+    /// [`AuthError::Locked`] when a credential is enrolled and no derived key
+    /// is held.
+    pub(crate) async fn save_share_record(
+        &self,
+        record: &str,
+        set: &ShareKeySet,
+    ) -> Result<(), AuthError> {
+        let (kek, record_key) = self.resolve_kek_for_write(record).await?;
+        let plain = serde_json::to_vec(set)
+            .map_err(|e| AuthError::Store(format!("share save encode: {e}")))?;
+        let record_bytes = encrypt_with_kek(&kek, &plain).await?;
+        let record = js_sys::Uint8Array::from(record_bytes.as_slice());
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("share save tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("share save store: {e}")))?;
+        let record_value: JsValue = record.into();
+        store
+            .put(record_value)
+            .with_key(record_key.as_str())
+            .primitive()
+            .map_err(|e| AuthError::Store(format!("share save put: {e}")))?
+            .await
+            .map_err(|e| AuthError::Store(format!("share save put await: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("share save commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove every holder copy of the share-key record `record`.
+    ///
+    /// Erasure is by key rather than by decrypt, so it works on a locked
+    /// store, reaches every holder of the name, and offers no plaintext
+    /// fallback. No-op when no record exists under the name.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] on any IDB failure.
+    pub(crate) async fn clear_share_record(&self, record: &str) -> Result<(), AuthError> {
+        self.delete_wrapped(&[format!("{record}#")]).await
+    }
+
+    /// Delete every `wrapped`-store record whose key starts with one of
+    /// `prefixes`, by key rather than by decrypt.
+    async fn delete_wrapped(&self, prefixes: &[String]) -> Result<(), AuthError> {
+        // Read all keys, then delete matching ones in a write tx.
+        let all_keys: Vec<String> = {
+            let tx = self
+                .db
+                .transaction(STORE_WRAPPED)
+                .build()
+                .map_err(|e| AuthError::Store(format!("clear list tx: {e}")))?;
+            let store = tx
+                .object_store(STORE_WRAPPED)
+                .map_err(|e| AuthError::Store(format!("clear list store: {e}")))?;
+            store
+                .get_all_keys::<String>()
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("clear list keys: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("clear list keys await: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| AuthError::Store(format!("clear list decode: {e}")))?
+        };
+        let to_delete: Vec<&str> = all_keys
+            .iter()
+            .filter(|k| prefixes.iter().any(|prefix| k.starts_with(prefix)))
+            .map(String::as_str)
+            .collect();
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction(STORE_WRAPPED)
+            .with_mode(TransactionMode::Readwrite)
+            .build()
+            .map_err(|e| AuthError::Store(format!("clear tx: {e}")))?;
+        let store = tx
+            .object_store(STORE_WRAPPED)
+            .map_err(|e| AuthError::Store(format!("clear store: {e}")))?;
+        for key in to_delete {
+            store
+                .delete(key)
+                .primitive()
+                .map_err(|e| AuthError::Store(format!("clear delete: {e}")))?
+                .await
+                .map_err(|e| AuthError::Store(format!("clear delete await: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| AuthError::Store(format!("clear commit: {e}")))?;
+        Ok(())
+    }
 }
 
 impl ReplicaKeyStore for IdbKeyStore {
@@ -936,22 +1083,7 @@ impl ReplicaKeyStore for IdbKeyStore {
         let Some(record) = record else {
             return Ok(None);
         };
-        let buf = js_sys::Uint8Array::new(&record).to_vec();
-        if buf.len() <= AES_GCM_IV_LEN {
-            return Err(AuthError::Store("key record truncated".into()));
-        }
-        let (iv_bytes, ct_bytes) = buf.split_at(AES_GCM_IV_LEN);
-        let iv = js_sys::Uint8Array::from(iv_bytes);
-        let params = aes_gcm_params(&iv);
-        let ct_buf = ct_bytes.to_vec();
-        let plain_js = JsFuture::from(
-            subtle()?
-                .decrypt_with_object_and_u8_array(&params, &kek, &ct_buf)
-                .map_err(|e| AuthError::Store(format!("decrypt: {e:?}")))?,
-        )
-        .await
-        .map_err(|e| AuthError::Store(format!("decrypt await: {e:?}")))?;
-        let plain = js_sys::Uint8Array::new(&plain_js).to_vec();
+        let plain = unwrap_record(&record, &kek).await?;
         if plain.len() != ReplicaKey::LEN {
             return Err(AuthError::Store("decrypted key has wrong length".into()));
         }
@@ -972,25 +1104,10 @@ impl ReplicaKeyStore for IdbKeyStore {
     /// [`AuthError::Locked`] when enrolled but no derived key is held.
     async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), AuthError> {
         let (kek, record_key) = self.resolve_kek_for_write(name).await?;
-        let iv_bytes = random_iv();
-        let iv = js_sys::Uint8Array::from(iv_bytes.as_ref());
-        let params = aes_gcm_params(&iv);
-        // Copy key bytes into a mutable buffer for the SubtleCrypto API.
-        let mut key_buf = *key.as_bytes();
-        let ct_js = JsFuture::from(
-            subtle()?
-                .encrypt_with_object_and_u8_array(&params, &kek, &key_buf)
-                .map_err(|e| AuthError::Store(format!("encrypt: {e:?}")))?,
-        )
-        .await
-        .map_err(|e| AuthError::Store(format!("encrypt await: {e:?}")))?;
-        // The plaintext copy handed to WebCrypto is key material, so it does
-        // not outlive the call. A plain fill would be elidable, zeroize is not.
-        key_buf.zeroize();
-        let ct = js_sys::Uint8Array::new(&ct_js);
-        let record = js_sys::Uint8Array::new_with_length(12u32 + ct.length());
-        record.set(&iv, 0);
-        record.set(&ct, 12u32);
+        // The plaintext copy handed to WebCrypto is key material, and the
+        // wrapper wipes it before it returns.
+        let record_bytes = encrypt_with_kek(&kek, key.as_bytes()).await?;
+        let record = js_sys::Uint8Array::from(record_bytes.as_slice());
         let tx = self
             .db
             .transaction(STORE_WRAPPED)
@@ -1014,79 +1131,38 @@ impl ReplicaKeyStore for IdbKeyStore {
         Ok(())
     }
 
-    /// Remove the wrapped key for `name`.
+    /// Remove the wrapped key for `name`, and with it the identity's share-key
+    /// record, whatever holder each carries.
     ///
-    /// Enumerates the `wrapped` store to find whichever holder suffix the
-    /// record carries, since the caller knows only the base name. No-op when no
-    /// record for `name` exists under any holder.
+    /// The share keys ride the replica key's protection, so the wipe names the
+    /// replica once and both records die. Erasure is by key, so it works on a
+    /// locked store, reaches every holder of the name, and touches no other
+    /// identity. No-op when no record for `name` exists under any holder.
     ///
     /// # Errors
     ///
     /// [`AuthError::Store`] on any IDB failure.
     async fn clear(&self, name: &str) -> Result<(), AuthError> {
-        let prefix = format!("{name}#");
-        // Read all keys, then delete matching ones in a write tx.
-        let all_keys: Vec<String> = {
-            let tx = self
-                .db
-                .transaction(STORE_WRAPPED)
-                .build()
-                .map_err(|e| AuthError::Store(format!("clear list tx: {e}")))?;
-            let store = tx
-                .object_store(STORE_WRAPPED)
-                .map_err(|e| AuthError::Store(format!("clear list store: {e}")))?;
-            store
-                .get_all_keys::<String>()
-                .primitive()
-                .map_err(|e| AuthError::Store(format!("clear list keys: {e}")))?
-                .await
-                .map_err(|e| AuthError::Store(format!("clear list keys await: {e}")))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| AuthError::Store(format!("clear list decode: {e}")))?
-        };
-        let to_delete: Vec<&str> = all_keys
-            .iter()
-            .filter(|k| k.starts_with(&prefix))
-            .map(String::as_str)
-            .collect();
-        if to_delete.is_empty() {
-            return Ok(());
-        }
-        let tx = self
-            .db
-            .transaction(STORE_WRAPPED)
-            .with_mode(TransactionMode::Readwrite)
-            .build()
-            .map_err(|e| AuthError::Store(format!("clear tx: {e}")))?;
-        let store = tx
-            .object_store(STORE_WRAPPED)
-            .map_err(|e| AuthError::Store(format!("clear store: {e}")))?;
-        for key in to_delete {
-            store
-                .delete(key)
-                .primitive()
-                .map_err(|e| AuthError::Store(format!("clear delete: {e}")))?
-                .await
-                .map_err(|e| AuthError::Store(format!("clear delete await: {e}")))?;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| AuthError::Store(format!("clear commit: {e}")))?;
-        Ok(())
+        // The wipe names the replica only, and the identity's share keys ride
+        // the same scope, so both records die here in one pass.
+        let prefixes = [format!("{name}#"), format!("{}#", share_key_record(name))];
+        self.delete_wrapped(&prefixes).await
     }
 }
 
 /// The worker's key store behind the error type the core builder's durable
-/// step expects.
+/// step expects, for the replica key and the share keys beside it.
 ///
-/// The store itself errors with [`AuthError`], and the builder takes a store
-/// that errors with [`ClientError`], so this wraps it and maps each failure
-/// to the one the boot reports.
-pub(crate) struct BuilderKeyStore(Rc<IdbKeyStore>);
+/// The store itself errors with [`AuthError`], and the builder takes stores
+/// that error with [`ClientError`], so this wraps it and maps each failure
+/// to the one the boot reports. The durable step names one wrapper per half,
+/// and both wrap clones of the same `Rc`, so the two halves read and write
+/// the same records under the same rung and gate.
+pub struct BuilderKeyStore(Rc<IdbKeyStore>);
 
 impl BuilderKeyStore {
-    /// Wrap the worker's key store.
-    pub(crate) fn new(store: Rc<IdbKeyStore>) -> Self {
+    /// Wrap the worker's key store for the builder's durable step.
+    pub fn new(store: Rc<IdbKeyStore>) -> Self {
         Self(store)
     }
 }
@@ -1111,6 +1187,45 @@ impl ReplicaKeyStore for BuilderKeyStore {
 
     async fn clear(&self, name: &str) -> Result<(), ClientError> {
         self.0.clear(name).await.map_err(|err| store_error(&err))
+    }
+}
+
+impl ShareKeyStore for BuilderKeyStore {
+    type Error = ClientError;
+
+    fn load<'a>(&'a self, record: &'a str) -> ShareKeyFuture<'a, Option<ShareKeySet>, ClientError> {
+        Box::pin(async move {
+            self.0
+                .load_share_record(record)
+                .await
+                .map_err(|err| store_error(&err))
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        record: &'a str,
+        set: &'a ShareKeySet,
+    ) -> ShareKeyFuture<'a, (), ClientError> {
+        Box::pin(async move {
+            self.0
+                .save_share_record(record, set)
+                .await
+                .map_err(|err| store_error(&err))
+        })
+    }
+
+    fn clear<'a>(&'a self, record: &'a str) -> ShareKeyFuture<'a, (), ClientError> {
+        Box::pin(async move {
+            self.0
+                .clear_share_record(record)
+                .await
+                .map_err(|err| store_error(&err))
+        })
+    }
+
+    fn protection(&self) -> Custody {
+        self.0.protection()
     }
 }
 
@@ -1830,4 +1945,25 @@ pub(crate) async fn encrypt_with_kek(
     out.extend_from_slice(&iv_bytes);
     out.extend(ct.to_vec());
     Ok(out)
+}
+
+/// Decrypt the `IV || ciphertext` record an [`encrypt_with_kek`] call stores,
+/// into its plaintext.
+async fn unwrap_record(record: &JsValue, kek: &web_sys::CryptoKey) -> Result<Vec<u8>, AuthError> {
+    let buf = js_sys::Uint8Array::new(record).to_vec();
+    if buf.len() <= AES_GCM_IV_LEN {
+        return Err(AuthError::Store("wrapped record truncated".into()));
+    }
+    let (iv_bytes, ct_bytes) = buf.split_at(AES_GCM_IV_LEN);
+    let iv = js_sys::Uint8Array::from(iv_bytes);
+    let params = aes_gcm_params(&iv);
+    let ct_buf = ct_bytes.to_vec();
+    let plain_js = JsFuture::from(
+        subtle()?
+            .decrypt_with_object_and_u8_array(&params, kek, &ct_buf)
+            .map_err(|e| AuthError::Store(format!("unwrap decrypt: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AuthError::Store(format!("unwrap decrypt await: {e:?}")))?;
+    Ok(js_sys::Uint8Array::new(&plain_js).to_vec())
 }

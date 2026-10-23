@@ -91,7 +91,7 @@ The header is a MessagePack-encoded enum mirroring the bulk variants with the pa
 | `ShareKeysReplaced` | Answers `ReplaceShareKeys` with its `request_id` once the session holds the new set and the resend of every subscription the change reaches is queued, so every frame after it is filtered by the new set. Says nothing about which keys resolved. A swap over its limit draws `RateLimited` with the same `request_id` instead, and the session keeps its old set. **Built (R95, 2026-10-18).** |
 | `SnapshotBegin` | Control frame: start of initial snapshot for a subscription |
 | `SnapshotPatch` | **Bulk plane.** Snapshot data: `sub_id` + `patchset_zstd` (Zstd-compressed SQLite patchset). One or more frames complete the snapshot. |
-| `SnapshotEnd` | Control frame: snapshot complete, carrying `sub_id` and the cursor at which the snapshot was taken |
+| `SnapshotEnd` | Completes an initial snapshot or an ordinary row catch-up, carrying `sub_id` and the snapshot cursor or replay ceiling, including an empty catch-up |
 | `LivePatch` | **Bulk plane.** Incremental CDC patch: `sub_id` + `cursor` + `patchset_zstd` |
 | `AggregateUpdate` | Incremental or full aggregate result update |
 | `MutationApplied` | Mutation accepted: client sequence number echoed |
@@ -165,11 +165,11 @@ See `12-identity-session-capability.md` for the session model.
 
 ### Snapshot before updates
 
-- After a `Subscribe`, the server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames, then `SnapshotEnd(lsn)` (control).
-- **`SnapshotEnd` cannot overtake the rows it completes. Built (R33, 2026-08-09).** It shares the outbound queue with the `SnapshotPatch` frames rather than going straight to the socket, so a client whose credit window is shut receives neither until it replenishes. It still costs no credit: it waits its turn, it is not rationed. Before this it went out immediately and a backlogged client was told its snapshot was complete over an empty replica, then recorded the resume position that frame carries.
-- No frame goes out until the snapshot read has succeeded (R38). A subscription the server cannot serve draws exactly one `Error` frame, bare and byte-identical whatever the cause, so a refusal never discloses whether the name passed registration.
-- The LSN in `SnapshotEnd` is the point at which the snapshot was taken.
-- Any `LivePatch` frames with LSN > snapshot LSN that arrive after `SnapshotEnd` are applied on top.
+- A fresh `Subscribe` receives `SnapshotBegin`, one or more `SnapshotPatch` frames, and `SnapshotEnd`.
+- An ordinary row catch-up receives its `LivePatch` frames followed by `SnapshotEnd` at the replay ceiling, including when no row changed.
+- `SnapshotEnd` costs no delivery credit and shares the ordered queue with the rows it completes, so a closed credit window cannot release it ahead of pending rows.
+- No frame goes out until the snapshot read has succeeded (R38). A subscription the server cannot serve draws exactly one fixed refusal frame.
+- Live changes after the snapshot or replay ceiling apply on top.
 - `LivePatch` frames overlapping the snapshot are re-applied, not filtered. Neither the snapshot LSN nor a change's WAL position orders by visibility, so a discard rule loses data. Decided at R28 part A, see `04-subscriptions.md`.
 
 ---

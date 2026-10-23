@@ -35,7 +35,8 @@ use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 use connetto_web::RelayHub;
 use connetto_web::auth::{
-    AuthError, LogoutOutcome, PendingWork, forget_retired_content, request_logout, request_unsynced,
+    AuthError, BuilderKeyStore, IdbKeyStore, LogoutOutcome, PendingWork, forget_retired_content,
+    request_logout, request_unsynced,
 };
 use connetto_web::relay::HubReconnect;
 use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
@@ -127,6 +128,14 @@ fn once<T: Transport + 'static>(
     FirstThen::new(transport, || core::future::ready(Err("spent")))
 }
 
+/// The share keys' store a durable build passes beside the fixture replica
+/// keys, over the real `IndexedDB` key store the worker uses.
+async fn share_store() -> BuilderKeyStore {
+    BuilderKeyStore::new(Rc::new(
+        IdbKeyStore::open().await.expect("open the key store"),
+    ))
+}
+
 struct CountingTransport {
     inner: FakeTransport,
     ticket_requests: Rc<Cell<u32>>,
@@ -214,7 +223,11 @@ async fn stranded_worker(
         HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
             .expect("a string identity serializes"),
     )
-    .durable(At { url, exists: false }, Holding(replica_key()))
+    .durable(
+        At { url, exists: false },
+        Holding(replica_key()),
+        share_store().await,
+    )
     .with_gate(Gate::off())
     .connect_driven()
     .await

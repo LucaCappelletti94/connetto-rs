@@ -160,14 +160,12 @@ pub struct SnapshotBegin {
     pub priority: SubscriptionPriority,
 }
 
-/// Server marks the end of an initial snapshot and pins the resume point.
+/// Completes an initial snapshot or row catch-up and pins its resume point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEnd {
-    /// Subscription this snapshot belongs to.
+    /// Subscription whose delivery completed.
     pub sub_id: String,
-    /// Cursor at which the snapshot was read. Row updates with a strictly
-    /// greater cursor apply on top. Updates at or below this point are already
-    /// reflected in the snapshot and are dropped by the client.
+    /// Snapshot read position or row catch-up ceiling, including an empty replay.
     pub cursor: Cursor,
 }
 
