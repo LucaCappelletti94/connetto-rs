@@ -45,21 +45,24 @@ pub fn PhotosPane() -> Element {
         use_signal(std::collections::HashMap::new);
     let src_refresh: Signal<u64> = use_signal(|| 0);
     {
-        let key: Vec<(Uuid, String)> = rows
-            .iter()
-            .map(|row| (row.id, row.content_state.clone().unwrap_or_default()))
-            .collect();
-        let key = (key, *src_refresh.read());
-        let snapshot = rows.clone();
+        // The effect reads the rows and the refresh generation itself, so it runs
+        // again whenever either moves.
+        let live_rows = photos_live.value();
         let cc = content.clone();
         let last_key: Rc<RefCell<Option<PhotoSrcKey>>> = use_hook(|| Rc::new(RefCell::new(None)));
         use_effect(move || {
+            let rows: Vec<crate::Photo> = live_rows.read().iter().cloned().collect();
+            let key: PhotoSrcKey = (
+                rows.iter()
+                    .map(|row| (row.id, row.content_state.clone().unwrap_or_default()))
+                    .collect(),
+                *src_refresh.read(),
+            );
             if last_key.borrow().as_ref() == Some(&key) {
                 return;
             }
-            *last_key.borrow_mut() = Some(key.clone());
+            *last_key.borrow_mut() = Some(key);
             let cc = cc.clone();
-            let rows = snapshot.clone();
             spawn(async move {
                 let mut photo_srcs = photo_srcs;
                 photo_srcs.set(cc.sources(&rows).await);
