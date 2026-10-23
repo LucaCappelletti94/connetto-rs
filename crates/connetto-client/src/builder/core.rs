@@ -31,11 +31,7 @@ use crate::builder::sign_in::HeldCredential;
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
 use crate::live::ConnettoClient;
-#[cfg(not(feature = "native-transport"))]
-use crate::reconnect::NoSleep;
-#[cfg(feature = "native-transport")]
-use crate::reconnect::TokioSleeper;
-use crate::reconnect::{ReconnectPolicy, Sleeper};
+use crate::reconnect::ReconnectPolicy;
 use crate::replica::Encrypted;
 #[cfg(feature = "native-transport")]
 use crate::replica::provision_replica_key;
@@ -173,28 +169,11 @@ type SleeperFn =
 #[cfg(not(feature = "native-transport"))]
 type SleeperFn = Box<dyn FnMut(Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
-/// The backoff sleep a build that named none rides. Native takes the ambient
-/// runtime's timer. Wasm names its own, because the built-in sleep is instant
-/// and turns the backoff into a retry loop with no pause.
+/// The backoff sleep a build that named none rides, the platform timer the
+/// handshake bound waits on. An instant sleep would turn the backoff and the
+/// keepalive wait into a loop that never yields.
 fn default_sleeper() -> SleeperFn {
-    #[cfg(feature = "native-transport")]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = TokioSleeper;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
-    #[cfg(not(feature = "native-transport"))]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = NoSleep;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
+    Box::new(|d| Box::pin(crate::timer_wait(d)))
 }
 
 /// The fields every stage carries and moves into the next.

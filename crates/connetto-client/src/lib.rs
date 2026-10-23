@@ -3064,7 +3064,8 @@ where
     }
 }
 
-/// The platform wait the handshake receive races against its bound.
+/// The platform wait, raced by the handshake receive against its bound and
+/// slept by a build's default backoff and keepalive timers.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 async fn timer_wait(remaining: Duration) {
     tokio::time::sleep(remaining).await;
@@ -3081,13 +3082,14 @@ async fn timer_wait(remaining: Duration) {
     use js_sys::wasm_bindgen::closure::Closure;
     let (tx, rx) = tokio::sync::oneshot::channel();
     // The u32 clamp keeps the JS delay finite, so `try_from` cannot fail.
-    let ms =
-        f64::from(u32::try_from(remaining.as_millis().min(u32::MAX as u128)).unwrap_or(u32::MAX));
+    let ms = f64::from(
+        u32::try_from(remaining.as_millis().min(u128::from(u32::MAX))).unwrap_or(u32::MAX),
+    );
     // The sender sits in a shared cell so the callback stays `Fn` (it takes
     // the sender at most once) and the fallback below can still settle a
     // page with no `setTimeout`.
-    let sender = std::sync::Arc::new(core::cell::RefCell::new(Some(tx)));
-    let callback_sender = std::sync::Arc::clone(&sender);
+    let sender = std::rc::Rc::new(core::cell::RefCell::new(Some(tx)));
+    let callback_sender = std::rc::Rc::clone(&sender);
     // The Function owns the callback and lives across the await, so the timer
     // fires into a live closure, and an abandoned wait detaches it and the
     // pending timer resolves into a no-op.
@@ -3109,10 +3111,8 @@ async fn timer_wait(remaining: Duration) {
                     .is_ok()
             })
     };
-    if !scheduled {
-        if let Some(tx) = sender.take() {
-            let _ = tx.send(());
-        }
+    if !scheduled && let Some(tx) = sender.take() {
+        let _ = tx.send(());
     }
     let _ = rx.await;
 }
