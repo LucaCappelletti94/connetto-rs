@@ -1,0 +1,34 @@
+---
+name: echoes organization
+
+"on":
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: echoes-organization
+  cancel-in-progress: false
+
+# Compares the default branches of every connetto-rs repository as one corpus.
+# Existing duplicates fail it, so it stays out of the required checks.
+jobs:
+  audit:
+    name: Echoes across connetto-rs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: LucaCappelletti94/cargo-echoes@7425be5b8edb997306fa8ec1c33b49bf0576b5d9 # v1.10.1
+        with:
+          organizations: connetto-rs
+          version: 0.8.1
+          threshold: 2
+          min-tokens: 0
+          functions: true
+          fn-min-tokens: 30
+          context-blocks: true
+          context-min-tokens: 30
+          all-targets: true
