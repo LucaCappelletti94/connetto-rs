@@ -50,11 +50,16 @@ fn main() {
     let builder = dioxus::LaunchBuilder::new();
     #[cfg(feature = "desktop")]
     let builder = builder.with_cfg(
-        dioxus::desktop::Config::new().with_window(
-            dioxus::desktop::WindowBuilder::new()
-                .with_title(format!("connetto live demo (pid {})", std::process::id()))
-                .with_inner_size(dioxus::desktop::LogicalSize::new(1024.0, 800.0)),
-        ),
+        dioxus::desktop::Config::new()
+            .with_icon(
+                dioxus::desktop::icon_from_memory(include_bytes!("../../icons/icon.ico"))
+                    .expect("decode the window icon"),
+            )
+            .with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title(format!("connetto live demo (pid {})", std::process::id()))
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(1024.0, 800.0)),
+            ),
     );
     builder.launch(connetto_dioxus_demo::platform::native::Shell);
 }

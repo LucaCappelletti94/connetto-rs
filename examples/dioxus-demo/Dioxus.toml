@@ -1,10 +1,12 @@
 [application]
 name = "connetto-dioxus-demo"
+public_dir = "../icons"
 
 [bundle]
 # The Android applicationId and the iOS bundle identifier. It is also the
 # scheme of the login redirect a phone receives, so it stays lowercase.
 identifier = "dev.connetto.dioxusdemo"
+icon = ["../icons/icon.ico", "../icons/icon.icns", "../icons/icon.png"]
 
 # The gate on the stored secrets (R51, R52). iOS offers Face ID only with the
 # usage description this writes, and Android needs `USE_BIOMETRIC` for the
@@ -39,6 +41,9 @@ NSLocationWhenInUseUsageDescription = "Join a nearby device's hotspot"
 [ios.entitlements]
 "com.apple.developer.devicecheck.appattest-environment" = "development"
 "com.apple.developer.networking.HotspotConfiguration" = true
+
+[web.app]
+title = "connetto live demo"
 
 [web.watcher]
 # Serve index.html for any unmatched path so the SPA handles /auth/callback.
