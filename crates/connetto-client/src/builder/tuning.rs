@@ -3,8 +3,9 @@
 use core::time::Duration;
 
 use crate::{
-    DEFAULT_GRACE, DEFAULT_RESIDUAL_THRESHOLD, DEFAULT_RESTED_STATISTICS_CAP, DEFAULT_TRIM_BUDGET,
-    DEFAULT_TRIM_THRESHOLD, MAX_GRACE, ResidualPass,
+    DEFAULT_ANSWER_WITHIN, DEFAULT_GRACE, DEFAULT_PROBE_AFTER, DEFAULT_RESIDUAL_THRESHOLD,
+    DEFAULT_RESTED_STATISTICS_CAP, DEFAULT_TRIM_BUDGET, DEFAULT_TRIM_THRESHOLD, MAX_GRACE,
+    ResidualPass,
 };
 
 /// The tuning levers a build carries, with their safe bounds applied at the
@@ -21,6 +22,8 @@ pub struct SyncTuning {
     residual_threshold: u64,
     residual_pass: ResidualPass,
     watch_grace: Duration,
+    probe_after: Duration,
+    answer_within: Duration,
 }
 
 impl Default for SyncTuning {
@@ -32,6 +35,8 @@ impl Default for SyncTuning {
             residual_threshold: DEFAULT_RESIDUAL_THRESHOLD,
             residual_pass: ResidualPass::default(),
             watch_grace: DEFAULT_GRACE,
+            probe_after: DEFAULT_PROBE_AFTER,
+            answer_within: DEFAULT_ANSWER_WITHIN,
         }
     }
 }
@@ -117,6 +122,32 @@ impl SyncTuning {
     #[must_use]
     pub const fn watch_grace(&self) -> Duration {
         self.watch_grace
+    }
+
+    /// The inbound silence after which a connected client probes the transport.
+    #[must_use]
+    pub const fn with_probe_after(mut self, bound: Duration) -> Self {
+        self.probe_after = bound;
+        self
+    }
+
+    /// The time a probe (and the opening handshake) waits for an answer before the transport is dropped.
+    #[must_use]
+    pub const fn with_answer_within(mut self, bound: Duration) -> Self {
+        self.answer_within = bound;
+        self
+    }
+
+    /// The inbound silence that arms the probe.
+    #[must_use]
+    pub const fn probe_after(&self) -> Duration {
+        self.probe_after
+    }
+
+    /// The answer bound a probe (and the handshake) waits under.
+    #[must_use]
+    pub const fn answer_within(&self) -> Duration {
+        self.answer_within
     }
 }
 

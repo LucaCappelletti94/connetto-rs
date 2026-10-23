@@ -21,7 +21,7 @@ use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
     MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys, RetireWriter,
-    Subscribe, SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
+    SUBSCRIPTION_REFUSED, Subscribe, SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -184,6 +184,12 @@ pub enum ClientError {
     /// (R91), so the app's transaction rolls back whole and nothing uploads.
     #[error("the install was refused: {0}")]
     InstallRefused(String),
+    /// The server refused the handle's subscription with the wire's one fixed
+    /// phrase. The snapshot never arrives, so a live handle's `changed`
+    /// returns this instead of waiting, and the text is the phrase itself, so
+    /// a display reads what the wire said.
+    #[error("subscription refused")]
+    SubscriptionRefused,
     /// The SQLite capture session failed.
     #[error("session error: {0}")]
     Session(String),
@@ -230,6 +236,10 @@ pub enum ClientError {
     /// meets this keeps working and retries when a transport arrives.
     #[error("not connected: this operation needs a server")]
     NotConnected,
+    /// The opening handshake drew no answer within the answer bound, so the
+    /// transport is dropped and the dial goes out again.
+    #[error("the handshake drew no answer within the answer bound")]
+    HandshakeUnanswered,
     /// The client's pump stopped on a fault no reconnect can cure, named here.
     #[error("the client stopped: {0}")]
     Stopped(String),
@@ -1418,6 +1428,12 @@ fn server_wins(conflict: ConflictType) -> ConflictAction {
     }
 }
 
+/// The inbound silence after which a connected client probes the transport.
+pub const DEFAULT_PROBE_AFTER: Duration = Duration::from_secs(15);
+
+/// The time a probe (and the opening handshake) waits for an answer.
+pub const DEFAULT_ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
 /// The schedule a deferred write is sent again on. Uncapped, because a write
 /// the server could not settle is kept like an offline one.
 static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
@@ -1445,6 +1461,45 @@ pub struct ResendTimer {
 
 impl ResendTimer {
     /// How long to wait before sending the deferred writes again.
+    #[must_use]
+    pub const fn wait(&self) -> Duration {
+        self.wait
+    }
+}
+
+/// The keepalive phase of a live connection.
+///
+/// The clock is the time since the last inbound frame, and any inbound frame,
+/// a `Pong` among them, restarts it.
+enum KeepalivePhase {
+    /// No probe out. The `probe_after` deadline runs from `last_inbound`.
+    Idle {
+        /// The moment of the last inbound frame.
+        last_inbound: Moment,
+    },
+    /// A probe out carries `nonce`. The `answer_within` deadline runs from
+    /// `anchor`, which a later frame moves.
+    Probed {
+        /// The nonce the probe carries.
+        nonce: u64,
+        /// The moment the answer deadline runs from, the probe send or a
+        /// frame that arrived after it.
+        anchor: Moment,
+    },
+}
+
+/// One armed keepalive deadline, for whoever drives the pump to sleep on
+/// before calling [`ConnettoConnection::keepalive_fire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveTimer {
+    /// How many deadlines were armed when this one stood.
+    armed: u64,
+    /// The wait the deadline was set for.
+    wait: Duration,
+}
+
+impl KeepaliveTimer {
+    /// How long to wait before firing the deadline.
     #[must_use]
     pub const fn wait(&self) -> Duration {
         self.wait
@@ -1502,7 +1557,6 @@ impl PartialEq for ShareKeyTimer {
 }
 
 impl Eq for ShareKeyTimer {}
-
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
 /// write is reverted.
@@ -2859,10 +2913,6 @@ struct HandshakeInput<'a> {
 
 /// Run the opening handshake and read the ack, shared by the first connect
 /// and every resume.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The opening exchange keeps its ordered protocol checks together."
-)]
 async fn exchange_handshake<T>(
     transport: &mut T,
     input: HandshakeInput<'_>,
@@ -2928,10 +2978,10 @@ where
     // The server opens every connection with a challenge (R91) the handshake answers nothing with.
     #[cfg(feature = "device-identity")]
     let mut challenge: Option<[u8; 32]> = None;
-    let frame = transport
-        .recv()
-        .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    // The bound runs from the Handshake send to the ack, so a frozen server
+    // cannot hold a dial open.
+    let bound = Moment::now(&SystemClock).after(config.tuning.answer_within());
+    let frame = bounded_recv(transport, bound).await?;
     let frame = match frame {
         Some(IncomingFrame::Control(ControlMessage::Challenge(challenge_frame))) => {
             #[cfg(feature = "device-identity")]
@@ -2942,10 +2992,7 @@ where
             {
                 let _ = challenge_frame;
             }
-            transport
-                .recv()
-                .await
-                .map_err(|e| ClientError::Transport(e.to_string()))?
+            bounded_recv(transport, bound).await?
         }
         other => other,
     };
@@ -2985,6 +3032,89 @@ where
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
     }
+}
+
+/// Read one frame under the handshake's answer bound, in real elapsed time.
+///
+/// A frame that arrives first wins, and a bound that fires late from a
+/// throttled timer only errors when the real clock says the bound is past.
+async fn bounded_recv<T>(
+    transport: &mut T,
+    bound: Moment,
+) -> Result<Option<IncomingFrame>, ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let recv = transport.recv();
+    tokio::pin!(recv);
+    loop {
+        let remaining = Moment::now(&SystemClock).until(bound);
+        if remaining.is_zero() {
+            return Err(ClientError::HandshakeUnanswered);
+        }
+        tokio::select! {
+            biased;
+            frame = &mut recv => {
+                return frame
+                    .map_err(|e| ClientError::Transport(e.to_string()));
+            }
+            () = timer_wait(remaining) => {}
+        }
+    }
+}
+
+/// The platform wait the handshake receive races against its bound.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn timer_wait(remaining: Duration) {
+    tokio::time::sleep(remaining).await;
+}
+
+/// The browser's wait, a `setTimeout` that fires a channel polled beside the
+/// receive. The closure lives beside the receiver, so it stays valid until
+/// the wait ends either way, and dropping the future invalidates it.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+async fn timer_wait(remaining: Duration) {
+    use js_sys::wasm_bindgen::JsCast;
+
+    use js_sys::wasm_bindgen::JsValue;
+    use js_sys::wasm_bindgen::closure::Closure;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // The u32 clamp keeps the JS delay finite, so `try_from` cannot fail.
+    let ms =
+        f64::from(u32::try_from(remaining.as_millis().min(u32::MAX as u128)).unwrap_or(u32::MAX));
+    // The sender sits in a shared cell so the callback stays `Fn` (it takes
+    // the sender at most once) and the fallback below can still settle a
+    // page with no `setTimeout`.
+    let sender = std::sync::Arc::new(core::cell::RefCell::new(Some(tx)));
+    let callback_sender = std::sync::Arc::clone(&sender);
+    // The Function owns the callback and lives across the await, so the timer
+    // fires into a live closure, and an abandoned wait detaches it and the
+    // pending timer resolves into a no-op.
+    let callback: js_sys::Function<fn() -> JsValue> =
+        js_sys::Function::from_closure(Closure::<dyn Fn() -> JsValue>::new(move || {
+            if let Some(tx) = callback_sender.take() {
+                let _ = tx.send(());
+            }
+            JsValue::UNDEFINED
+        }));
+    let scheduled = {
+        let global = js_sys::global();
+        js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .is_some_and(|set_timeout| {
+                set_timeout
+                    .call2(&global, &JsValue::from(&callback), &JsValue::from_f64(ms))
+                    .is_ok()
+            })
+    };
+    if !scheduled {
+        if let Some(tx) = sender.take() {
+            let _ = tx.send(());
+        }
+    }
+    let _ = rx.await;
 }
 
 /// Install an update hook recording the name of every table whose rows change on
@@ -3260,6 +3390,14 @@ pub struct ConnettoConnection<T: Transport> {
     resend: Resend,
     /// How many resends were ever armed, so a pump tells a fresh timer from the one it sleeps on.
     resends_armed: u64,
+    /// Where the keepalive stands, the silence since the last inbound frame
+    /// and the probe out if there is one.
+    keepalive: KeepalivePhase,
+    /// How many keepalive deadlines were ever armed, so a pump tells a fresh
+    /// timer from the one it sleeps on.
+    keepalive_armed: u64,
+    /// The nonce the next probe carries, fresh for every probe.
+    next_probe_nonce: u64,
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
     /// Optional source of fresh access tokens, consulted on every resume so a
@@ -3278,6 +3416,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// re-apply (R48 decision 3). Held per subscription because two can be
     /// replaced at once, and cleared when each one's `SnapshotEnd` lands.
     resyncing: HashSet<String>,
+    /// Subscriptions the server has refused with the one fixed phrase and has
+    /// not served or released since. A reader that builds on the connection (a
+    /// relay hub, at construction) reads them to refuse what the server would.
+    refused: HashSet<String>,
     /// Whether this connection already emptied every subscribed table for a
     /// cursor past where its timeline ended (R73).
     history_cleared: bool,
@@ -3628,11 +3770,17 @@ where
             transaction_state: AnsiTransactionManager::default(),
             resend: Resend::Idle,
             resends_armed: 0,
+            keepalive: KeepalivePhase::Idle {
+                last_inbound: Moment::now(&SystemClock),
+            },
+            keepalive_armed: 0,
+            next_probe_nonce: 1,
             config: config.clone(),
             token_source: None,
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
+            refused: HashSet::new(),
             history_cleared: false,
             cursor_subjects,
             open_snapshots: HashSet::new(),
@@ -3831,6 +3979,11 @@ where
             #[cfg(feature = "device-identity")]
             number: ConnectionNumber(self.handshakes),
         });
+        // The ack is the first inbound frame, so the clock starts with it.
+        self.keepalive = KeepalivePhase::Idle {
+            last_inbound: Moment::now(&SystemClock),
+        };
+        self.keepalive_armed += 1;
         self.history_cleared = false;
         self.bound_writer = bound;
         self.share_key_settled = self.share_key_generation;
@@ -4669,6 +4822,106 @@ where
         };
     }
 
+    /// The next keepalive deadline, `None` while no socket stands.
+    ///
+    /// A pump that owns a timer sleeps for its [`KeepaliveTimer::wait`] and
+    /// then calls [`keepalive_fire`](Self::keepalive_fire). A frame that
+    /// arrives in between arms a fresh one, which a pump reads on its next
+    /// step and a fire rejects through the `armed` mark.
+    #[must_use]
+    pub fn keepalive_timer(&self) -> Option<KeepaliveTimer> {
+        if !self.is_connected() {
+            return None;
+        }
+        let deadline = match &self.keepalive {
+            KeepalivePhase::Idle { last_inbound } => {
+                last_inbound.after(self.config.tuning.probe_after())
+            }
+            KeepalivePhase::Probed { anchor, .. } => {
+                anchor.after(self.config.tuning.answer_within())
+            }
+        };
+        Some(KeepaliveTimer {
+            armed: self.keepalive_armed,
+            wait: Moment::now(&SystemClock).until(deadline),
+        })
+    }
+
+    /// Fire one armed keepalive deadline, sending the probe the `probe_after`
+    /// bound owes or dropping the transport the `answer_within` bound owes
+    /// through the same path a transport error takes.
+    ///
+    /// A deadline a frame has re-armed is a no-op, and the fire compares real
+    /// elapsed time, so a late fire from a throttled timer never touches a
+    /// link that drew a frame in real time.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Transport`] when the probe cannot be sent.
+    pub async fn keepalive_fire(&mut self, timer: KeepaliveTimer) -> Result<(), ClientError> {
+        if timer.armed != self.keepalive_armed || !self.is_connected() {
+            return Ok(());
+        }
+        match self.keepalive {
+            KeepalivePhase::Idle { last_inbound } => {
+                let due = last_inbound.after(self.config.tuning.probe_after());
+                if !Moment::now(&SystemClock).until(due).is_zero() {
+                    return Ok(());
+                }
+                let nonce = self.next_probe_nonce;
+                self.next_probe_nonce += 1;
+                match self
+                    .wire()?
+                    .transport
+                    .send_control(ControlMessage::Ping(Ping { nonce }))
+                    .await
+                {
+                    // The probe send is the anchor a later frame would move.
+                    Ok(()) => {
+                        self.keepalive = KeepalivePhase::Probed {
+                            nonce,
+                            anchor: Moment::now(&SystemClock),
+                        };
+                        self.keepalive_armed += 1;
+                        Ok(())
+                    }
+                    // A probe that cannot be sent is the link dying, dropped
+                    // like any send failure.
+                    Err(e) => {
+                        self.disconnected();
+                        Err(ClientError::Transport(e.to_string()))
+                    }
+                }
+            }
+            KeepalivePhase::Probed { anchor, .. } => {
+                let due = anchor.after(self.config.tuning.answer_within());
+                if !Moment::now(&SystemClock).until(due).is_zero() {
+                    return Ok(());
+                }
+                self.disconnected();
+                Ok(())
+            }
+        }
+    }
+
+    /// Note one inbound frame. The silence clock restarts from it, a probe
+    /// answered by its own nonce clears, and a stale-nonce answer restarts the
+    /// clock and leaves the probe out.
+    fn note_inbound(&mut self, pong_nonce: Option<u64>) {
+        let now = Moment::now(&SystemClock);
+        self.keepalive = match self.keepalive {
+            KeepalivePhase::Idle { .. } => KeepalivePhase::Idle { last_inbound: now },
+            KeepalivePhase::Probed { nonce, .. } => {
+                if Some(nonce) == pong_nonce {
+                    KeepalivePhase::Idle { last_inbound: now }
+                } else {
+                    KeepalivePhase::Probed { nonce, anchor: now }
+                }
+            }
+        };
+        self.keepalive_armed += 1;
+    }
+
     /// The live socket, or the not-connected refusal.
     ///
     /// Every method that speaks to the server goes through this, so the offline
@@ -4694,6 +4947,11 @@ where
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
+        // No socket means no clock to keep, and no probe stays owed.
+        self.keepalive = KeepalivePhase::Idle {
+            last_inbound: Moment::now(&SystemClock),
+        };
+        self.keepalive_armed += 1;
         // The writer identity a connection bound to is per-connection; a fresh
         // handshake rebinds, and a held bind re-signs against the fresh nonce.
         self.bound_writer = None;
@@ -6037,10 +6295,18 @@ where
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             subscriptions::end(&mut self.db, sub_id)?;
         }
+        self.refused.remove(sub_id);
         self.open_snapshots.remove(sub_id);
         self.resyncing.remove(sub_id);
         self.unfenced_computed.remove(sub_id);
         Ok(())
+    }
+
+    /// The subscriptions the server has refused with the one fixed phrase and
+    /// not served or released since, as of this connection's last frame.
+    #[must_use]
+    pub fn refused_subscriptions(&self) -> &HashSet<String> {
+        &self.refused
     }
 
     /// Read one inbound frame, apply it if it is a patch, and report what
@@ -6112,6 +6378,14 @@ where
         &mut self,
         frame: Option<IncomingFrame>,
     ) -> Result<Option<ClientEvent>, ClientError> {
+        // Any inbound frame, a Pong among them, restarts the silence clock.
+        let pong_nonce = match &frame {
+            Some(IncomingFrame::Control(ControlMessage::Pong(pong))) => Some(pong.nonce),
+            _ => None,
+        };
+        if frame.is_some() {
+            self.note_inbound(pong_nonce);
+        }
         let event = match frame {
             // A peer that closed cleanly is as gone as one that failed, so the
             // wire goes and the change is announced behind this event.
@@ -6614,6 +6888,9 @@ where
                 if self.resyncing.remove(&end.sub_id) {
                     self.reapply_pending()?;
                 }
+                // A plain end means the read was served, so a refusal
+                // correlated to this sub is answered.
+                self.refused.remove(&end.sub_id);
                 self.publish_coverage()?;
                 Ok(ClientEvent::SnapshotEnd { sub_id: end.sub_id })
             }
@@ -6700,6 +6977,11 @@ where
                 url: grant.url,
             }),
             ControlMessage::NonFatalError(err) => {
+                if let Some(id) = &err.related_to
+                    && err.detail == SUBSCRIPTION_REFUSED
+                {
+                    self.refused.insert(id.clone());
+                }
                 self.refuse_declaration(err.related_to.as_deref());
                 Ok(ClientEvent::NonFatal {
                     related_to: err.related_to,

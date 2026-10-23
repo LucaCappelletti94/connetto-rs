@@ -57,6 +57,25 @@ impl Moment {
             .saturating_sub(self.monotonic)
             .max(back.wall.saturating_sub(self.wall))
     }
+
+    /// The moment `bound` after this one, on both readings.
+    #[must_use]
+    pub fn after(self, bound: Duration) -> Self {
+        Self {
+            monotonic: self.monotonic + bound,
+            wall: self.wall + bound,
+        }
+    }
+
+    /// The time left from this moment until `deadline`, as the smaller of the
+    /// monotonic and wall deltas, so it runs out when either reading says so.
+    #[must_use]
+    pub fn until(self, deadline: Moment) -> Duration {
+        deadline
+            .monotonic
+            .saturating_sub(self.monotonic)
+            .min(deadline.wall.saturating_sub(self.wall))
+    }
 }
 
 /// The two clocks a [`Moment`] reads, a sleep-counting monotonic and a wall.

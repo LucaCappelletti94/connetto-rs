@@ -75,8 +75,9 @@ use connetto_client::away::Clock as _;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer, SystemClock,
-    WriterGrant, WriterRequest, subscription_is_aggregate, subscription_tables,
+    GateController, GateSink, ImportChoices, ImportOutcome, KeepaliveTimer, PolicyTables,
+    ResendTimer, SystemClock, WriterGrant, WriterRequest, subscription_is_aggregate,
+    subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
@@ -525,6 +526,11 @@ struct HubState {
     /// `SnapshotEnd` triggers the tab re-snapshot, which carries that reason on
     /// rather than restating one cause as another.
     resyncing: HashMap<String, FullResyncReason>,
+    /// Upstream subscriptions the server has refused, keyed by the worker's
+    /// upstream sub id, each with the tables that subscription backs. A tab
+    /// reading a table every upstream for it has been refused gets the
+    /// server's fixed phrase instead of a snapshot that never arrives.
+    refused_upstreams: HashMap<String, HashSet<String>>,
 
     /// Resolves waiting on a server ticket answer, each with the tab and
     /// request to answer and the `performance.now` instant its wait ends.
@@ -1169,6 +1175,15 @@ where
                 state.resync_tables.insert(sub_id.clone(), tables);
             }
         }
+        // The worker already recorded the upstream subscriptions the server
+        // refused before the hub existed, so later tabs learn of them.
+        for sub_id in worker.refused_subscriptions() {
+            if let Some(tables) = state.resync_tables.get(sub_id) {
+                state
+                    .refused_upstreams
+                    .insert(sub_id.clone(), tables.clone());
+            }
+        }
     }
     state
 }
@@ -1254,6 +1269,8 @@ enum Wake {
     Ticket,
     /// The worker's resend of the writes the server deferred fell due.
     Resend,
+    /// The worker's keepalive deadline fell due.
+    Keepalive(KeepaliveTimer),
     /// The worker's gate prompt resolved.
     Gate(Option<GateAskOutcome>),
 }
@@ -1330,6 +1347,8 @@ where
             }
         };
         tokio::pin!(resend_wait);
+        let keepalive_wait = keepalive_wake(self.worker.keepalive_timer());
+        tokio::pin!(keepalive_wait);
         // The in-flight gate prompt, if any, driven alongside the other
         // wakes and handed back to the controller when another wake wins.
         let mut ask = self.gate.take_ask();
@@ -1359,6 +1378,7 @@ where
                 () = core::future::ready(()), if unverified => Wake::Verify,
                 () = &mut ticket_wait, if ticket_ms.is_some() => Wake::Ticket,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
+                timer = &mut keepalive_wait => Wake::Keepalive(timer),
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
             }
         };
@@ -1394,6 +1414,29 @@ where
                     Err(err) => self.serve_upstream(reconnect, Err(err)).await,
                 }
             }
+            Wake::Keepalive(timer) => self.fire_keepalive(reconnect, timer).await,
+        }
+    }
+
+    /// Fire the worker's keepalive deadline, recovering as from any loss when
+    /// an unanswered probe dropped the transport.
+    async fn fire_keepalive<F, S>(
+        &mut self,
+        reconnect: Option<&mut HubReconnect<F, S>>,
+        timer: KeepaliveTimer,
+    ) -> Result<bool, RelayError>
+    where
+        U: MaybeSend + 'static,
+        F: TransportFactory<Transport = U>,
+        S: Sleeper,
+    {
+        match self.worker.keepalive_fire(timer).await {
+            Ok(()) if self.worker.is_connected() => Ok(true),
+            Ok(()) => {
+                self.serve_upstream(reconnect, Err(ClientError::NotConnected))
+                    .await
+            }
+            Err(err) => self.serve_upstream(reconnect, Err(err)).await,
         }
     }
 
@@ -2688,11 +2731,16 @@ where
 /// its sub id, leaving the tab and its siblings alive, mirroring the direct
 /// server. An aggregate registers a private upstream sub. A row subscription is
 /// answered from the worker replica and its tables recorded for later routing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the subscription needs the worker, the routes, the blank state, the local tables and the refused tables, none of which belongs on another's struct"
+)]
 async fn handle_tab_subscribe<U>(
     worker: &mut ConnettoConnection<U>,
     agg_routes: &mut HashMap<String, AggRoute>,
     blank: &mut BlankState,
     local_tables: &HashSet<String>,
+    refused_tables: &HashSet<String>,
     tab: &mut TabState,
     id: TabId,
     subscribe: Subscribe,
@@ -2717,6 +2765,14 @@ where
                     return Ok(());
                 }
             };
+            // The server itself refuses any subscription reading a table it
+            // cannot serve, so the hub answers the same fixed phrase and no
+            // snapshot, rather than an empty one.
+            if !tables.is_disjoint(refused_tables) {
+                tracing::warn!(tab = %id, sub_id = %subscribe.sub_id, "tab subscription reads a fully refused upstream");
+                send_tab_nonfatal(tab, &subscribe.sub_id, SUBSCRIPTION_REFUSED);
+                return Ok(());
+            }
             if let Err(err) = serve_snapshot(
                 worker,
                 blank,
@@ -2741,6 +2797,29 @@ where
     }
 }
 
+/// The tables whose covering upstream subscriptions the server has all
+/// refused, so the hub can never serve them a snapshot and answers a tab
+/// reading one with the server's fixed phrase.
+fn fully_refused_tables(state: &HubState) -> HashSet<String> {
+    let mut coverers: HashMap<String, HashSet<String>> = HashMap::new();
+    for (sub_id, tables) in &state.resync_tables {
+        for table in tables {
+            coverers
+                .entry(table.clone())
+                .or_default()
+                .insert(sub_id.clone());
+        }
+    }
+    coverers
+        .into_iter()
+        .filter(|(_, subs)| {
+            subs.iter()
+                .all(|sub_id| state.refused_upstreams.contains_key(sub_id))
+        })
+        .map(|(table, _)| table)
+        .collect()
+}
+
 /// Handle one control frame from a tab.
 #[expect(
     clippy::too_many_lines,
@@ -2757,6 +2836,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    let refused_tables = fully_refused_tables(state);
     let Some(tab) = state.tabs.get_mut(&id) else {
         return Ok(());
     };
@@ -2840,6 +2920,7 @@ where
                 &mut state.agg_routes,
                 &mut state.blank,
                 &state.local_tables,
+                &refused_tables,
                 tab,
                 id,
                 subscribe,
@@ -4240,6 +4321,17 @@ fn fetch_deadline_ms(pending: &[PendingHubFetch]) -> Option<i32> {
         .min()
 }
 
+/// Resolve with the worker's keepalive deadline once it falls due, never when
+/// no socket stands. The wait is at least one millisecond, so a due deadline
+/// still yields to the other wakes.
+async fn keepalive_wake(timer: Option<KeepaliveTimer>) -> KeepaliveTimer {
+    let Some(timer) = timer else {
+        return core::future::pending().await;
+    };
+    sleep_ms(i32::try_from(timer.wait().as_millis().max(1)).unwrap_or(i32::MAX)).await;
+    timer
+}
+
 /// Milliseconds until the worker's armed resend falls due, `None` when none is
 /// armed. A newly armed resend takes its deadline from now, and one already
 /// armed keeps the deadline it had.
@@ -4465,6 +4557,7 @@ where
             Ok(())
         }
         ClientEvent::SnapshotEnd { sub_id } => {
+            state.refused_upstreams.remove(&sub_id);
             if let Some(reason) = state.resyncing.remove(&sub_id) {
                 resnapshot_after_resync(worker, state, &sub_id, &reason)?;
             }
@@ -4681,8 +4774,9 @@ fn send_tab_rate_limited(tab: &TabState, related_to: &str, retry_after_ms: u64) 
 /// tab subscription. A row upstream maps to every tab subscription reading one
 /// of its tables, mirroring the resync fan-out, so a rejected replica feed
 /// surfaces on each affected tab rather than vanishing. An error the hub cannot
-/// correlate to a tab is dropped.
-fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &str) {
+/// correlate to a tab is dropped. A refusal of one of its own upstream
+/// subscriptions is also recorded, so a tab arriving later learns of it.
+fn forward_worker_nonfatal(state: &mut HubState, related_to: Option<&str>, detail: &str) {
     let Some(upstream) = related_to else {
         return;
     };
@@ -4692,12 +4786,17 @@ fn forward_worker_nonfatal(state: &HubState, related_to: Option<&str>, detail: &
         }
         return;
     }
-    let Some(tables) = state.resync_tables.get(upstream) else {
+    let Some(tables) = state.resync_tables.get(upstream).cloned() else {
         return;
     };
+    if detail == SUBSCRIPTION_REFUSED {
+        state
+            .refused_upstreams
+            .insert(upstream.to_owned(), tables.clone());
+    }
     for tab in state.tabs.values() {
         for sub in &tab.subs {
-            if !sub.tables.is_disjoint(tables) {
+            if !sub.tables.is_disjoint(&tables) {
                 send_tab_nonfatal(tab, &sub.sub_id, detail);
             }
         }
@@ -5755,6 +5854,7 @@ mod tests {
             &mut HashMap::new(),
             &mut blank,
             &local,
+            &std::collections::HashSet::new(),
             &mut tab,
             1,
             subscribe,

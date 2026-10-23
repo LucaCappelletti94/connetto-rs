@@ -26,7 +26,6 @@ native-transport = [
   "tokio/rt",
   "tokio/rt-multi-thread",
   "tokio/net",
-  "tokio/time",
   "tokio/io-util",
   "dep:getrandom",
 ]
@@ -133,11 +132,12 @@ zip = { version = "4.6.1", default-features = false }
 # The replica file an identity owns is named from a SHA-256 over the id's own
 # serde encoding, so identity never reaches the filename through `Display`.
 sha2 = "0.10"
-# The library core needs only the runtime-agnostic pieces, which compile on
-# wasm32. The runtime, net, and time features arrive with native-transport.
+# The keepalive handshake bound and the native timer wait need the time
+# module on every non-wasm build, native-transport or not.
 tokio = { version = "1", default-features = false, features = [
   "sync",
   "macros",
+  "time",
 ] }
 thiserror.workspace = true
 # The hotspot machine's answer, waited on by the API methods (R76).
