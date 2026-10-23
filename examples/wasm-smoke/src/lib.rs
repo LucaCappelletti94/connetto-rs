@@ -509,4 +509,32 @@ pub mod workers {
             .map(drop)
             .map_err(JsValue::from)
     }
+
+    /// Connect a relay tab to the DB worker over its own wire channel, its
+    /// mirror answering views and routing share-key changes as the worker's.
+    ///
+    /// # Errors
+    ///
+    /// The announce, channel or handshake failure, as text.
+    pub async fn connect_relay_tab(
+        client_id: &str,
+    ) -> Result<
+        connetto_client::ConnettoConnection<crate::MessageTransport<web_sys::BroadcastChannel>>,
+        String,
+    > {
+        let wire = format!("connetto-wire-{client_id}");
+        announce_tab(&wire)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let transport = crate::MessageTransport::<web_sys::BroadcastChannel>::new(&wire)
+            .map_err(|err| format!("{err:?}"))?;
+        connetto_client::ClientBuilder::new(
+            demo_schema().relay_mirror(),
+            crate::build::Once::new(transport),
+        )
+        .with_client_id(client_id)
+        .connect_driven()
+        .await
+        .map_err(|err| err.to_string())
+    }
 }

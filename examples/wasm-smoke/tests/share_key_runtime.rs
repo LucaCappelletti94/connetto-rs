@@ -13,12 +13,9 @@ mod harness;
 use core::time::Duration;
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery,
-};
+use connetto_client::{ClientEvent, ConnettoClient, Grant, LiveQuery};
 use connetto_core::auth::CapabilitySubject;
-use connetto_wasm_smoke::build::Once;
-use connetto_wasm_smoke::workers::{announce_tab, await_db_worker_ready, demo_schema, sleep};
+use connetto_wasm_smoke::workers::{await_db_worker_ready, connect_relay_tab, sleep};
 use connetto_wasm_smoke::{MessageTransport, locks};
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -71,17 +68,6 @@ fn spawn_photo_worker() -> web_sys::Worker {
     worker
 }
 
-/// A relay tab whose mirror routes share-key changes to the worker.
-async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
-    let wire = format!("connetto-wire-{client_id}");
-    announce_tab(&wire).await.expect("announce the tab");
-    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
-        .with_client_id(client_id)
-        .connect_driven()
-        .await
-        .expect("tab connect through the wire channel")
-}
 /// One tab of the worker, its lock held, its pump running, watching photos.
 struct Tab {
     client: ConnettoClient<MessageTransport<BroadcastChannel>>,
@@ -94,7 +80,9 @@ impl Tab {
     async fn open(name: &str) -> Self {
         let client_id = format!("{name}-{}", rosetta_uuid::Uuid::new_v4());
         let lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-        let mut conn = connect_tab(&client_id).await;
+        let mut conn = connect_relay_tab(&client_id)
+            .await
+            .expect("tab connect through the wire channel");
         conn.subscribe(&format!("{name}-photos"), "SELECT * FROM photos")
             .await
             .expect("photo subscribe");

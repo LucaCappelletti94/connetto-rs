@@ -12,11 +12,11 @@ mod common;
 mod harness;
 
 use connetto_client::dsl::Watchable;
-use connetto_wasm_smoke::build::{self, Once};
+use connetto_wasm_smoke::build;
 use connetto_wasm_smoke::workers::demo_schema;
 
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
-use connetto_wasm_smoke::workers::{announce_tab, await_db_worker_ready};
+use connetto_wasm_smoke::workers::await_db_worker_ready;
 use connetto_wasm_smoke::{MessageTransport, locks};
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -62,12 +62,7 @@ fn spawn_share_worker(glue_url: &str) -> (web_sys::Worker, connetto_web::workers
 /// the keys it holds to the tab, so the tab's mirror answers its views as the
 /// worker's replica does.
 async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
-    let wire = format!("connetto-wire-{client_id}");
-    announce_tab(&wire).await.expect("announce the tab");
-    let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
-        .with_client_id(client_id)
-        .connect_driven()
+    connetto_wasm_smoke::workers::connect_relay_tab(client_id)
         .await
         .expect("tab connect through the wire channel")
 }

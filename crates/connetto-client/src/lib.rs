@@ -4880,6 +4880,7 @@ where
             .filter(|(_, wait)| now >= wait.deadline)
             .map(|(id, _)| id.clone())
             .collect();
+        let expired = !overdue.is_empty();
         for id in overdue {
             if let Some(wait) = self.relay_share_key_waits.remove(&id) {
                 let _ = wait.answer.send(Err(ClientError::Transport(
@@ -4899,7 +4900,7 @@ where
         {
             tracing::warn!("a share-key answer overran its bound, dropping the connection");
             self.disconnected();
-        } else {
+        } else if expired {
             self.recompute_share_key_deadline();
         }
     }

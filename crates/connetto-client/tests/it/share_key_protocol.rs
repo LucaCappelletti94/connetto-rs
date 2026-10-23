@@ -90,19 +90,7 @@ impl Transport for Script {
     }
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
-        let frames = Arc::clone(&self.frames);
-        let closed = Arc::clone(&self.closed);
-        async move {
-            loop {
-                if closed.load(Ordering::Acquire) {
-                    return Ok(None);
-                }
-                if let Some(frame) = frames.lock().pop_front() {
-                    return Ok(Some(frame));
-                }
-                tokio::task::yield_now().await;
-            }
-        }
+        super::support::scripted_recv(&self.frames, &self.closed)
     }
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
