@@ -2,7 +2,7 @@
 name: echoes-post
 
 "on":
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] the job reads only the scan's payload
     workflows: [echoes]
     types: [completed]
 
