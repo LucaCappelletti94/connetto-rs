@@ -505,6 +505,8 @@ jobs:
       # fails there. The secret-store script reads the same variable.
       CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
       CARGO_INCREMENTAL: "0"
+      # Six or more parallel thin-LTO links exhaust a 22 GiB heavy VM, four peak at 18.3 GiB.
+      CARGO_BUILD_JOBS: ${{ github.event_name == 'pull_request' && 'default' || '4' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
