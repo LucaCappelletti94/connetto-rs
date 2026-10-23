@@ -45,7 +45,9 @@ use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::PendingWork;
 use connetto_web::builder::{AttachedTab, TabTopology, WebClientBuilder};
 use connetto_web::unlock::serve_account_choice;
-use connetto_web::{MessageTransport, TabContent, TabResolved, deliver_login_code, workers};
+use connetto_web::{
+    MessageTransport, ObjectUrl, TabContent, TabResolved, deliver_login_code, workers,
+};
 use connetto_yew::use_live;
 use connetto_yew_web_demo::{short_id, status_label};
 use diesel::prelude::*;
@@ -1393,6 +1395,7 @@ fn panes_skeleton() -> Html {
 #[derive(Properties, PartialEq)]
 struct PhotoStorageControlsProps {
     content: ContentHandle,
+    refresh: UseStateHandle<u64>,
 }
 
 #[function_component(PhotoStorageControls)]
@@ -1434,14 +1437,17 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
     let fetch = {
         let content = Rc::clone(&props.content.0);
         let message = message.clone();
+        let refresh = props.refresh.clone();
         Callback::from(move |_| {
             let content = Rc::clone(&content);
             let message = message.clone();
+            let refresh = refresh.clone();
             spawn_local(async move {
                 let result = content.fetch_pinned().await.map_or_else(
                     |err| format!("fetch failed: {err}"),
                     |ids| format!("fetched {} pinned file(s)", ids.len()),
                 );
+                refresh.set(*refresh + 1);
                 message.set(Some(result));
             });
         })
@@ -1489,6 +1495,14 @@ fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
     }
 }
 
+#[derive(Clone)]
+enum PhotoUrl {
+    /// The signed server URL.
+    Remote(String),
+    /// The local bytes through an owned object URL, revoked when the last owner drops.
+    Local(ObjectUrl),
+}
+
 /// The client the dashboard drives, passed once from [`App`] when it is ready.
 #[derive(Properties, PartialEq)]
 struct DashboardProps {
@@ -1528,27 +1542,50 @@ fn dashboard(props: &DashboardProps) -> Html {
         .map_or_else(|| "pending".to_owned(), |value| value.to_string());
     let grouped_text = grouped_label(&counts_by_quantity.value());
 
-    // Resolved signed URLs for available photos. Refetched (not cached) whenever the
-    // set of available photos changes, so a stale ticket never wedges the panel.
-    let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, String>::new);
+    // The display source of each photo's bytes, refetched on a row's id or content
+    // state change and when the fetch button restores bytes, so a stale ticket
+    // never wedges the panel.
+    let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, PhotoUrl>::new);
+    let src_refresh = use_state(|| 0_u64);
     {
         let content = Rc::clone(&props.content.0);
         let photo_urls = photo_urls.clone();
-        let available: Vec<(rosetta_uuid::Uuid, Vec<u8>)> = photo_rows
+        let rows: Vec<(rosetta_uuid::Uuid, Vec<u8>, bool)> = photo_rows
             .iter()
-            .filter(|p| p.content_state.as_deref() == Some("available"))
-            .map(|p| (p.id, p.content_id.clone()))
+            .map(|p| {
+                (
+                    p.id,
+                    p.content_id.clone(),
+                    p.content_state.as_deref() == Some("available"),
+                )
+            })
             .collect();
-        let key: Vec<rosetta_uuid::Uuid> = available.iter().map(|(id, _)| *id).collect();
+        let key = (
+            rows.iter()
+                .map(|(id, _, available)| (*id, *available))
+                .collect::<Vec<_>>(),
+            *src_refresh,
+        );
         use_effect_with(key, move |_| {
             spawn_local(async move {
                 let mut new_urls = HashMap::new();
-                for (id, content_id) in available {
-                    if let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) {
-                        let file_id = FileId::from_bytes(bytes);
-                        if let TabResolved::Remote { url } = content.resolve(file_id).await {
-                            new_urls.insert(id, url);
+                for (id, content_id, available) in rows {
+                    let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) else {
+                        continue;
+                    };
+                    let file_id = FileId::from_bytes(bytes);
+                    let resolved = content.resolve(file_id).await;
+                    match resolved {
+                        TabResolved::Remote { url } if available => {
+                            new_urls.insert(id, PhotoUrl::Remote(url));
                         }
+                        TabResolved::Local { .. } => {
+                            let Ok(Some(object_url)) = resolved.into_object_url() else {
+                                continue;
+                            };
+                            new_urls.insert(id, PhotoUrl::Local(object_url));
+                        }
+                        _ => {}
                     }
                 }
                 photo_urls.set(new_urls);
@@ -1876,8 +1913,13 @@ fn dashboard(props: &DashboardProps) -> Html {
                         { for photo_rows.iter().map(|row| {
                             let id = row.id.to_string();
                             let state = row.content_state.as_deref().unwrap_or("pending");
-                            let img = urls.get(&row.id).map(|url| {
-                                html! { <img class="thumb" src={url.clone()} /> }
+                            let img = urls.get(&row.id).map(|src| match src {
+                                PhotoUrl::Remote(url) => {
+                                    html! { <img class="thumb" src={url.clone()} /> }
+                                }
+                                PhotoUrl::Local(object_url) => {
+                                    html! { <img class="thumb" src={object_url.as_str().to_owned()} /> }
+                                }
                             });
                             html! {
                                 <tr key={id.clone()}>
@@ -1889,7 +1931,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                         }) }
                     </tbody>
                 </table>
-                <PhotoStorageControls content={props.content.clone()} />
+                <PhotoStorageControls content={props.content.clone()} refresh={src_refresh.clone()} />
             </div>
             <div class="pane">
                 <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
