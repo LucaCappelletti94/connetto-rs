@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: LucaCappelletti94/cargo-echoes@7425be5b8edb997306fa8ec1c33b49bf0576b5d9 # v1.10.1
+      - uses: LucaCappelletti94/cargo-echoes@fe825077e5322a8bd3fa82c8c5a55f2d49cbe016 # v1.10.2
         with:
           organizations: connetto-rs
-          version: 0.8.1
+          version: 0.9.0
           threshold: 2
           min-tokens: 0
           functions: true
