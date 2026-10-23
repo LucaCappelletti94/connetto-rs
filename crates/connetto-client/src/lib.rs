@@ -6861,7 +6861,8 @@ mod tests {
         );
     }
 
-    /// A write to a connetto table never becomes an upload, and an application write beside it still does.
+    /// A write to a connetto table never becomes an upload, and the application
+    /// write beside it still does, holding exactly the rows the application wrote.
     #[tokio::test]
     async fn connetto_tables_are_never_captured() {
         let config = ClientConfig::new("capture-test");
@@ -6882,9 +6883,21 @@ mod tests {
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (1)")
             .expect("application write");
+        let changeset = conn
+            .session
+            .changeset()
+            .expect("capture the application write");
+        let rows = affected_rows(&changeset, conn.policy_tables()).expect("decode the capture");
         assert_eq!(
-            conn.push().await.expect("push"),
-            Some(0),
+            rows,
+            vec![AffectedRow {
+                table: "t".to_owned(),
+                key: vec![KeyValue::Int(1)],
+            }],
+            "the capture holds exactly the intended write and no bookkeeping"
+        );
+        assert!(
+            conn.push().await.expect("push").is_some(),
             "the application write uploads"
         );
     }
