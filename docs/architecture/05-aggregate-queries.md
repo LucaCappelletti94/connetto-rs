@@ -136,7 +136,7 @@ For large group maps, deltas are preferable to re-sending the full map. The delt
 
 **Amended 2026-09-01 (R84, delivered):** the client side is `watch_groups`, a `LiveGroups<K, V>` holding one typed entry per group. The wire delta carries `group_values_json` (decoded values in `GROUP BY` order beside the opaque canonical key), so the map key is typed without decoding key bytes; the values rest in `_connetto_aggregates.group_values_json` for offline rebuild, and a demotion to whole answers rebuilds through the same rested-row path, so the tier change never surfaces. Grouped `query.live(&client)` dispatches at compile time from diesel's group clause and projection SQL types, deriving scalar or tuple `K` and aggregate `V`; float, numeric, and JSON map keys have no typed impl. `LiveRows<R>` is the explicit full-replacement handle for wider re-executed row shapes. Proof: all three tests in `crates/connetto-client/tests/it/grouped_live.rs`; the Dioxus desktop demo exercises generic `use_live` with `COUNT(*) GROUP BY quantity`.
 
-The Dioxus demo renders the `COUNT(*)` for each quantity in ascending quantity order, with `none` for an empty group map.
+The Dioxus and Yew demos render the `COUNT(*)` for each quantity in ascending quantity order, with `none` for an empty group map.
 
 ---
 

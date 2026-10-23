@@ -1390,6 +1390,105 @@ fn panes_skeleton() -> Html {
     }
 }
 
+#[derive(Properties, PartialEq)]
+struct PhotoStorageControlsProps {
+    content: ContentHandle,
+}
+
+#[function_component(PhotoStorageControls)]
+fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
+    let message = use_state(|| None::<String>);
+    let pin = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content
+                    .pin_content("photos", "SELECT content_id FROM photos", "content_id")
+                    .await
+                    .map_or_else(
+                        |err| format!("pin failed: {err}"),
+                        |_| "pinned photos".to_owned(),
+                    );
+                message.set(Some(result));
+            });
+        })
+    };
+    let unpin = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content.unpin_content("photos").await.map_or_else(
+                    |err| format!("unpin failed: {err}"),
+                    |_| "unpinned photos".to_owned(),
+                );
+                message.set(Some(result));
+            });
+        })
+    };
+    let fetch = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content.fetch_pinned().await.map_or_else(
+                    |err| format!("fetch failed: {err}"),
+                    |ids| format!("fetched {} pinned file(s)", ids.len()),
+                );
+                message.set(Some(result));
+            });
+        })
+    };
+    let tidy = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content.tidy().await.map_or_else(
+                    |err| format!("content tidy failed: {err}"),
+                    |n| format!("content tidy: {n} file(s) evicted"),
+                );
+                message.set(Some(result));
+            });
+        })
+    };
+
+    html! {
+        <>
+            <div class="row">
+                <button onclick={pin}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_THUMBTACK} width={"14"} height={"14"} />
+                    { "Pin all photos" }
+                </button>
+                <button onclick={unpin}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_LINK_SLASH} width={"14"} height={"14"} />
+                    { "Unpin photos" }
+                </button>
+                <button onclick={fetch}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_DOWNLOAD} width={"14"} height={"14"} />
+                    { "Fetch pinned" }
+                </button>
+                <button onclick={tidy}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />
+                    { "Free up content storage" }
+                </button>
+            </div>
+            if let Some(message) = &*message {
+                <p class="status">{ message.clone() }</p>
+            }
+        </>
+    }
+}
+
 /// The client the dashboard drives, passed once from [`App`] when it is ready.
 #[derive(Properties, PartialEq)]
 struct DashboardProps {
@@ -1410,6 +1509,12 @@ fn dashboard(props: &DashboardProps) -> Html {
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
     let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
     let count = use_live(&client, orders::table.count());
+    let counts_by_quantity = use_live(
+        &client,
+        orders::table
+            .group_by(orders::quantity)
+            .select((orders::quantity, diesel::dsl::count_star())),
+    );
 
     let order_rows = orders.value();
     let note_rows = notes.value();
@@ -1421,6 +1526,7 @@ fn dashboard(props: &DashboardProps) -> Html {
     let count_text = count
         .value()
         .map_or_else(|| "pending".to_owned(), |value| value.to_string());
+    let grouped_text = grouped_label(&counts_by_quantity.value());
 
     // Resolved signed URLs for available photos. Refetched (not cached) whenever the
     // set of available photos changes, so a stale ticket never wedges the panel.
@@ -1715,6 +1821,9 @@ fn dashboard(props: &DashboardProps) -> Html {
     let count_error = count.error().map(|err| {
         html! { <p class="error">{ format!("count error: {err}") }</p> }
     });
+    let grouped_error = counts_by_quantity.error().map(|err| {
+        html! { <p class="error">{ format!("grouped subscription error: {err}") }</p> }
+    });
     let urls = (*photo_urls).clone();
 
     html! {
@@ -1723,6 +1832,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {order_count}, total quantity {order_sum}. Newest first. Converges across every window through Postgres.") }</p>
                 <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
+                <p>{ "COUNT(*) grouped by quantity: " }<strong>{ grouped_text }</strong></p>
                 <div class="row">
                     <button class="primary" onclick={add_order} disabled={identity.is_empty()}>
                         <Icon data={IconData::FONT_AWESOME_SOLID_PLUS} width={"14"} height={"14"} />
@@ -1737,6 +1847,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </div>
                 { orders_error.unwrap_or_default() }
                 { count_error.unwrap_or_default() }
+                { grouped_error.unwrap_or_default() }
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody>
@@ -1778,6 +1889,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                         }) }
                     </tbody>
                 </table>
+                <PhotoStorageControls content={props.content.clone()} />
             </div>
             <div class="pane">
                 <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
@@ -1840,4 +1952,18 @@ fn dashboard(props: &DashboardProps) -> Html {
             </div>
         </div>
     }
+}
+
+/// `quantity: count` pairs in quantity order, or `none` for an empty snapshot.
+fn grouped_label(counts: &HashMap<i64, i64>) -> String {
+    let mut sorted: Vec<(i64, i64)> = counts.iter().map(|(q, c)| (*q, *c)).collect();
+    sorted.sort_unstable();
+    if sorted.is_empty() {
+        return "none".to_owned();
+    }
+    sorted
+        .iter()
+        .map(|(quantity, count)| format!("{quantity}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
