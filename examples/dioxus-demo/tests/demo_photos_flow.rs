@@ -26,8 +26,8 @@ use std::sync::Arc;
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices, MemoryKeyStore,
-    MemoryRefreshStore,
+    ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices,
+    MemoryKeyStore, MemoryRefreshStore,
 };
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
@@ -68,7 +68,6 @@ const CATALOG_DDL: &str = concat!(
     "CREATE TABLE photos (id UUID PRIMARY KEY, order_id UUID NOT NULL,",
     " owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT)"
 );
-
 
 /// Stage, upload, flip, resolve, fetch, and archive round trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
