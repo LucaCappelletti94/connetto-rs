@@ -30,6 +30,7 @@ use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use js_sys::{Array, Uint8Array};
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -139,6 +140,16 @@ async fn global_fetch_str(url: &str) -> web_sys::Response {
         .expect("fetch")
         .dyn_into()
         .expect("Response")
+}
+
+/// A fetch that reports a rejection instead of panicking on it, for URLs
+/// that no longer serve.
+async fn global_fetch_maybe(url: &str) -> Result<web_sys::Response, wasm_bindgen::JsValue> {
+    let promise = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .map(|w| w.fetch_with_str(url))
+        .unwrap_or_else(|_| web_sys::window().expect("window").fetch_with_str(url));
+    JsFuture::from(promise).await?.dyn_into()
 }
 
 async fn global_fetch_req(req: &Request) -> web_sys::Response {
@@ -395,6 +406,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let (content, mut conn) = connect_tab(&client_id).await;
+    let lane = Rc::new(content);
     conn.subscribe("photo-test-photos", "SELECT * FROM photos")
         .await
         .expect("subscribe");
@@ -423,7 +435,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
 
     let bytes = photo_bytes();
     let blob = blob_of(&bytes);
-    let (file_id, photo_id) = content
+    let (file_id, photo_id) = lane
         .stage(&blob, MimeClass::Jpeg, &client, |conn, file_id| {
             conn.transaction(|conn| {
                 let before_orders: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
@@ -487,7 +499,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     assert_eq!(available.content_id, file_id.as_bytes().to_vec());
     stage("photo available");
 
-    let url = match content.resolve(file_id).await {
+    let url = match lane.resolve(file_id).await {
         TabResolved::Remote { url } => url,
         TabResolved::Local { .. } => panic!("uploaded photo must resolve to server"),
         TabResolved::Unavailable => panic!("available photo must resolve"),
@@ -495,8 +507,53 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     assert_eq!(fetch_bytes(&url).await, bytes);
     stage("photo bytes verified");
 
+    // Pinned and fetched bytes make the row resolve local, and the demo's
+    // display source keeps the object URL valid while it owns it.
+    let demo = connetto_dioxus_demo::platform::DemoContent::new(Rc::clone(&lane));
+    assert_eq!(demo.pin().await, "pinned photos");
+    assert_eq!(demo.fetch_pinned().await, "fetched 1 pinned file(s)");
+    let held = connetto_dioxus_demo::Photo {
+        id: available.id,
+        order_id: available.order_id,
+        owner_id: available.owner_id.clone(),
+        content_id: available.content_id.clone(),
+        content_state: Some("available".to_owned()),
+    };
+    let srcs = demo.sources(&[held]).await;
+    let src = srcs
+        .get(&available.id)
+        .expect("the held photo gets a display source");
+    assert!(
+        src.display.starts_with("blob:"),
+        "held bytes display through an object URL, got {}",
+        src.display
+    );
+    assert!(src.owner.is_some(), "the display source keeps its owner");
+    assert_eq!(
+        fetch_bytes(&src.display).await,
+        bytes,
+        "the object URL serves while owned"
+    );
+    let spare = src.clone();
+    drop(srcs);
+    assert_eq!(
+        fetch_bytes(&spare.display).await,
+        bytes,
+        "a kept owner still serves"
+    );
+    let last = spare.display.clone();
+    drop(spare);
+    // A revoked object URL rejects the fetch outright instead of answering
+    // with an error status.
+    let revoked = global_fetch_maybe(&last).await;
+    assert!(
+        revoked.is_err(),
+        "the revoked URL no longer serves, got {revoked:?}"
+    );
+    stage("held photo object URL lifecycle verified");
+
     drop(live);
-    drop(content);
+    drop(lane);
     drop(client);
     done_rx.await.expect("pump exited");
     worker.terminate();

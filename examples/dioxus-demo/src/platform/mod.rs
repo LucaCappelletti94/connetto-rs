@@ -142,17 +142,27 @@ use rosetta_uuid::Uuid;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
+/// A photo's display source and, for local bytes, the object URL that keeps it valid.
+#[derive(Clone, Debug)]
+pub struct PhotoSrc {
+    /// The value passed to the image element.
+    pub display: String,
+    /// The object URL owning `display`, revoked when the last owner drops.
+    #[cfg(target_arch = "wasm32")]
+    pub owner: Option<connetto_web::ObjectUrl>,
+}
+
 impl DemoContent {
-    /// Where each photo's bytes are to be shown, keyed by the photo row's id.
-    /// Local bytes become a display source at every state, since content this
-    /// device staged answers as Local while unsent. A signed URL is used once
-    /// the server says the row's content is available.
-    pub async fn sources(&self, photos: &[Photo]) -> std::collections::HashMap<Uuid, String> {
+    /// The display source of each row, keyed by the photo row's id. Local bytes show at
+    /// every state, since a staged file answers as Local while unsent, and a signed URL
+    /// is used once the server says the row's content is available.
+    pub async fn sources(&self, photos: &[Photo]) -> std::collections::HashMap<Uuid, PhotoSrc> {
         #[cfg(target_arch = "wasm32")]
         {
             use connetto_web::TabResolved;
 
-            let mut srcs = std::collections::HashMap::new();
+            let mut srcs: std::collections::HashMap<Uuid, PhotoSrc> =
+                std::collections::HashMap::new();
             for photo in photos {
                 let Some(fid) = photo_file_id(&photo.content_id) else {
                     continue;
@@ -161,13 +171,25 @@ impl DemoContent {
                 let resolved = self.0.resolve(fid).await;
                 match resolved {
                     TabResolved::Remote { url } if available => {
-                        srcs.insert(photo.id, url);
+                        srcs.insert(
+                            photo.id,
+                            PhotoSrc {
+                                display: url,
+                                owner: None,
+                            },
+                        );
                     }
                     TabResolved::Local { .. } => {
                         let Ok(Some(object_url)) = resolved.into_object_url() else {
                             continue;
                         };
-                        srcs.insert(photo.id, object_url.as_str().to_owned());
+                        srcs.insert(
+                            photo.id,
+                            PhotoSrc {
+                                display: object_url.as_str().to_owned(),
+                                owner: Some(object_url),
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -180,7 +202,8 @@ impl DemoContent {
             use base64::Engine as _;
             use connetto_file_client::Resolved;
 
-            let mut srcs = std::collections::HashMap::new();
+            let mut srcs: std::collections::HashMap<Uuid, PhotoSrc> =
+                std::collections::HashMap::new();
             for photo in photos {
                 let Some(fid) = photo_file_id(&photo.content_id) else {
                     continue;
@@ -189,10 +212,15 @@ impl DemoContent {
                 match self.0.resolve(fid).await {
                     Ok(Resolved::Local { bytes, .. }) => {
                         let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        srcs.insert(photo.id, format!("data:image/jpeg;base64,{enc}"));
+                        srcs.insert(
+                            photo.id,
+                            PhotoSrc {
+                                display: format!("data:image/jpeg;base64,{enc}"),
+                            },
+                        );
                     }
                     Ok(Resolved::Remote { url }) if available => {
-                        srcs.insert(photo.id, url);
+                        srcs.insert(photo.id, PhotoSrc { display: url });
                     }
                     _ => {}
                 }

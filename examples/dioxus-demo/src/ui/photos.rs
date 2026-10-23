@@ -17,6 +17,9 @@ use connetto_file_core::FileId;
 use diesel::prelude::*;
 
 use super::{ClientSlot, ContentSlot, UserId};
+/// The identity the display sources were fetched for, every row's id and
+/// content state with the generation the fetch button bumps.
+type PhotoSrcKey = (Vec<(Uuid, String)>, u64);
 
 /// The photos pane.
 #[component]
@@ -36,15 +39,20 @@ pub fn PhotosPane() -> Element {
     let rows: Vec<crate::Photo> = photos_live.value().read().iter().cloned().collect();
     let photos_error = photos_live.error().read().clone();
 
-    // The display source of each photo's bytes, refetched whenever the rows
-    // move so a stale signed ticket never wedges the panel.
-    let photo_srcs: Signal<std::collections::HashMap<Uuid, String>> =
+    // The display source of each photo's bytes, refetched on a row's id or content state
+    // change and when the fetch button restores bytes, so a stale ticket never wedges it.
+    let photo_srcs: Signal<std::collections::HashMap<Uuid, crate::platform::PhotoSrc>> =
         use_signal(std::collections::HashMap::new);
+    let src_refresh: Signal<u64> = use_signal(|| 0);
     {
-        let key: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+        let key: Vec<(Uuid, String)> = rows
+            .iter()
+            .map(|row| (row.id, row.content_state.clone().unwrap_or_default()))
+            .collect();
+        let key = (key, *src_refresh.read());
         let snapshot = rows.clone();
         let cc = content.clone();
-        let last_key: Rc<RefCell<Option<Vec<Uuid>>>> = use_hook(|| Rc::new(RefCell::new(None)));
+        let last_key: Rc<RefCell<Option<PhotoSrcKey>>> = use_hook(|| Rc::new(RefCell::new(None)));
         use_effect(move || {
             if last_key.borrow().as_ref() == Some(&key) {
                 return;
@@ -142,14 +150,14 @@ pub fn PhotosPane() -> Element {
                             td { {state} }
                             td {
                                 if let Some(src) = srcs.get(&row_id) {
-                                    img { class: "thumb", src: src.clone() }
+                                    img { class: "thumb", src: src.display.clone() }
                                 }
                             }
                         }
                     }
                 }
             }
-            PinControls {}
+            PinControls { refresh: src_refresh }
             RefusedUploads { refused }
             LostBytes { retired }
         }
@@ -158,7 +166,7 @@ pub fn PhotosPane() -> Element {
 
 /// The pin controls: pin, unpin, fetch and tidy on every platform.
 #[component]
-fn PinControls() -> Element {
+fn PinControls(refresh: Signal<u64>) -> Element {
     let ContentSlot(content_slot) = use_context::<ContentSlot>();
     let content = content_slot
         .read()
@@ -175,7 +183,10 @@ fn PinControls() -> Element {
             onclick: move |_| {
                 let cc = fetch.clone();
                 spawn(async move {
-                    message.set(Some(cc.fetch_pinned().await));
+                    let result = cc.fetch_pinned().await;
+                    let count = *refresh.read();
+                    refresh.set(count + 1);
+                    message.set(Some(result));
                 });
             },
             Icon { icon: FaDownload, width: 14, height: 14 }
