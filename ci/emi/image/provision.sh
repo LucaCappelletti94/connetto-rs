@@ -110,6 +110,10 @@ tar xzf /tmp/actions-runner.tar.gz -C "$run_home"
 "$run_home/bin/installdependencies.sh" >/dev/null
 chown -R "$RUNNER:$RUNNER" "$run_home"
 
+echo "== A process killed for memory fails its step, never the runner service around it"
+install -d /etc/systemd/system.conf.d
+printf '[Manager]\nDefaultOOMPolicy=continue\n' > /etc/systemd/system.conf.d/oom-policy.conf
+
 echo "== Job hooks: the VM's peak memory and sccache's statistics, printed in every job's log"
 install -d /opt/ci-hooks
 cat > /opt/ci-hooks/job-started.sh <<'EOF'
