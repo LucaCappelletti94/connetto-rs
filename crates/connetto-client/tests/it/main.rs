@@ -94,6 +94,7 @@ mod schema_handshake;
 mod secret_stores;
 
 mod share_key_protocol;
+mod share_key_relay;
 #[cfg(feature = "native-transport")]
 mod share_key_storage;
 mod share_keys;

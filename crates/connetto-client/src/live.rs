@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
-use connetto_core::messages::{BindValue, Grant, SubscriptionSpec};
+use connetto_core::messages::{BindValue, Grant, ShareKeyChange, SubscriptionSpec};
 use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::associations::{HasTable, Identifiable};
@@ -2371,6 +2371,9 @@ where
 
     /// Commit a share key to the desired set and refresh local visibility.
     ///
+    /// A relay tab's worker holds the keys, so in a tab the call returns once
+    /// the worker committed the change and restated the tab's identity.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError`] if the client is closed, locked, or cannot persist the change.
@@ -2381,6 +2384,17 @@ where
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         self.allow_share_key_change()?;
+        if state.conn.is_relay_mirror() {
+            let answer = state
+                .conn
+                .ask_relay_share_key(ShareKeyChange::Add {
+                    grant: grant.clone(),
+                    subject: subject.key().to_string(),
+                })
+                .await?;
+            drop(state);
+            return self.await_relay_share_key(answer).await;
+        }
         state.conn.add_share_key(grant, subject).await?;
         refresh_changed(&mut state, &self.shared.events);
         drop(state);
@@ -2389,6 +2403,9 @@ where
     }
 
     /// Remove every grant for a subject and refresh local visibility.
+    ///
+    /// A relay tab's worker holds the keys, as for
+    /// [`add_share_key`](Self::add_share_key).
     ///
     /// # Errors
     ///
@@ -2399,11 +2416,35 @@ where
     ) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         self.allow_share_key_change()?;
+        if state.conn.is_relay_mirror() {
+            let answer = state
+                .conn
+                .ask_relay_share_key(ShareKeyChange::Remove {
+                    subject: subject.key().to_string(),
+                })
+                .await?;
+            drop(state);
+            return self.await_relay_share_key(answer).await;
+        }
         state.conn.remove_share_key(subject).await?;
         refresh_changed(&mut state, &self.shared.events);
         drop(state);
         self.shared.wake.notify_one();
         Ok(())
+    }
+
+    /// Wait for the relay's answer, which the pump delivers or ends at its
+    /// bound, so the pump is woken to arm that bound.
+    async fn await_relay_share_key(
+        &self,
+        answer: tokio::sync::oneshot::Receiver<Result<(), ClientError>>,
+    ) -> Result<(), ClientError> {
+        self.shared.wake.notify_one();
+        answer.await.unwrap_or_else(|_| {
+            Err(ClientError::Transport(
+                "the relay connection dropped before answering the share-key change".to_owned(),
+            ))
+        })
     }
 
     fn allow_share_key_change(&self) -> Result<(), ClientError> {
