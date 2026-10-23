@@ -106,7 +106,7 @@ web-sys = { version = "0.3", features = [
 # (Session::diff against an attached blank schema twin) and applies forwarded
 # tab changesets to the worker replica. The dependency line mirrors
 # connetto-client's verbatim so both resolve to one git source.
-diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
+diesel-sqlite-session = { git = "https://github.com/connetto-rs/diesel-sqlite-session" }
 # Routing live patches by table needs the patchset parser, and snapshot
 # payloads ride the wire zstd compressed like the server's snapshot leg.
 sqlite-diff-rs = { version = "0.15", default-features = false }

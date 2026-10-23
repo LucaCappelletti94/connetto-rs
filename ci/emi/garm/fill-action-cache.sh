@@ -9,7 +9,7 @@
 # Runs as ci-runner. Re-runnable: archives already present are kept.
 set -euo pipefail
 
-REPO=LucaCappelletti94/connetto-rs
+REPO=connetto-rs/connetto-rs
 APP_ID=5319459
 INSTALLATION_ID=171457690
 KEY=$HOME/garm/github-app.pem

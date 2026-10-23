@@ -1,7 +1,7 @@
 # connetto-core
 
-[![Coverage](https://codecov.io/gh/LucaCappelletti94/connetto-rs/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/connetto-rs)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
+[![Coverage](https://codecov.io/gh/connetto-rs/connetto-rs/graph/badge.svg)](https://codecov.io/gh/connetto-rs/connetto-rs)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/LICENSE)
 [![docs.rs](https://docs.rs/connetto-core/badge.svg)](https://docs.rs/connetto-core)
 [![crates.io](https://img.shields.io/crates/v/connetto-core.svg)](https://crates.io/crates/connetto-core)
 

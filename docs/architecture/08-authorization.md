@@ -49,7 +49,7 @@ An authorization change does not require a new session. Permissions resolve per 
 
 ## Policy source and executors
 
-**Decided, and already recorded at `open-questions.md:262`.** Postgres RLS policy text is the source of truth. [`rls2fga`](https://github.com/LucaCappelletti94/rls2fga) parses it, classifies each `USING` and `WITH CHECK` expression into its canonical patterns (`PatternClass` in `rls2fga` is the only correct statement of how many), and generates an OpenFGA authorization model plus SQL that populates the corresponding relationship records. At runtime, point-shaped visibility questions go to OpenFGA rather than to direct SQL evaluation or to an in-process compilation of the policy, and connetto never evaluates policy text itself.
+**Decided, and already recorded at `open-questions.md:262`.** Postgres RLS policy text is the source of truth. [`rls2fga`](https://github.com/connetto-rs/rls2fga) parses it, classifies each `USING` and `WITH CHECK` expression into its canonical patterns (`PatternClass` in `rls2fga` is the only correct statement of how many), and generates an OpenFGA authorization model plus SQL that populates the corresponding relationship records. At runtime, point-shaped visibility questions go to OpenFGA rather than to direct SQL evaluation or to an in-process compilation of the policy, and connetto never evaluates policy text itself.
 
 Two executors, split by the shape of the question and not by convenience:
 

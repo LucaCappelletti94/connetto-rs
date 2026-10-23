@@ -80,7 +80,7 @@ fn translate_ddl() -> String {
         .expect("parse the Postgres schema")
         .translate_to_sql(&options())
         .expect("translate to SQLite DDL");
-    let mut ddl = statements.join(";\n");
+    let mut ddl = statements.into_vec().join(";\n");
     ddl.push(';');
     ddl
 }
