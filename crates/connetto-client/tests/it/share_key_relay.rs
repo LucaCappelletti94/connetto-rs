@@ -6,64 +6,29 @@
 //! errors a native call returns. The worker's side commits the change and
 //! reports whether the subjects its replica answers moved.
 
-use std::collections::VecDeque;
-use std::future::{Future, ready};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use connetto_client::{
-    ClientBuilder, ClientError, ConnettoClient, ConnettoConnection, Grant, SyncSchema,
-};
-use connetto_core::Cursor;
+use connetto_client::{ClientBuilder, ClientError, ConnettoClient, ConnettoConnection, Grant};
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, GateState, HandshakeAck, ShareKeyChange, TabIdentity,
-    TabShareKeyAnswer, TabShareKeyChange, TabShareKeyOutcome, WriterGrant,
+    ControlMessage, GateState, ShareKeyChange, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome,
 };
-use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::traits::IncomingFrame;
 use diesel::prelude::*;
-use parking_lot::Mutex;
-use thiserror::Error;
 
-/// A scripted relay or server that records every control frame it is sent.
-#[derive(Clone, Default)]
-struct Script {
-    frames: Arc<Mutex<VecDeque<IncomingFrame>>>,
-    sent: Arc<Mutex<Vec<ControlMessage>>>,
-    closed: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Error)]
-enum Gone {
-    #[error("the scripted socket is gone")]
-    Closed,
-}
+use super::support::{Script, handshake_ack, key_gated_notes as schema};
 
 impl Script {
-    fn say(&self, message: ControlMessage) {
-        self.frames
-            .lock()
-            .push_back(IncomingFrame::Control(message));
+    fn tell(&self, message: ControlMessage) {
+        self.say(IncomingFrame::Control(message));
     }
 
     fn changes(&self) -> Vec<TabShareKeyChange> {
-        self.sent
-            .lock()
-            .iter()
-            .filter_map(|message| match message {
-                ControlMessage::TabShareKeyChange(change) => Some(change.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn replacements(&self) -> usize {
-        self.sent
-            .lock()
-            .iter()
-            .filter(|message| matches!(message, ControlMessage::ReplaceShareKeys(_)))
-            .count()
+        self.sent(|message| match message {
+            ControlMessage::TabShareKeyChange(change) => Some(change.clone()),
+            _ => None,
+        })
     }
 
     /// The change the tab sent, waited for within `bound`.
@@ -82,72 +47,11 @@ impl Script {
     }
 
     fn answer(&self, request_id: &str, outcome: TabShareKeyOutcome) {
-        self.say(ControlMessage::TabShareKeyAnswer(TabShareKeyAnswer {
+        self.tell(ControlMessage::TabShareKeyAnswer(TabShareKeyAnswer {
             request_id: request_id.to_owned(),
             outcome,
         }));
     }
-}
-
-impl Transport for Script {
-    type Error = Gone;
-
-    fn send_control(
-        &mut self,
-        message: ControlMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        self.sent.lock().push(message);
-        if self.closed.load(Ordering::Acquire) {
-            ready(Err(Gone::Closed))
-        } else {
-            ready(Ok(()))
-        }
-    }
-
-    fn send_bulk(
-        &mut self,
-        _message: BulkMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
-    }
-
-    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
-        super::support::scripted_recv(&self.frames, &self.closed)
-    }
-
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
-        self.closed.store(true, Ordering::Release);
-        ready(Ok(()))
-    }
-}
-
-fn ack() -> ControlMessage {
-    ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "relay".to_owned(),
-        session_token: "relay".to_owned(),
-        resume_token: "relay".to_owned(),
-        current_cursor: Cursor::from(Vec::new()),
-        schema_version: None,
-        initial_credits: 64,
-        writer: Some(WriterGrant {
-            number: 1,
-            frontier: 0,
-        }),
-    })
-}
-
-fn schema() -> SyncSchema {
-    SyncSchema::new(connetto_core::SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
-         CREATE VIEW visible AS SELECT * FROM notes \
-         WHERE owner = current_app_user() \
-            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
 }
 
 fn grant(token: &str) -> Grant {
@@ -167,7 +71,7 @@ struct Subjects {
 /// A tab mirror attached to a scripted relay, its pump running.
 async fn tab() -> (ConnettoClient<Script>, Script, tokio::task::JoinHandle<()>) {
     let script = Script::default();
-    script.say(ack());
+    script.say(handshake_ack());
     let mut conn = ClientBuilder::new(
         schema().relay_mirror(),
         super::support::NeverDial::<Script>::default(),
@@ -211,7 +115,7 @@ async fn a_tab_change_travels_to_the_worker_and_returns_after_its_identity() {
             subject: "b".to_owned(),
         }
     );
-    script.say(ControlMessage::TabIdentity(TabIdentity {
+    script.tell(ControlMessage::TabIdentity(TabIdentity {
         caller: None,
         subjects: Some("b".to_owned()),
     }));
@@ -222,9 +126,8 @@ async fn a_tab_change_travels_to_the_worker_and_returns_after_its_identity() {
         .expect("the call task completes")
         .expect("the worker committed the change");
     assert_eq!(mirror_subjects(&client).await.as_deref(), Some("b"));
-    assert_eq!(
-        script.replacements(),
-        0,
+    assert!(
+        script.replacements().is_empty(),
         "a tab never swaps keys with a server"
     );
 
@@ -251,7 +154,7 @@ async fn a_tab_change_travels_to_the_worker_and_returns_after_its_identity() {
         }
     );
     assert_ne!(removal.request_id, change.request_id);
-    script.say(ControlMessage::TabIdentity(TabIdentity {
+    script.tell(ControlMessage::TabIdentity(TabIdentity {
         caller: None,
         subjects: None,
     }));
@@ -343,7 +246,7 @@ async fn a_foreign_answer_leaves_the_call_waiting() {
 #[tokio::test]
 async fn a_locked_tab_refuses_without_asking_the_worker() {
     let (client, script, pump) = tab().await;
-    script.say(ControlMessage::GateState(GateState::Locked));
+    script.tell(ControlMessage::GateState(GateState::Locked));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !matches!(client.with_conn(|_| ()).await, Err(ClientError::Locked)) {
         assert!(
@@ -374,7 +277,7 @@ async fn a_dropped_tab_wire_fails_the_pending_call() {
         tokio::spawn(async move { client.add_share_key(&grant("f"), &subject("f")).await })
     };
     script.change(Duration::from_secs(5)).await;
-    script.closed.store(true, Ordering::Release);
+    script.hang_up();
     let result = tokio::time::timeout(Duration::from_secs(5), call)
         .await
         .expect("the call fails when the wire drops")
@@ -408,7 +311,7 @@ async fn an_unanswered_tab_change_ends_at_its_bound() {
     );
     assert!(started.elapsed() >= Duration::from_secs(25));
     assert!(
-        !script.closed.load(Ordering::Acquire),
+        !script.is_closed(),
         "an unanswered relay request keeps the tab connected"
     );
     client
@@ -424,7 +327,7 @@ async fn an_unanswered_tab_change_ends_at_its_bound() {
 #[tokio::test]
 async fn a_driven_mirror_refuses_a_local_change() {
     let script = Script::default();
-    script.say(ack());
+    script.say(handshake_ack());
     let mut conn: ConnettoConnection<Script> = ClientBuilder::new(
         schema().relay_mirror(),
         super::support::NeverDial::<Script>::default(),
@@ -443,7 +346,7 @@ async fn a_driven_mirror_refuses_a_local_change() {
     assert!(conn.remove_share_key(&subject("h")).await.is_err());
     let _ = tokio::time::timeout(Duration::from_millis(100), conn.pump_one()).await;
     assert_eq!(script.changes(), Vec::new());
-    assert_eq!(script.replacements(), 0);
+    assert_eq!(script.replacements(), Vec::new());
 }
 
 /// The worker's relay call reports whether the subjects its replica answers
