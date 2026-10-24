@@ -12,7 +12,7 @@ This programme closes a security defect in how connetto decides who a caller is,
 
 **Citations name a file and a symbol, not a line number.** Line numbers rot silently and several in this repository already had. Where a symbol does not exist, a line range is given and should be read as a hint rather than a fact.
 
-**Every phase has the same shape:** Status, Purpose, Blocked on, Steps, Done when, and where the ordering or the necessity is counterintuitive, Why. A phase is done when its Done when clause is demonstrated, never when it merely compiles.
+**Every phase has the same shape:** Status, Purpose, Blocked on, Steps, Done when, and where the ordering or the necessity is counterintuitive, Why. A phase that is not done carries a `Changes state` line beside its Status naming the persistent state it changes, the rule for which sits beside the dependency table and the graph. A phase is done when its Done when clause is demonstrated, never when it merely compiles.
 
 **Two status words are load-bearing.** **DONE** means the Done when clause was demonstrated. **BUILT** means every step landed and was proven except a named remainder outside the phase's own work, such as a run the environment blocks, and the section names that remainder. Defined 2026-08-21, when five phases were found using BUILT undefined.
 
@@ -255,7 +255,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R63 rewire the membership term onto subql's own APIs | **DONE** (2026-08-30) | nothing. Steps 1 to 3 landed 2026-08-23, step 4 (caller bind retired onto the self-seeding term) and decision 3's proof landed 2026-08-30 in the pin-move working tree | landed: `TermDescription::Caller` since subql `1e5382f` |
 | R86 adopt the re-run path so the boot refusal asks the real question | **DONE** (2026-08-31) | nothing | landed and adopted: composite-join grading plus the unqualified-table fix, rls2fga `bbe4f57a` |
 | R15 replica retention and trimming | **DONE** (2026-08-19) | **nothing.** The pin carries all nine APIs the phase uses (`wal_checkpoint`, `WalCheckpointMode`, `auto_vacuum` and its setter, `page_count`, `freelist_count`, `incremental_vacuum`, `vacuum`, `vacuum_into`) | merged and pinned |
-| R31 application schema majors and the update path | NOT STARTED | nothing | no |
+| R31 application schema majors and the update path | NOT STARTED | R75, whose per-writer queue, the handshake writer half and archive version 4 its capture major rides on | no |
 | R32 replication slot lifecycle | **DONE** (2026-08-09) | nothing | no |
 | R40 replica policy enforcement wired into sync | **DONE** (2026-08-19) | nothing. The pk codec is type-directed, the relay hub reads and applies split tables through the worker's map, and all twenty browser binaries pass | landed |
 | R24 file-sync integration | **DONE** (2026-08-21, as a design) | nothing. Ten positions recorded, R64 to R69 derived | no |
@@ -272,10 +272,10 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R71 Linux key custody survives reboot | **DONE** (2026-09-29) | nothing. Sixteen decisions in the section. KDE Wallet loses a write made in the 5 s before `ksecretd` is stopped, `upstream/kwallet-sigterm-loses-recent-writes.md`, pursued upstream on `upstream/ksecretd-sigterm-flush` (2026-09-29) | no, R71 holds without it |
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows and Linux `unproven` records, which R76's home run produces | no |
-| R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
-| R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place | no |
-| R77 the peer exchange and provisional tier | NOT STARTED | R75 and R76. The retraction's reason rides on R57 step 8's fix | no |
-| R78 courier recovery | NOT STARTED | R75 and R77 | no |
+| R75 the per-device applied frontier | IN PROGRESS, every step built, slices 1 to 5 merged as #196, #197, #199, #200 and #206 (2026-10-20) | R74. Touches the R2 watermark contract and the R56 import. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains | no |
+| R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place | no |
+| R77 the peer exchange and provisional tier | NOT STARTED | R75, R76 and R31, whose capture major an exchanged entry carries on the wire once it exists. The retraction's reason rides on R57 step 8's fix | no |
+| R78 courier recovery | NOT STARTED | R75, R77 and R31, whose capture major a couriered entry carries on the wire once it exists | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
 | R80 peer sync in every demo | NOT STARTED | R77, R78 and R79 | no |
 | R30 grouped aggregates revisited | **DONE** (2026-08-22, as a design) | nothing. R82 to R85 derived on the maintainer's instruction, the upstream request written | no longer: the GROUP BY/HAVING refusal defect is resolved upstream and adopted (2026-08-25) |
@@ -288,6 +288,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 ## Dependency graph
 
 A rendering of the dependencies in the table above, for reading rather than for deciding. **The graph carries dependencies only and says nothing about status. Decided with the maintainer 2026-08-08**, after the graph's done-highlighting was found missing R20, R29 and R44 and its node set missing R34 and R39: status lived in three hand-maintained places and drifted within days, so finishing a phase now updates the two tables and never this diagram. If an edge disagrees with the table, the table is right. Amended 2026-08-21: the node set had stopped growing (R48 to R61 were missing while R55 alone was added), so the missing phases are backfilled and the standing rule is that a new phase adds its node and edges, while status still never touches the diagram.
+
+**Shared persistent state is linked before either phase starts.** R31 and R75 both reshaped the client's pending queue and the plan linked neither, and the rebase between them paid for the missing edge, so every phase that is NOT STARTED, STARTED or IN PROGRESS lists the persistent state it changes, in a `Changes state` line beside its Status, naming the client tables, the server tables, the wire messages and the archive format it touches, and saying `none` where a category is empty. Two unfinished phases that list the same state carry a dependency edge between them before either starts.
 
 ```mermaid
 graph TD
@@ -384,6 +386,10 @@ graph TD
   R76 --> R77
   R57 -.->|reason surface| R77
   R75 --> R78[R78 courier recovery]
+  R75 -->|the queue, the handshake and the archive| R31
+  R31 -->|the capture major| R77
+  R31 -->|the capture major| R78
+  R75 -->|the frontier leg| R70
   R77 --> R78
   R77 --> R79[R79 media over the peer link]
   R67 --> R79
@@ -3000,6 +3006,8 @@ A person whose device died can restore the export onto its replacement and find 
 
 **Blocked on nothing.** `R54` claimed every demo carries every application-visible feature. It was true for what it audited and these are what it missed, so this is `R54`'s follow-through rather than a new idea.
 
+**Changes state.** Client tables: none. Server tables: none. Wire messages: none, the step 8 `MutationRejectReason` surfacing riding the client's event stream. Archive format: none, the export pane exercising the archive as it stands.
+
 ### Purpose
 
 A capability no demo drives is one nobody has held. That is the lesson `R42` and `R54` already paid for: auditing the demos against the public API found five library defects a green test suite had hidden. Two of the gaps below are worse than an absence, because a demo actively asserts the feature does not exist.
@@ -3221,6 +3229,8 @@ A `LIMIT n` request registers as a computed read and holds no replica rows, raw 
 **Status.** NOT STARTED, fully designed 2026-08-22. Split out of `R26` on 2026-08-21 when the maintainer separated moving data between devices from handing a person all their data. All three open questions were settled with the maintainer on 2026-08-22, and its build waits on the same deadline class as `R31`: the first real deployment. The file half needs `R65`.
 
 **Blocked on nothing technically.** Blocked on wanting it: nothing in the tree needs it and no deployment exists to be obliged by it.
+
+**Changes state.** Client tables: none. Server tables: none, the query list registration sitting on the server configuration. Wire messages: none. Archive format: none, the download zip a terminal artifact with no version that nothing ever machine-reads back (question 3).
 
 ### Purpose
 
@@ -3873,6 +3883,8 @@ A row that stops matching a subscription is removed from that subscriber's repli
 
 **Blocked on** the `libsqlite3-sys` and `sqlite-wasm-rs` maintainers agreeing to the route proposed in [`rusqlite/rusqlite` discussion #1908](https://github.com/rusqlite/rusqlite/discussions/1908) (decided with the maintainer 2026-09-28). Without that agreement the native codec and the option set of decision 7 live on forks that no release ever retires, and a published `connetto-client` cannot reach a `[patch.crates-io]` fork, so the phase does not start on the forks alone. The discussion opened 2026-09-23 with `sqlite3mc-src` as one SQLite3MC source crate for both `-sys` crates, and on 2026-09-25 widened to two source crates, `sqlcipher-src` and `sqlite3mc-src`, each pinned with `=` by both `-sys` crates, with forks of `libsqlite3-sys` and `sqlite-wasm-rs` passing their CI. No maintainer had answered the widened proposal by 2026-09-28. Before it, `utelle` (SQLite3MC) favoured one library on both targets, `gwenn` (`rusqlite`) asked how many users SQLite3MC has against SQLCipher, and `Spxg` (`sqlite-wasm-rs`) welcomed a `sqlcipher` feature but objected to taking it from a separate crate, because `wasm32-unknown-unknown` has no libc and a second crate must move in step with the first. Which library the maintainers accept on both targets decides whether decisions 1 and 4 stand, since SQLCipher has no ChaCha20 scheme.
 
+**Changes state.** Client tables: the on-disk format of the replica and the tier, the SQLCipher and SQLite3MC split giving way to one SQLite3MC codec on both backends (decision 3's named break). Server tables: none. Wire messages: none. Archive format: none, the archive holding unencrypted rows and decision 3's tier recovery riding it unchanged.
+
 Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
 
 ### Decisions
@@ -4023,6 +4035,8 @@ Every knob has a recorded value and a reason, both open paths set them, and the 
 
 **Blocked on nothing.** Off the critical path and independent of every other phase, so it lands whenever it is wanted. Slice 2 opens with the one rule still to settle with the maintainer, named in decision 3.
 
+**Changes state.** Client tables: the `connetto_shared` store attached to every identity's replica connection, its identity-keyed subscription table (decision 6), the declared tables and their policy views (step 3) and the device key record under its reserved name (decision 4). Server tables: none. Wire messages: none. Archive format: none.
+
 Because the replica is named from the identity (`replica_db_name` in `crates/connetto-client/src/replica.rs`), data visible to everybody is stored once per identity on the same device. This phase adds a store holding the public tables a deployment declares, attached to every identity's replica connection and shared by the identities on one device. Chapter 12 records the design under "Public tables may be shared across identities".
 
 ### Purpose
@@ -4132,7 +4146,9 @@ A replica that has held and released a large window returns disk to the filesyst
 
 **Status.** NOT STARTED
 
-**Blocked on nothing.** Its deadline is the first deployment that intends to survive a schema change, the same class of deadline as R21 and the `auto_vacuum` default: nothing is urgent at `version = "0.0.0"`, and it becomes load-bearing the day old clients exist.
+**Blocked on R75**, whose per-writer queue, the handshake writer half and archive version 4 its capture major rides on. Its deadline is the first deployment that intends to survive a schema change, the same class of deadline as R21 and the `auto_vacuum` default: nothing is urgent at `version = "0.0.0"`, and it becomes load-bearing the day old clients exist.
+
+**Changes state.** Client tables: the capture major on each `_connetto_pending` entry, which step 1's drain gate reads, and the tier's recorded major, applied once per boundary by the migration trait (step 3). Server tables: none, one deployment server per supported major carrying the schema migration itself. Wire messages: the major field on the handshake, declared beside the policy map (step 2), and the typed update-required refusal. Archive format: the `connetto-local-data` archive at version 5, the major in its header and the capture major on each queued entry (step 2).
 
 ### Purpose
 
@@ -4144,6 +4160,8 @@ An application schema change is a major version, decided with the maintainer. A 
 2. **A major mismatch at handshake surfaces as update-required, not as an error.** The major is a handshake field (decided 2026-09-12): the client sends the major it was built against, declared beside R40's policy map since both are build artifacts the client is refused without, and the server compares it to its own and refuses a mismatch with a typed reason, the same shape as the policy-map fingerprint check. One URL. Routing by major, where a deployment hosts several, is the proxy's business on that field and never the client's configuration. Rejected: a URL per major shipped in the application, a configuration surface on every client that nothing stops from pairing wrongly. Two consequences recorded with it: the R56 archive header gains the major, so an import into an application at a different major is refused by name rather than converted, and `_connetto_content_*` manifests and the R62 accepted-table list ride the identity's replica and so resync with it. `schema_version` staleness detection exists. A client at an older major connecting to a newer server (its major decommissioned) receives a typed signal the application renders as "update the app", never a silent failure or a resync into a schema it cannot read.
 3. **The local-tier migration trait.** App-supplied and diesel-typed: one step per major boundary, run by connetto on the first open of a tier whose recorded major is behind, with the applied major persisted in the tier so each step runs exactly once. Only device-private tables ride it. Rescue conversion of synced data or stranded mutations (server-side upload-and-convert) is explicitly out of scope, prevented instead by the deployment policy of keeping a major up until its clients drain.
 4. **Resync at the boundary rides existing machinery.** The updated app's first connect against the new major full-resyncs the synced tables, which is `FullResyncRequired` plus the coverage rules already decided, nothing new.
+
+**Slices 3 and 5 are being rewritten on R75's per-writer queue, per the plan decided with the maintainer on 2026-10-20.** One queue and one chain per writer, each entry carrying its capture major, the rebuild keeping writer state, the drain presenting the entry's writer, and a gone major reporting its entries lost and carrying the rest to the live writer.
 
 ### Proof
 
@@ -4948,6 +4966,8 @@ Thumbnails: chapter 18 names `thumb_hash` as a convention and nothing in the tre
 
 **Blocked on R75 for step 2's frontier leg.** The frontier leg demonstrates a client replaying its pending queue against a server restored to an earlier point, and R75 replaces the session watermark with the per-device applied frontier, so demonstrating it before R75 proves a mechanism R75 deletes (decided 2026-09-12). The reverse edge does not exist. R75 step 3 refuses a second, different changeset at an applied `(key, sequence)`, while a restored server's rewound frontier accepts the author's own signed changesets again byte for byte, which is the recovery R78 exists for, and the device-side fork is closed by R75 step 4 minting a fresh key on import.
 
+**Changes state.** Client tables: none, the client half being a demonstrated replay of the pending queue against a restored server. Server tables: the epoch in `connetto_epoch`, which every restore method rewrites to make its clients resync and its sessions revoke. Wire messages: none. Archive format: none.
+
 ### Decisions
 
 1. **Step 2 splits by what R75 touches** (2026-09-22). The legs whose mechanism R75 leaves in place are demonstrated now, namely R32's resume-past-delivery detection, the auth store's refresh rotation under a rewound `connetto_sessions`, chunk bytes against rewound file-server manifests, and the OpenFGA store against rewound rows. The pending-queue leg against the per-device frontier, with the courier re-delivery, waits for R75.
@@ -5100,6 +5120,8 @@ A fresh Linux session reopens the replica and the device tier without re-minting
 
 **Blocked on nothing.**
 
+**Changes state.** Client tables: the revocation list in the enrolment store (step 6), which every identity on the device prunes on a `RevocationUpdate` and which decides whether a peer's device key is used. Server tables: the `connetto_device_certificates` and `connetto_device_enrolments` schema, built with the step 7 inventory. Wire messages: the `RevocationUpdate` carrying the list hash and a reason, which every connected client receives. Archive format: none.
+
 ### Purpose
 
 Grace countdowns (R29), the session staleness bound (chapter 11), cache TTLs, and certificate validation (whose wall-clock rule R74 step 7 states for itself, since a peer cannot correct its clock against a server, and this phase absorbs into the inventory) all assume a sane running clock, and nothing states monotonic versus wall time per timer or what suspend and resume does. A device waking after a week fires every grace expiry at once while reconnect races catch-up, under the offline eviction pause, which is X6's own example.
@@ -5124,6 +5146,8 @@ X6 is closed with a per-timer rule recorded, and the code matches the rule every
 **Blocked on nothing** since R94 landed on 2026-09-30 (the dependency was decided with the maintainer 2026-09-28). This phase adds a third secret beside the two stores R94 decision 15 injects by setter, an application-requested certificate lifetime, and an enrolment run after sign-in inside the connection sequence R94 step 3 moves into `connect()`. R94 decisions 11 and 15 make `ClientConfig` and `ConnettoConnection::connect` internal, so the device key's store, its protection report under R94 decision 13, the lifetime setting and the enrolment are built once, on the builders. R96 does not gate it, because the server half (the issuer key checked at startup, its chain and the lifetime ceiling) is server settings types with R37 setters, which R96's builder gathers.
 
 Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Linux the device key shares the replica key's custody, which R71 made survive a reboot, so the device key uses R71's stores and needs nothing of its own. R72: certificate validity is the one wall-clock check a peer cannot correct against a server, so step 7 below states the clock rule itself and R72's later inventory cites it. Rejected: R71 gating the whole peer programme on a Linux custody decision whose every candidate has a named cost, and R72 preceding with an inventory that touches only built code.
+
+**Changes state.** Client tables: the `_connetto_device_certificate` and `_connetto_revocation_list` tables in the enrolment store. Server tables: `connetto_device_enrolments` and `connetto_device_certificates` with their chain and lifetime columns. Wire messages: the enrolment exchange, `EnrolRequest`, `EnrolGrant`, `RevokeDeviceRequest`, `DeviceRevokedAck` and `EnrolRefused`, the `RevocationUpdate` broadcast, and `DevicesRequest` with its `DevicesList` answer. Archive format: none, the archive holding no enrolment state.
 
 ### Purpose
 
@@ -5271,9 +5295,11 @@ A native device enrols while online, holds its chip key and certificate across r
 
 ## R75: the per-device applied frontier
 
-**Status.** NOT STARTED.
+**Status.** IN PROGRESS. Every step built and merged as #196, #197, #199, #200 and #206 (2026-10-20), all five slices. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains.
 
 **Blocked on** R74. Touches the R2 watermark contract and the R56 import.
+
+**Changes state.** Client tables: the per-writer queue in `_connetto_writers` and `_connetto_pending`, the per-writer retire tables, and the import's writer choice (step 5). Server tables: the writer rows and the settled record, the settlement's outcome and path (step 6). Wire messages: the handshake's writer request and grant, `client_seq` and the provenance on every mutation, the control messages `BindDevice`, `RetireWriter` and `WriterAnswer`, the fatals `SequenceGap`, `WriterRetired` and `WriterUnknown`, and the `Forked` outcome. Archive format: the `connetto-local-data` archive at version 4, each queued write carrying its writer, sequence and chain hash.
 
 ### Purpose
 
@@ -5301,6 +5327,8 @@ A write applied through any path is refused by every other path, proven three wa
 **Status.** IN PROGRESS, its hosting, joining, Bluetooth and proof questions decided with the maintainer on 2026-10-02 and the link's on 2026-10-06 (below). Slices 1 to 3, the `connetto-peer` crate, the client's peer link and discovery, are built (2026-10-07), slice 4, Android hosting and joining, on 2026-10-08, slices 5 to 8 on 2026-10-09, slice 9a, the iPhone hosting and the iPad joining, on 2026-10-12, slice 9b, Linux, on 2026-10-13 and slice 9c, macOS, on 2026-10-14, merged as #134 to #137 (2026-10-14), #140 to #143 (2026-10-15), #148 (2026-10-16) and #162 and #163 (2026-10-18), with the duplicate close's keep across a reset as #158 (2026-10-15). Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place.
 
 **Blocked on** nothing. Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place.
+
+**Changes state.** Client tables: none, the client's half being the `connetto-peer` crate's peer link and the platform hosting and discovery (slices 3 to 9). Server tables: none. Wire messages: the peer link's messages, decided with the maintainer on 2026-10-06. Archive format: none.
 
 ### Purpose
 
@@ -5540,7 +5568,9 @@ Two native processes with valid certificates discover each other on one network 
 
 **Status.** NOT STARTED.
 
-**Blocked on** R75 and R76. The retraction's reason rides on R57 step 8's fix of the dropped `MutationRejectReason`.
+**Blocked on** R75, R76 and R31, whose capture major an exchanged entry carries on the wire once it exists. The retraction's reason rides on R57 step 8's fix of the dropped `MutationRejectReason`.
+
+**Changes state.** Client tables: none, the exchange answering from the per-writer record R75 keeps. Server tables: none. Wire messages: the exchange entry with its capture major, and the retraction's typed reason. Archive format: none.
 
 ### Purpose
 
@@ -5565,7 +5595,9 @@ Two devices of different accounts exchange offline and reconcile online with not
 
 **Status.** NOT STARTED.
 
-**Blocked on** R75 and R77.
+**Blocked on** R75, R77 and R31, whose capture major a couriered entry carries on the wire once it exists.
+
+**Changes state.** Client tables: none, the courier's entry reading the record R75 settles into. Server tables: the settled record the courier replay answers from, with its audit rows. Wire messages: the couriered entry with its capture major. Archive format: none.
 
 ### Purpose
 
@@ -5589,6 +5621,8 @@ A device's writes reach the server through a different account's session with ex
 
 **Blocked on** R77, and on R64 to R67 for the chunk machinery.
 
+**Changes state.** Client tables: none, the receiver keeping chunks under its own file identity (step 3). Server tables: none. Wire messages: the chunk messages over the peer link, decided with the maintainer (step 2), and the re-served entry carrying the chunk's content hash (step 6). Archive format: none.
+
 ### Purpose
 
 Sample photos in camp: metadata rows travel in the exchange already, so this phase adds content. Pull-on-demand by chunk hash over the established link, the author's device answering after evaluating the requester against translated policy fail-closed, hash-verified, re-encrypted under the receiver's key into the never-exported cache class.
@@ -5611,6 +5645,8 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 **Status.** NOT STARTED.
 
 **Blocked on** R77, R78 and R79.
+
+**Changes state.** Client tables: none, the receiver's file table recording the completed media by its content hash. Server tables: none. Wire messages: the completed media entry on the peer link (step 3). Archive format: none.
 
 ### Steps
 
@@ -5765,6 +5801,8 @@ No durable credential exists in browser storage, the three auth endpoints serve 
 
 **Its other prerequisites are met.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
 
+**Changes state.** Client tables: none. Server tables: `connetto_apps`, `connetto_app_grants`, `connetto_installations`, `connetto_app_bots` and `connetto_installation_sessions`. Wire messages: `Challenge`, `RegisterBot` and `BotRegistered`, the bot's registration over the challenge. Archive format: none.
+
 ### Purpose
 
 connetto has no way for a program to hold a query, be told when it changed and write values back under rights a user granted it. This phase gives a deployment the backend and shared logic for that, registering apps, installing them, and running them, and leaves the screens to the deployment. Three entities. An app is code, one private key and a manifest, a row in `connetto_apps` at every deployment where it is registered. A bot is the app's user at one deployment, so lab A's grant to app X and lab B's are two bots sharing a key and nothing else. An installation is one resource owner at that deployment granting the bot a view of what they own, a row in `connetto_installations` plus the deployment's own sharing rows. A bot is a user, authorship is its identity in the audit row, ownership is the row's owner column.
@@ -5864,6 +5902,8 @@ Synced tables carry no references on either backend, enforcement is on at every 
 **Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R71's decision 8.
 
 **Blocked on** R91 for the bot template. R71's durable headless custody is built. Two decisions, listed below.
+
+**Changes state.** Client tables: none, the bot's identity living in its own replica. Server tables: the bot rows in the registry R91 owns, one template per bot (decision 3). Wire messages: none, the template arriving through the registry sync. Archive format: none.
 
 ### Purpose
 
@@ -5970,6 +6010,8 @@ Both platforms build their clients from one builder each over the shared pieces,
 **Status.** STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
 
 **Blocked on nothing** since R94 landed on 2026-09-30. Its `Auth` holds the starting set this phase persists.
+
+**Changes state.** Client tables: the share-key record the step 5 to 7 persistence holds, merged with the record the archive keeps (step 7). Server tables: none, the starting set sitting in the server's `Auth` (R94). Wire messages: `ReplaceShareKeys` and its `ShareKeysReplaced` answer, and `cursor_subjects` on the handshake. Archive format: none, the archive keeping the share-key record under its existing name.
 
 ### Purpose
 
