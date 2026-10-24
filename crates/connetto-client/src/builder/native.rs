@@ -49,7 +49,7 @@ use crate::share_keys::share_key_record;
 use crate::share_keys::{ErasedShareKeyStore, RefreshStoreShareKeys, ShareKeyStore};
 use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
-use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
+use crate::teardown::{ForgetError, ForgetIncomplete, ForgetRefusal, forget_device};
 use crate::{ClientError, ConnettoClient, Custody};
 #[cfg(feature = "peer")]
 use crate::{ClientEvent, HotspotError, HotspotOffer, JoinError};
@@ -1645,35 +1645,47 @@ where
     /// client is closed and its replica swapped for an empty in-memory one
     /// before the files go, since Windows refuses to delete an open file, so
     /// clones still alive read an empty replica. The application drops it
-    /// afterwards.
+    /// afterwards. Once the client is closed every part of the teardown runs
+    /// even when an earlier one failed, so as much as possible is removed.
     ///
     /// # Errors
     ///
-    /// [`ForgetError::NoReplica`] for a build that kept nothing on the
-    /// device, [`ForgetError::Client`] when the unsynced writes cannot be
-    /// read or, once the wipe stands, the device key cannot be deleted,
-    /// [`ForgetError::Purge`] when the guard refuses or the wipe fails,
-    /// and [`ForgetError::NotRevoked`] when the wipe succeeded but the server
-    /// was not reached.
+    /// [`ForgetError::Refused`] when nothing was destroyed and the client
+    /// still works: the build kept nothing on the device, the unsynced writes
+    /// cannot be read, or they block the wipe. [`ForgetError::Incomplete`]
+    /// when the client is closed and part of the teardown failed, naming each
+    /// part.
     pub async fn forget_device(&self, force: bool) -> Result<(), ForgetError> {
-        let teardown = self.teardown.as_ref().ok_or(ForgetError::NoReplica)?;
-        let unsynced = self.core.client().unsynced().await?;
+        let teardown = self.teardown.as_ref().ok_or(ForgetRefusal::NoReplica)?;
+        let unsynced = self
+            .core
+            .client()
+            .unsynced()
+            .await
+            .map_err(ForgetRefusal::Unreadable)?;
         if !unsynced.is_empty() && !force {
-            return Err(ForgetError::Purge(PurgeError::Unsynced(unsynced)));
+            return Err(ForgetRefusal::Unsynced(unsynced).into());
         }
         self.core.close().await;
-        self.core.client().release_replica().await?;
-        let forgotten = teardown.forget(&unsynced, force).await;
+        let mut report = ForgetIncomplete {
+            release: self.core.client().release_replica().await.err(),
+            ..ForgetIncomplete::default()
+        };
+        teardown.forget(&unsynced, &mut report).await;
         // The certificate went with the replica, and the key goes once the
         // wipe stands, whether or not the server heard (lifecycle row
         // "`forget_device`").
         #[cfg(feature = "device-identity")]
-        if matches!(forgotten, Ok(()) | Err(ForgetError::NotRevoked(_)))
+        if report.wipe.is_none()
             && let Some(device) = &self.device
         {
-            device.delete_key().await?;
+            report.device_key = device.delete_key().await.err();
         }
-        forgotten
+        if report.is_complete() {
+            Ok(())
+        } else {
+            Err(ForgetError::Incomplete(Box::new(report)))
+        }
     }
 }
 
@@ -1722,8 +1734,8 @@ trait Forget: Send + Sync {
     fn forget<'a>(
         &'a self,
         unsynced: &'a [crate::UnsyncedWrite],
-        force: bool,
-    ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>>;
+        report: &'a mut ForgetIncomplete,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 /// The replica a durable build wrote, and what revokes its session.
@@ -1745,39 +1757,22 @@ where
     fn forget<'a>(
         &'a self,
         unsynced: &'a [crate::UnsyncedWrite],
-        force: bool,
-    ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>> {
+        report: &'a mut ForgetIncomplete,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let forgotten = match &self.authenticator {
-                Some(authenticator) => {
-                    forget_device(
-                        authenticator,
-                        &self.path,
-                        self.key_store.as_ref(),
-                        &self.name,
-                        unsynced,
-                        force,
-                    )
-                    .await
-                }
-                None => wipe_replica(
-                    &self.path,
-                    self.key_store.as_ref(),
-                    &self.name,
-                    unsynced,
-                    force,
-                )
-                .await
-                .map_err(ForgetError::from),
-            };
+            forget_device(
+                self.authenticator.as_deref(),
+                &self.path,
+                self.key_store.as_ref(),
+                &self.name,
+                unsynced,
+                report,
+            )
+            .await;
             // Local secret cleanup is required even when revocation cannot be confirmed.
-            if matches!(forgotten, Ok(()) | Err(ForgetError::NotRevoked(_))) {
-                self.share_key_store
-                    .clear(&self.share_record)
-                    .await
-                    .map_err(|err| ForgetError::Purge(PurgeError::KeyStore(err.to_string())))?;
+            if report.wipe.is_none() {
+                report.share_keys = self.share_key_store.clear(&self.share_record).await.err();
             }
-            forgotten
         })
     }
 }
