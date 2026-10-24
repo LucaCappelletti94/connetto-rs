@@ -6,7 +6,7 @@ description: >-
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/install-rust
+    - uses: $/.github/actions/install-rust
       with:
         targets: wasm32-unknown-unknown
     - shell: bash
