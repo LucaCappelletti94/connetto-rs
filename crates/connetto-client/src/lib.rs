@@ -3346,10 +3346,10 @@ fn install_storage_layout<S: ReplicaStorage>(
 ) -> Result<(), ClientError> {
     use diesel::OptionalExtension as _;
     let Some(layout) = &config.shared_layout else {
-        if let Some(ddl) = sqlite_ddl {
-            db.batch_execute(ddl)?;
-        } else if let Some(ddl) = &config.connection_ddl {
-            db.batch_execute(ddl)?;
+        // One transaction, because committing each of a replica schema's statements on its own
+        // takes seconds on the browser's OPFS storage.
+        if let Some(ddl) = sqlite_ddl.or(config.connection_ddl.as_deref()) {
+            db.transaction::<_, ClientError, _>(|db| Ok(db.batch_execute(ddl)?))?;
         }
         return Ok(());
     };
@@ -3383,31 +3383,32 @@ fn install_storage_layout<S: ReplicaStorage>(
     check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
 }
 
-/// The schema and metadata tables an open installs, in dependency order.
+/// The schema and metadata tables an open installs, in dependency order and in one transaction.
 #[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
     config: &ClientConfig,
 ) -> Result<(), ClientError> {
-    // The views are what the map has to agree with.
-    check_policy_tables(db, &config.policy_tables)?;
-    // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
-    check_recorded_tables(db, "main", &config.unrecorded_tables)?;
-    db.batch_execute(META_DDL)?;
-    match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
-        Ok(()) => {}
-        Err(diesel::result::Error::DatabaseError(_, info))
-            if info.message().contains("duplicate column name") => {}
-        Err(error) => return Err(error.into()),
-    }
-    db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
-    // After the subscription tables, since it references `_connetto_query`.
-    db.batch_execute(aggregates::AGGREGATE_DDL)?;
-    #[cfg(feature = "device-identity")]
-    db.batch_execute(enrolment::CERTIFICATE_DDL)?;
-    // A watch the previous run died still holding counts down from now.
-    subscriptions::anchor_launch(db)?;
-    Ok(())
+    db.transaction(|db| {
+        // The views are what the map has to agree with.
+        check_policy_tables(db, &config.policy_tables)?;
+        // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
+        check_recorded_tables(db, "main", &config.unrecorded_tables)?;
+        db.batch_execute(META_DDL)?;
+        match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
+            Ok(()) => {}
+            Err(diesel::result::Error::DatabaseError(_, info))
+                if info.message().contains("duplicate column name") => {}
+            Err(error) => return Err(error.into()),
+        }
+        db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+        // After the subscription tables, since it references `_connetto_query`.
+        db.batch_execute(aggregates::AGGREGATE_DDL)?;
+        #[cfg(feature = "device-identity")]
+        db.batch_execute(enrolment::CERTIFICATE_DDL)?;
+        // A watch the previous run died still holding counts down from now.
+        subscriptions::anchor_launch(db)
+    })
 }
 
 impl<T> ConnettoConnection<T>
