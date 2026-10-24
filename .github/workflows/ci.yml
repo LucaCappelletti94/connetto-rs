@@ -510,10 +510,10 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      # Sharded by package so no single shard hits the execution cap: the two
-      # heavy Docker-backed crates run alone and the light ones share a shard.
-      # The graph compiles once per shard, which is duplicated work traded for
-      # wall-clock under the cap.
+      # Sharded by package so no single shard hits the execution cap: the
+      # heavy Docker-backed crates run alone or with their own family, and the
+      # light ones share a shard. The graph compiles once per shard, which is
+      # duplicated work traded for wall-clock under the cap.
       matrix:
         include:
           - name: server
@@ -524,6 +524,12 @@ jobs:
           - name: client
             packages: -p connetto-client
             bins: ''
+          - name: files
+            packages: >-
+              -p connetto-file-core
+              -p connetto-file-server
+              -p connetto-file-client
+            bins: ''
           - name: rest
             packages: >-
               -p connetto-core
@@ -532,9 +538,6 @@ jobs:
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew
-              -p connetto-file-core
-              -p connetto-file-server
-              -p connetto-file-client
               -p connetto-peer
             bins: ''
     steps:
