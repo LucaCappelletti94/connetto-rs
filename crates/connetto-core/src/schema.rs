@@ -180,6 +180,141 @@ pub struct SchemaBundle {
     policy_views: Vec<String>,
     local_tier_ddl: Option<String>,
     major: Major,
+    tier_history: TierHistory,
+}
+
+/// The generated structural step of one local-tier boundary, from the major
+/// it starts at to the next (R31).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierBoundary {
+    from: Major,
+    sql: String,
+}
+
+impl TierBoundary {
+    /// The step from `from` to the next major, as the SQL the build generated.
+    #[must_use]
+    pub fn new(from: Major, sql: impl Into<String>) -> Self {
+        Self {
+            from,
+            sql: sql.into(),
+        }
+    }
+
+    /// The major the step starts at.
+    #[must_use]
+    pub const fn from(&self) -> Major {
+        self.from
+    }
+
+    /// The generated SQL, run against the tier alone.
+    #[must_use]
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+/// What a build knows about its local tier's past (R31): the oldest major it
+/// exported, the first major whose export had a tier, and the generated step
+/// of every boundary from the oldest up to the build's own major.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TierHistory {
+    oldest: Major,
+    first_with_tier: Option<Major>,
+    boundaries: Vec<TierBoundary>,
+}
+
+impl TierHistory {
+    /// A history starting at `oldest`, whose first tier appeared at
+    /// `first_with_tier`, with `boundaries` in ascending order.
+    #[must_use]
+    pub const fn new(
+        oldest: Major,
+        first_with_tier: Option<Major>,
+        boundaries: Vec<TierBoundary>,
+    ) -> Self {
+        Self {
+            oldest,
+            first_with_tier,
+            boundaries,
+        }
+    }
+
+    /// The oldest major a tier can be migrated from.
+    #[must_use]
+    pub const fn oldest(&self) -> Major {
+        self.oldest
+    }
+
+    /// The first major whose build had a tier, `None` while none has.
+    #[must_use]
+    pub const fn first_with_tier(&self) -> Option<Major> {
+        self.first_with_tier
+    }
+
+    /// The generated steps, oldest boundary first.
+    #[must_use]
+    pub fn boundaries(&self) -> &[TierBoundary] {
+        &self.boundaries
+    }
+
+    /// Check that the boundaries run one by one from the oldest major to
+    /// `build`, and that the first tier is no later than `build`.
+    fn check_reaches(&self, build: Major) -> Result<(), TierHistoryError> {
+        let mut next = self.oldest.get();
+        for boundary in &self.boundaries {
+            if boundary.from.get() != next {
+                return Err(TierHistoryError::Gap {
+                    expected: next,
+                    found: boundary.from,
+                });
+            }
+            next += 1;
+        }
+        if next != build.get() {
+            return Err(TierHistoryError::Short {
+                reached: next,
+                build,
+            });
+        }
+        match self.first_with_tier {
+            Some(first) if first < self.oldest || first > build => {
+                Err(TierHistoryError::FirstTierOutside { first, build })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Why a tier history does not fit the bundle it was given to.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TierHistoryError {
+    /// A boundary is missing between two others.
+    #[error("the tier history jumps to major {found}, expected a boundary from {expected}")]
+    Gap {
+        /// The major the next boundary had to start at.
+        expected: u32,
+        /// The major it started at.
+        found: Major,
+    },
+    /// The boundaries stop short of the build's major, or run past it.
+    #[error("the tier history reaches major {reached}, the build is major {build}")]
+    Short {
+        /// The major the last boundary reaches.
+        reached: u32,
+        /// The build's major.
+        build: Major,
+    },
+    /// The first major with a tier lies outside the history.
+    #[error(
+        "the tier history says the tier first appeared at major {first}, outside the history up to {build}"
+    )]
+    FirstTierOutside {
+        /// The first major with a tier.
+        first: Major,
+        /// The build's major.
+        build: Major,
+    },
 }
 
 impl SchemaBundle {
@@ -226,6 +361,11 @@ impl SchemaBundle {
                 .map(|(logical, physical)| (logical.into(), physical.into()))
                 .collect(),
             policy_views: policy_views.into_iter().map(Into::into).collect(),
+            tier_history: TierHistory::new(
+                major,
+                local_tier_ddl.is_some().then_some(major),
+                Vec::new(),
+            ),
             local_tier_ddl,
             major,
         })
@@ -240,11 +380,37 @@ impl SchemaBundle {
     /// Return a copy of this bundle with its translated local tier, for the
     /// build step that translates the synced tier and the local tier as two
     /// separate reference universes. The version is unaffected, since the
-    /// local tier is not part of the synced shape it covers.
+    /// local tier is not part of the synced shape it covers. A bundle given a
+    /// tier and no history records its own major as the first with a tier.
     #[must_use]
     pub fn with_local_tier(mut self, local_tier_ddl: impl Into<String>) -> Self {
         self.local_tier_ddl = Some(local_tier_ddl.into());
+        if self.tier_history.first_with_tier.is_none() {
+            self.tier_history.first_with_tier = Some(self.major);
+        }
         self
+    }
+
+    /// Return a copy of this bundle carrying the local tier's history, the
+    /// generated structural step of every boundary from the oldest exported
+    /// major up to this bundle's (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`TierHistoryError`] when the boundaries are not consecutive from the
+    /// history's oldest major to this bundle's, or when the history names a
+    /// first major with a tier that this bundle, which has a tier, cannot
+    /// have reached.
+    pub fn with_tier_history(mut self, history: TierHistory) -> Result<Self, TierHistoryError> {
+        history.check_reaches(self.major)?;
+        self.tier_history = history;
+        Ok(self)
+    }
+
+    /// The local tier's history this build carries.
+    #[must_use]
+    pub const fn tier_history(&self) -> &TierHistory {
+        &self.tier_history
     }
 
     /// The Postgres schema source document, as this bundle holds it.
@@ -445,6 +611,65 @@ mod tests {
         assert_eq!(
             Major::declared_in("CREATE TABLE a (id INT); -- a comment"),
             Err(MajorError::Missing)
+        );
+    }
+
+    fn major(value: u32) -> Major {
+        Major::new(value).expect("a test major is from 1 up")
+    }
+
+    fn at_major(value: u32) -> SchemaBundle {
+        SchemaBundle::new(
+            format!("{MAJOR_DIRECTIVE} {value}"),
+            "",
+            "",
+            NO_TABLES.iter().copied(),
+            NO_VIEWS.iter().copied(),
+            Some("CREATE TABLE notes (id INTEGER PRIMARY KEY)"),
+        )
+        .expect("the source declares its major")
+    }
+
+    #[test]
+    fn a_tier_history_must_run_one_boundary_at_a_time_up_to_the_build() {
+        let boundary = |from| TierBoundary::new(major(from), "");
+        let whole = TierHistory::new(major(1), Some(major(1)), vec![boundary(1), boundary(2)]);
+        assert!(at_major(3).with_tier_history(whole).is_ok());
+
+        let gap = TierHistory::new(major(1), Some(major(1)), vec![boundary(1), boundary(3)]);
+        assert_eq!(
+            at_major(4).with_tier_history(gap).err(),
+            Some(TierHistoryError::Gap {
+                expected: 2,
+                found: major(3)
+            })
+        );
+
+        let short = TierHistory::new(major(1), Some(major(1)), vec![boundary(1)]);
+        assert_eq!(
+            at_major(3).with_tier_history(short).err(),
+            Some(TierHistoryError::Short {
+                reached: 2,
+                build: major(3)
+            })
+        );
+
+        let late = TierHistory::new(major(1), Some(major(4)), vec![boundary(1), boundary(2)]);
+        assert_eq!(
+            at_major(3).with_tier_history(late).err(),
+            Some(TierHistoryError::FirstTierOutside {
+                first: major(4),
+                build: major(3)
+            })
+        );
+    }
+
+    #[test]
+    fn a_bundle_with_a_tier_and_no_history_starts_its_history_at_its_own_major() {
+        let history = at_major(5).tier_history().clone();
+        assert_eq!(
+            history,
+            TierHistory::new(major(5), Some(major(5)), Vec::new())
         );
     }
 

@@ -1515,8 +1515,11 @@ dependencies = [
  "connetto-demo-deployment",
  "diesel",
  "pg2sqlite",
+ "serde",
  "sqlparser",
+ "tempfile",
  "thiserror 2.0.20",
+ "toml 0.8.2",
 ]
 
 [[package]]
