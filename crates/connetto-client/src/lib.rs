@@ -7673,6 +7673,34 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Verified);
     }
 
+    /// A first boot whose schema fails partway leaves none of its earlier tables in the file.
+    #[test]
+    fn a_schema_failing_partway_leaves_no_table_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("partial.db");
+        let path_str = path.to_str().expect("path is utf-8");
+        let key = || ReplicaKey::from_bytes([0x42; ReplicaKey::LEN]);
+        let replica = Replica::encrypted_file(path_str, Some(key())).expect("replica");
+        let failing = "CREATE TABLE first (id INTEGER PRIMARY KEY);
+             CREATE TABLE first (id INTEGER PRIMARY KEY);";
+        let config = ClientConfig::new("partial-test");
+        assert!(
+            ConnettoConnection::<FakeTransport>::open(&replica, failing, &config, None).is_err(),
+            "a schema naming one table twice fails the open"
+        );
+        let mut db = SqliteConnection::establish(path_str).expect("reopen the file");
+        cipher::unlock(&mut db, &key()).expect("unlock");
+        let left = sqlite_catalog::table
+            .filter(sqlite_catalog::name.eq("first"))
+            .count()
+            .get_result::<i64>(&mut db)
+            .expect("read the catalogue");
+        assert_eq!(
+            left, 0,
+            "the first statement was rolled back with the second"
+        );
+    }
+
     /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.
     #[tokio::test]
     async fn a_settled_resend_restarts_the_next_deferral_from_the_first_wait() {
