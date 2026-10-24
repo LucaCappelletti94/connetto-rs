@@ -1172,6 +1172,20 @@ mod tests {
         )
     }
 
+    async fn page_positions(
+        log: &InMemoryOplog,
+        after: PgCommitPosition,
+        upto: PgCommitPosition,
+        limit: usize,
+    ) -> Vec<PgCommitPosition> {
+        log.entries_page(after, upto, limit)
+            .await
+            .expect("read")
+            .iter()
+            .map(ChangeRecord::position)
+            .collect()
+    }
+
     /// Two rows of one transaction share its commit LSN, so a client holding the first still catches up the second.
     #[tokio::test]
     async fn a_cursor_at_a_transactions_first_row_replays_its_second() {
@@ -1236,19 +1250,19 @@ mod tests {
         for (id, position) in (1..).zip(&at) {
             log.append(row(id, *position)).await.expect("append");
         }
-        let log = &log;
-        let page = |after, upto, limit| async move {
-            log.entries_page(after, upto, limit)
-                .await
-                .expect("read")
-                .iter()
-                .map(ChangeRecord::position)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(page(at[0], at[3], 10).await, vec![at[1], at[2], at[3]]);
-        assert_eq!(page(at[0], at[4], 2).await, vec![at[1], at[2]]);
-        assert_eq!(page(at[2], at[4], 2).await, vec![at[3], at[4]]);
-        assert_eq!(page(at[4], at[4], 2).await, Vec::new());
+        assert_eq!(
+            page_positions(&log, at[0], at[3], 10).await,
+            vec![at[1], at[2], at[3]]
+        );
+        assert_eq!(
+            page_positions(&log, at[0], at[4], 2).await,
+            vec![at[1], at[2]]
+        );
+        assert_eq!(
+            page_positions(&log, at[2], at[4], 2).await,
+            vec![at[3], at[4]]
+        );
+        assert_eq!(page_positions(&log, at[4], at[4], 2).await, Vec::new());
     }
 
     /// A cursor before the earliest retained entry pages from that entry, since the window holds nothing earlier to page.
@@ -1261,19 +1275,19 @@ mod tests {
         for (id, position) in (1..).zip(&at) {
             log.append(row(id, *position)).await.expect("append");
         }
-        let log = &log;
-        let page = |after, upto, limit| async move {
-            log.entries_page(after, upto, limit)
-                .await
-                .expect("read")
-                .iter()
-                .map(ChangeRecord::position)
-                .collect::<Vec<_>>()
-        };
         // Positions 1..=5 are pruned, so a cursor at one of them is before the retained front.
-        assert_eq!(page(at[4], at[7], 10).await, vec![at[5], at[6], at[7]]);
-        assert_eq!(page(at[0], at[9], 3).await, vec![at[5], at[6], at[7]]);
-        assert_eq!(page(at[4], at[9], 3).await, vec![at[5], at[6], at[7]]);
+        assert_eq!(
+            page_positions(&log, at[4], at[7], 10).await,
+            vec![at[5], at[6], at[7]]
+        );
+        assert_eq!(
+            page_positions(&log, at[0], at[9], 3).await,
+            vec![at[5], at[6], at[7]]
+        );
+        assert_eq!(
+            page_positions(&log, at[4], at[9], 3).await,
+            vec![at[5], at[6], at[7]]
+        );
     }
 
     /// A cursor at a transaction's first row pages the rest of that transaction, ordered by ordinal.
@@ -1286,21 +1300,15 @@ mod tests {
         log.append(row(1, first)).await.expect("append");
         log.append(row(2, second)).await.expect("append");
         log.append(row(3, after_commit)).await.expect("append");
-        let log = &log;
-        let page = |after, upto, limit| async move {
-            log.entries_page(after, upto, limit)
-                .await
-                .expect("read")
-                .iter()
-                .map(ChangeRecord::position)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(page(first, first, 10).await, Vec::new());
+        assert_eq!(page_positions(&log, first, first, 10).await, Vec::new());
         assert_eq!(
-            page(first, after_commit, 10).await,
+            page_positions(&log, first, after_commit, 10).await,
             vec![second, after_commit]
         );
-        assert_eq!(page(second, after_commit, 10).await, vec![after_commit]);
+        assert_eq!(
+            page_positions(&log, second, after_commit, 10).await,
+            vec![after_commit]
+        );
     }
 
     /// A cursor past the watermark and a zero limit each find an empty page.
@@ -1313,17 +1321,8 @@ mod tests {
         for (id, position) in (1..).zip(&at) {
             log.append(row(id, *position)).await.expect("append");
         }
-        let log = &log;
-        let page = |after, upto, limit| async move {
-            log.entries_page(after, upto, limit)
-                .await
-                .expect("read")
-                .iter()
-                .map(ChangeRecord::position)
-                .collect::<Vec<_>>()
-        };
         let future = PgCommitPosition::new(PgLsn(0x100 * 6), PgXid(1), 1);
-        assert_eq!(page(future, future, 10).await, Vec::new());
-        assert_eq!(page(at[0], at[4], 0).await, Vec::new());
+        assert_eq!(page_positions(&log, future, future, 10).await, Vec::new());
+        assert_eq!(page_positions(&log, at[0], at[4], 0).await, Vec::new());
     }
 }
