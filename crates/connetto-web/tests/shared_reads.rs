@@ -309,7 +309,7 @@ async fn a_second_identitys_late_tab_reads_the_first_identitys_shared_rows() {
     assert_eq!(count, 2, "alice's rows are visible under the bare name");
     // The DSL cannot probe a schema's catalogue, so the raw read stays.
     let readers: RowCount = diesel::sql_query(
-        "SELECT count(*) AS count FROM temp.sqlite_schema WHERE type = 'view' AND name = 'public'",
+        "SELECT count(*) AS count FROM temp.sqlite_master WHERE type = 'view' AND name = 'public'",
     )
     .get_result(&mut *bob.conn())
     .expect("the temp catalogue reads");

@@ -4252,23 +4252,15 @@ where
         .cloned()
         .collect();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
-    if !synced.is_empty() {
-        let patchset = synced_snapshot(worker.conn(), MAIN_SCHEMA, &map, &synced, blank)?;
-        if !patchset.is_empty() {
-            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
-        }
-    }
-    if !shared_tables.is_empty() {
-        let patchset = synced_snapshot(worker.conn(), SHARED_SCHEMA, &map, &shared_tables, blank)?;
-        if !patchset.is_empty() {
-            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
+    for (schema, set) in [(MAIN_SCHEMA, &synced), (SHARED_SCHEMA, &shared_tables)] {
+        if !set.is_empty() {
+            let patchset = synced_snapshot(worker.conn(), schema, &map, set, blank)?;
+            push_payload(&mut payloads, &patchset)?;
         }
     }
     if !local_tables.is_empty() {
         let patchset = snapshot_patchset(worker.conn(), LOCAL_SCHEMA, &local_tables, blank)?;
-        if !patchset.is_empty() {
-            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
-        }
+        push_payload(&mut payloads, &patchset)?;
     }
     let _ = tab.out.send(TabOut::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
@@ -4295,6 +4287,14 @@ where
             cursor: relay_cursor(worker),
         }),
     );
+    Ok(())
+}
+
+/// Compress a non-empty snapshot patchset onto the payloads a subscription serves.
+fn push_payload(payloads: &mut Vec<Vec<u8>>, patchset: &[u8]) -> Result<(), RelayError> {
+    if !patchset.is_empty() {
+        payloads.push(zstd::encode_all(patchset, ZSTD_LEVEL)?);
+    }
     Ok(())
 }
 

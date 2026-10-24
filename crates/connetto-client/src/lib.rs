@@ -1725,8 +1725,8 @@ fn check_policy_tables(
     tables: &PolicyTables,
 ) -> Result<(), ClientError> {
     let rows: Vec<SchemaTableRow> = diesel::sql_query(
-        "SELECT name FROM main.sqlite_schema WHERE type = 'view' \
-         UNION SELECT name FROM temp.sqlite_schema WHERE type = 'view'",
+        "SELECT name FROM main.sqlite_master WHERE type = 'view' \
+         UNION SELECT name FROM temp.sqlite_master WHERE type = 'view'",
     )
     .load(db)?;
     let present: HashSet<String> = rows
@@ -3348,7 +3348,7 @@ fn install_storage_layout<S: ReplicaStorage>(
         (None, Some(_)) => return Err(ClientError::ReplicaKeyMissing),
     }
     let fresh_shared = diesel::sql_query(
-        "SELECT 1 AS present FROM connetto_shared.sqlite_schema WHERE type = 'table' LIMIT 1",
+        "SELECT 1 AS present FROM connetto_shared.sqlite_master WHERE type = 'table' LIMIT 1",
     )
     .get_result::<Present>(db)
     .optional()?
