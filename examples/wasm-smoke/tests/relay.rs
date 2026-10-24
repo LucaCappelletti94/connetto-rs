@@ -39,6 +39,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -56,6 +57,7 @@ struct Order {
     id: rosetta_uuid::Uuid,
     owner_id: String,
     quantity: i64,
+    created_at: String,
 }
 
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]

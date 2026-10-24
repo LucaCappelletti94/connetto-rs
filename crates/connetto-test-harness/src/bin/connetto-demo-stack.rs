@@ -1,6 +1,7 @@
-//! Runs the dev stack `examples/dioxus-desktop-demo` signs in and syncs
+//! Runs the dev stack the Dioxus and Tauri demos sign in and sync
 //! against, which is Postgres, the authorization service, the dev identity
-//! provider and `connetto-server`, provisioned with the demo's own deployment.
+//! provider and `connetto-server`, provisioned with `examples/deployment`,
+//! the deployment the browser demos share.
 //!
 //! ```text
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack
@@ -67,10 +68,10 @@ const APP_REDIRECTS: &str =
 const DEMO_BUNDLES: [&str; 2] = ["dev.connetto.dioxusdemo", "dev.connetto.tauridemo"];
 
 const DEPLOYMENT: Deployment = Deployment {
-    schema: include_str!("../../../../examples/dioxus-desktop-demo/schema.sql"),
-    roles: include_str!("../../../../examples/dioxus-desktop-demo/roles.sql"),
-    content: include_str!("../../../../examples/dioxus-desktop-demo/content.sql"),
-    policies: include_str!("../../../../examples/dioxus-desktop-demo/policies.sql"),
+    schema: include_str!("../../../../examples/deployment/schema.sql"),
+    roles: include_str!("../../../../examples/deployment/roles.sql"),
+    content: include_str!("../../../../examples/deployment/content.sql"),
+    policies: include_str!("../../../../examples/deployment/policies.sql"),
     published: &["orders", "order_lines", "photos"],
     writable: "orders,photos",
 };

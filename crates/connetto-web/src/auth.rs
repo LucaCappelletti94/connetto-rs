@@ -580,6 +580,11 @@ impl IdbKeyStore {
         self.derived.replace(None);
     }
 
+    /// Whether this handle holds the passkey-derived key.
+    pub(crate) fn has_derived(&self) -> bool {
+        self.derived.borrow().is_some()
+    }
+
     /// Derive the key-encryption key for this handle from `hkdf` without
     /// touching storage. Subsequent reads and writes use the derived key.
     ///

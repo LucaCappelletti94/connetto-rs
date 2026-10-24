@@ -1,3 +1,4 @@
+use core::future::Future;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -84,7 +85,7 @@ pub(super) fn install_blocked_content_transport(
 /// Answers the chunk `PUT` the way the file server does, recording its body,
 /// reporting upload progress so the transport's idle bound keeps resetting,
 /// and waiting on `gate` before answering when the test holds one.
-fn replace_content_upload(
+pub(super) fn replace_content_upload(
     uploaded: &Rc<RefCell<Vec<Vec<u8>>>>,
     gate: Option<(Rc<Cell<bool>>, Promise)>,
 ) -> Replaced {
@@ -175,31 +176,48 @@ fn replace_global(name: &str, replacement: &JsValue, kept: Kept) -> Replaced {
 
 /// Answers the intent with every declared hash and the commit with `200`.
 fn replace_content_fetch() -> Replaced {
+    install_fetch(|request, body| async move {
+        if request.url().contains("/intent?") {
+            intent_answer(&body)
+        } else {
+            response(None, 200)
+        }
+    })
+}
+
+/// Replaces `fetch` with `answer`, called with each request and its body.
+pub(super) fn install_fetch<F, Fut>(answer: F) -> Replaced
+where
+    F: Fn(Request, Vec<u8>) -> Fut + 'static,
+    Fut: Future<Output = Result<JsValue, JsValue>> + 'static,
+{
+    let answer = Rc::new(answer);
     let closure = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
         let request = value.dyn_into::<Request>().expect("fetch receives Request");
+        let answer = Rc::clone(&answer);
         future_to_promise(async move {
             let body = JsFuture::from(request.array_buffer()?).await?;
             let body = Uint8Array::new(&body).to_vec();
-            if request.url().contains("/intent?") {
-                let intent: serde_json::Value =
-                    serde_json::from_slice(&body).expect("decode upload intent");
-                let needed: Vec<&str> = intent["chunks"]
-                    .as_array()
-                    .expect("intent chunks")
-                    .iter()
-                    .map(|chunk| chunk["hash"].as_str().expect("chunk hash"))
-                    .collect();
-                response(
-                    Some(&serde_json::json!({ "needed": needed }).to_string()),
-                    200,
-                )
-            } else {
-                response(None, 200)
-            }
+            answer(request, body).await
         })
     });
     let replacement: JsValue = closure.as_ref().clone();
     replace_global("fetch", &replacement, Kept::Fetch(closure))
+}
+
+/// The file server's answer to an upload intent, every declared chunk needed.
+pub(super) fn intent_answer(body: &[u8]) -> Result<JsValue, JsValue> {
+    let intent: serde_json::Value = serde_json::from_slice(body).expect("decode upload intent");
+    let needed: Vec<&str> = intent["chunks"]
+        .as_array()
+        .expect("intent chunks")
+        .iter()
+        .map(|chunk| chunk["hash"].as_str().expect("chunk hash"))
+        .collect();
+    response(
+        Some(&serde_json::json!({ "needed": needed }).to_string()),
+        200,
+    )
 }
 
 impl Drop for Replaced {
@@ -208,7 +226,13 @@ impl Drop for Replaced {
     }
 }
 
-fn response(body: Option<&str>, status: u16) -> Result<JsValue, JsValue> {
+/// Answers like a `web_sys::Response` of `status` with an optional text body.
+pub(super) fn response(body: Option<&str>, status: u16) -> Result<JsValue, JsValue> {
+    response_with(body.map(JsValue::from_str), status)
+}
+
+/// Answers like a `web_sys::Response` of `status` with an optional body.
+pub(super) fn response_with(body: Option<JsValue>, status: u16) -> Result<JsValue, JsValue> {
     let global = js_sys::global();
     let constructor =
         Reflect::get(&global, &JsValue::from_str("Response"))?.dyn_into::<Function>()?;
@@ -219,7 +243,7 @@ fn response(body: Option<&str>, status: u16) -> Result<JsValue, JsValue> {
         &JsValue::from_f64(f64::from(status)),
     )?;
     let arguments = Array::new();
-    arguments.push(&body.map_or(JsValue::NULL, JsValue::from_str));
+    arguments.push(&body.unwrap_or(JsValue::NULL));
     arguments.push(&init);
     Reflect::construct(&constructor, &arguments)
 }

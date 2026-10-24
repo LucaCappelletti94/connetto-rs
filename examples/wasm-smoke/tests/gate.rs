@@ -335,6 +335,9 @@ async fn a_durable_boot_with_no_gate_setting_is_gated() {
     await_db_worker_ready(&[])
         .await
         .expect("the default boot unlocks through the ceremony and is ready");
+    let tab = connect_gate_tab("gate-tab-default").await;
+    assert_open(&tab).await;
+    assert!(prompts.borrow().is_none(), "boot needs one approval");
     worker.terminate();
     stage("gate test: done");
 }
@@ -350,8 +353,9 @@ async fn a_locked_gate_refuses_the_tabs_that_attach_while_it_is_locked() {
     stage("gate test: waiting for worker ready");
     await_db_worker_ready(&[]).await.expect("db worker ready");
 
-    // Hold the gate's launch prompt unanswered, so the gate stays locked.
-    stage("gate test: holding the launch prompt");
+    post_visibility("gate-tab-a", true);
+    post_visibility("gate-tab-a", false);
+    post_visibility("gate-tab-a", true);
     await_prompt(&prompts).await;
 
     let tab_a = connect_gate_tab("gate-tab-a").await;
@@ -375,13 +379,9 @@ async fn tab_visibility_aggregates_the_gate_lock_on_every_return() {
     stage("gate test: aggregation");
     plant_enrolled_credential(SEED, 0x02).await;
     common::play_the_tab();
-    let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
+    let (worker, _prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    stage("gate test: answering the launch prompt");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-agga").await;
     let tab_b = connect_gate_tab("gate-tab-aggb").await;
@@ -424,12 +424,9 @@ async fn a_closing_tab_counts_as_hidden_for_the_gate() {
     stage("gate test: closing tab counts as hidden");
     plant_enrolled_credential(SEED, 0x03).await;
     common::play_the_tab();
-    let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
+    let (worker, _prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-clsa").await;
     let tab_b = connect_gate_tab("gate-tab-clsb").await;
@@ -470,9 +467,6 @@ async fn an_approval_unlocks_every_tab() {
     let (worker, prompts) = spawn_worker_with_prompt_handler(0).await;
 
     await_db_worker_ready(&[]).await.expect("db worker ready");
-    await_prompt(&prompts).await;
-    let launch = prompts.borrow_mut().take().expect("the launch prompt");
-    answer_prompt(&worker, launch).await;
 
     let tab_a = connect_gate_tab("gate-tab-unla").await;
     let tab_b = connect_gate_tab("gate-tab-unlb").await;

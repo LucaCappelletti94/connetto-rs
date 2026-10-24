@@ -120,6 +120,8 @@ A re-check that fires pauses the application and keeps the session. The client r
 
 The input is **one fixed value, not per identity**, producing one key-encryption key that unwraps per-identity records. R23's original argument for a fixed input was that the refresh store must open before any identity is known, and R90 deletes the store that needed it (**Decided (R90, 2026-09-22)**). The decision stands on the reason that outlives the store: erasing one account without touching another is the job per-identity keys actually have, the per-identity wrapped records already provide it, and one gesture on a shared profile must open every account's replica rather than the remembered one.
 
+Each enrolment uses a fresh random WebAuthn `user.id`, so independent origins or browser profiles sharing an authenticator retain separate credentials even when their relying-party domain matches. The stored credential identifier selects the passkey on later launches. After boot verifies the user, the relay gate starts open and asks again only under the configured away-and-return policy.
+
 Storage becomes:
 
 | Store | Contents |

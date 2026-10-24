@@ -2,7 +2,7 @@
 
 ## Why this plan exists
 
-The browser dioxus-web work surfaced a structural gap. A browser tab does not talk to `connetto-server` directly. It talks to the `RelayHub` in the DB worker (`crates/connetto-web/src/relay.rs`), which re-serves the connetto wire protocol from a worker-held connection so that many tabs share one OPFS replica and one server session. The hub re-implements the server's protocol, but only partially. Several live-query legs that work against the direct server silently do nothing through the relay.
+The browser dioxus demo work surfaced a structural gap. A browser tab does not talk to `connetto-server` directly. It talks to the `RelayHub` in the DB worker (`crates/connetto-web/src/relay.rs`), which re-serves the connetto wire protocol from a worker-held connection so that many tabs share one OPFS replica and one server session. The hub re-implements the server's protocol, but only partially. Several live-query legs that work against the direct server silently do nothing through the relay.
 
 The client code is already unified. `ConnettoClient` and `ConnettoConnection` are the same crate on native and wasm, and the whole typed `live()` surface compiles and runs on wasm. So this is not a native-versus-wasm code gap. The asymmetry is entirely the server stand-in:
 

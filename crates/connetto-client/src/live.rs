@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
-use connetto_core::messages::{BindValue, Grant, SubscriptionSpec};
+use connetto_core::messages::{BindValue, Grant, SUBSCRIPTION_REFUSED, SubscriptionSpec};
 use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::associations::{HasTable, Identifiable};
@@ -51,7 +51,9 @@ use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment};
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
-use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer, ShareKeyTimer};
+use crate::{
+    ClientError, ClientEvent, ConnettoConnection, KeepaliveTimer, ResendTimer, ShareKeyTimer,
+};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
 /// the bind values the placeholders stand for, in placeholder order.
@@ -656,11 +658,49 @@ fn run_probe(conn: &mut SqliteConnection, probe: &str) -> Result<String, ClientE
 
 /// Subscription ids and the wake signal shared with every [`LiveQuery`], so a
 /// synchronous `Drop` can queue its unsubscribe for the async pump, and the
-/// fault that stopped the pump, if one did.
+/// fault that stopped the pump, if one did. It also holds the subscriptions
+/// the server refused and the wake that ends a handle's wait on one.
 struct Reaper {
     pending: StdMutex<Vec<String>>,
     wake: Arc<Notify>,
     stopped: OnceLock<String>,
+    /// The handles the server has refused, by sub id. They stay marked until
+    /// the server re-serves the sub or the handle drops.
+    refused: StdMutex<HashSet<String>>,
+    /// Wakes every handle waiting in `changed` so one that was refused returns
+    /// the refusal instead of outliving its subscription.
+    refuse_wake: Arc<Notify>,
+}
+
+impl Reaper {
+    /// Record that the server refused one handle's subscription, waking the
+    /// handles that wait in `changed`.
+    fn record_refusal(&self, sub_id: &str) {
+        let mut refused = match self.refused.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if refused.insert(sub_id.to_owned()) {
+            self.refuse_wake.notify_waiters();
+        }
+    }
+
+    /// Let a dropped handle take its refusal mark with it.
+    fn forget_refusal(&self, sub_id: &str) {
+        let mut refused = match self.refused.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        refused.remove(sub_id);
+    }
+
+    /// Whether the server refused this handle's subscription.
+    fn refusal(&self, sub_id: &str) -> bool {
+        match self.refused.lock() {
+            Ok(guard) => guard.contains(sub_id),
+            Err(poisoned) => poisoned.into_inner().contains(sub_id),
+        }
+    }
 }
 
 /// What [`LiveQuery`] and [`LiveValue`] both are underneath: a subscription
@@ -692,18 +732,38 @@ impl LiveHandleCore {
         if let Some(detail) = self.reaper.stopped.get() {
             return Err(ClientError::Stopped(detail.clone()));
         }
-        self.changed.changed().await.map_err(|_| {
-            self.reaper.stopped.get().map_or_else(
-                || ClientError::Transport("live query driver stopped".to_owned()),
-                |detail| ClientError::Stopped(detail.clone()),
-            )
-        })
+        loop {
+            if self.reaper.refusal(&self.sub_id) {
+                return Err(ClientError::SubscriptionRefused);
+            }
+            let refuse_wake = self.reaper.refuse_wake.notified();
+            let res = tokio::select! {
+                res = self.changed.changed() => res,
+                () = refuse_wake => {
+                    if self.reaper.refusal(&self.sub_id) {
+                        return Err(ClientError::SubscriptionRefused);
+                    }
+                    // Another handle took the wake, and this one was not refused.
+                    continue;
+                }
+            };
+            if self.reaper.refusal(&self.sub_id) {
+                return Err(ClientError::SubscriptionRefused);
+            }
+            return res.map_err(|_| {
+                self.reaper.stopped.get().map_or_else(
+                    || ClientError::Transport("live query driver stopped".to_owned()),
+                    |detail| ClientError::Stopped(detail.clone()),
+                )
+            });
+        }
     }
 }
 
 impl Drop for LiveHandleCore {
     fn drop(&mut self) {
         let sub_id = core::mem::take(&mut self.sub_id);
+        self.reaper.forget_refusal(&sub_id);
         let mut pending = match self.reaper.pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1398,6 +1458,8 @@ where
                 pending: StdMutex::new(Vec::new()),
                 wake: Arc::clone(&wake),
                 stopped: OnceLock::new(),
+                refused: StdMutex::new(HashSet::new()),
+                refuse_wake: Arc::new(Notify::new()),
             }),
             events,
             next_live: AtomicU64::new(1),
@@ -2825,6 +2887,10 @@ async fn wait_timer<D, F: Future<Output = ()> + ?Sized>(
 /// which case the pump recovers: backoff, fresh transport, session resume,
 /// re-declared subscriptions. Local faults (session, apply, protocol) stay
 /// terminal either way and are announced as [`ClientEvent::Stopped`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "one loop arms the resend, keepalive and share-key timers beside the gate prompt"
+)]
 async fn pump<T, F, S>(
     shared: Arc<Shared<T>>,
     alive: Weak<ClientToken>,
@@ -2838,6 +2904,8 @@ async fn pump<T, F, S>(
     let mut needs_recovery = false;
     // The sleep for the armed resend, kept across steps so arriving frames do not restart it.
     let mut resend = None;
+    // The sleep for the armed keepalive deadline, re-armed when a frame moves it.
+    let mut keepalive = None;
     let mut key_timer = None;
     loop {
         if alive.upgrade().is_none() {
@@ -2894,12 +2962,20 @@ async fn pump<T, F, S>(
 
         // One cancellable pump step. A wake interrupts the idle wait so lock
         // waiters (watch, with_conn, drops) get in promptly, and the armed
-        // resend of deferred writes interrupts it when it is due. With no
-        // driver there is no sleeper, so deferred writes wait for the next
-        // attach.
+        // resend of deferred writes and the armed keepalive deadline interrupt
+        // it when they are due. The keepalive runs while the gate is locked,
+        // because the away gate holds the app, not the socket. With no driver
+        // there is no sleeper, so deferred writes and keepalive waits hold for
+        // the next attach.
         let armed = state.conn.resend_timer();
         if armed != resend.as_ref().map(|(timer, _)| *timer) {
             resend = armed
+                .zip(reconnect.as_mut())
+                .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
+        }
+        let ka_armed = state.conn.keepalive_timer();
+        if ka_armed != keepalive.as_ref().map(|(timer, _)| *timer) {
+            keepalive = ka_armed
                 .zip(reconnect.as_mut())
                 .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
         }
@@ -2911,10 +2987,11 @@ async fn pump<T, F, S>(
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
-        let stepped = step_or_resend(
+        let stepped = step_or_resend_or_keepalive(
             &mut state.conn,
             &shared.wake,
             &mut resend,
+            &mut keepalive,
             &mut key_timer,
             &mut ask,
             &mut ask_outcome,
@@ -3325,6 +3402,19 @@ where
                     }
                 }
             }
+            if let ClientEvent::NonFatal {
+                related_to: Some(wire_id),
+                detail,
+            } = &event
+                && detail == SUBSCRIPTION_REFUSED
+            {
+                note_wire_outcome(state, &shared.reaper, wire_id, true);
+            }
+            if let ClientEvent::SnapshotEnd { sub_id } = &event {
+                // The server re-served the sub, whatever it refused before,
+                // so the handles riding it wait for data again.
+                note_wire_outcome(state, &shared.reaper, sub_id, false);
+            }
             if !apply_relayed_gate(&shared.gate, &event) {
                 let _ = shared.events.send(event);
             }
@@ -3337,6 +3427,40 @@ where
             } else {
                 PumpFlow::Fail(err)
             }
+        }
+    }
+}
+
+/// Set or clear the refusal mark of every live handle that rides one wire
+/// subscription. A refused sub makes each `changed` return the refusal instead
+/// of waiting for a snapshot that never arrives, and a re-served one makes the
+/// handles wait for data again.
+fn note_wire_outcome<T: Transport>(
+    state: &State<T>,
+    reaper: &Reaper,
+    wire_id: &str,
+    refused: bool,
+) {
+    let note = |reaper: &Reaper, sub_id: &str| {
+        if refused {
+            reaper.record_refusal(sub_id);
+        } else {
+            reaper.forget_refusal(sub_id);
+        }
+    };
+    for entry in &state.registry {
+        if entry.wire_ids.iter().any(|id| id == wire_id) {
+            note(reaper, &entry.sub_id);
+        }
+    }
+    for entry in &state.values {
+        if entry.wire_id == wire_id {
+            note(reaper, &entry.sub_id);
+        }
+    }
+    for entry in &state.computed {
+        if entry.wire_id == wire_id {
+            note(reaper, &entry.sub_id);
         }
     }
 }
@@ -3368,16 +3492,18 @@ fn pump_finished<T: Transport>(shared: &Shared<T>) {
     shared.pump_done.wake.notify_waiters();
 }
 
-/// One cancellable pump step that also ends when the armed resend is due or
-/// the gate's prompt resolves, and then sends the deferred writes again.
+/// One cancellable pump step that also ends when the armed resend is due, the
+/// armed keepalive deadline is due, or the gate's prompt resolves, and then
+/// sends the deferred writes again and fires the keepalive deadline.
 ///
-/// A due resend means the cancel won, so the step took no frame and an error
-/// from the resend loses none. A resolved prompt is captured in `ask_outcome`
-/// for the caller to apply under the state lock.
-async fn step_or_resend<T, F>(
+/// A due resend or deadline means the cancel won, so the step took no frame
+/// and an error from either loses none. A resolved prompt is captured in
+/// `ask_outcome` for the caller to apply under the state lock.
+async fn step_or_resend_or_keepalive<T, F>(
     conn: &mut ConnettoConnection<T>,
     wake: &Notify,
     resend: &mut Option<(ResendTimer, core::pin::Pin<Box<F>>)>,
+    keepalive: &mut Option<(KeepaliveTimer, core::pin::Pin<Box<F>>)>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
     ask: &mut Option<GateAskFuture>,
     ask_outcome: &mut Option<GateAskOutcome>,
@@ -3388,12 +3514,14 @@ where
     F: Future<Output = ()>,
 {
     let due = AtomicBool::new(false);
+    let ka_due = AtomicBool::new(false);
     let key_due = AtomicBool::new(false);
     let cancel = async {
         tokio::select! {
             biased;
             () = wake.notified() => {}
             () = wait_timer(resend) => due.store(true, Ordering::Relaxed),
+            () = wait_timer(keepalive) => ka_due.store(true, Ordering::Relaxed),
             () = wait_timer(key_timer) => key_due.store(true, Ordering::Relaxed),
             outcome = async {
                 match ask.as_mut() {
@@ -3411,6 +3539,11 @@ where
         && let Some((timer, _)) = resend.take()
     {
         conn.resend_deferred(timer).await?;
+    }
+    if ka_due.load(Ordering::Relaxed)
+        && let Some((timer, _)) = keepalive.take()
+    {
+        conn.keepalive_fire(timer).await?;
     }
     stepped
 }

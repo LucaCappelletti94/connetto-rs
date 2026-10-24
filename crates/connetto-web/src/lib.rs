@@ -52,9 +52,11 @@ use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::{IncomingFrame, Transport};
 pub use content::{
     BrowserContentClient, BrowserContentError, BrowserResolved, ObjectUrl, ObjectUrlError,
-    TabContent, TabPinError, TabResolved, TabStageError, attach_browser_content,
+    TabContent, TabContentError, TabResolved, TabStageError, attach_browser_content,
 };
-pub use content_wire::{ContentFrame, WirePins, WireResolve, mime_code, mime_from_code};
+pub use content_wire::{
+    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_code, mime_from_code,
+};
 pub use frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };

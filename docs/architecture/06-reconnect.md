@@ -136,6 +136,8 @@ HandshakeAck {
 
 After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 
+**Built: a silent peer is noticed on both sides.** The handshake waits at most `SyncTuning::answer_within` (10 s) from the `Handshake` send to the `HandshakeAck`, so a server frozen mid-dial costs one backoff and a redial. Once connected, the client sends `Ping` after `probe_after` (15 s) with no inbound frame and drops the transport after `answer_within` more with none, which shows the application `SyncStatus::Offline` and starts this flow. Every deadline compares real elapsed time, so a timer a throttled tab fires late never drops a link that received a frame. The server closes a session that sent nothing for `SessionConfig::idle_limit` (60 s) through the exit a dropped socket takes, releasing its registration and subscriptions.
+
 ---
 
 ## Reconnect Flow

@@ -61,6 +61,7 @@ mod grouped_wire;
 
 mod failover;
 
+mod idle_limit;
 mod inprocess_loop;
 mod lifecycle;
 mod logging;

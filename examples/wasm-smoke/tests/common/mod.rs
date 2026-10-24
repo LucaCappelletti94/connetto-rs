@@ -21,6 +21,11 @@ pub const PROVIDER: &str = "dev-idp";
 /// These suites' account index, kept apart from every other suite's.
 pub const ACCOUNT_DB: &str = "e42-accounts.sqlite";
 
+/// The order write time, RFC 3339 from the browser clock, named on insert
+/// because the replica's default leaves the changeset value NULL.
+pub fn now_rfc3339() -> String {
+    js_sys::Date::new_0().to_json().into()
+}
 /// The stack's provider sign-in, which serves the navigation and the fetch
 /// calls on one origin.
 pub fn auth_config() -> connetto_client::Auth {

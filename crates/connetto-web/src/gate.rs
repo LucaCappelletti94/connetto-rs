@@ -39,6 +39,10 @@ impl BrowserGateMechanism {
 }
 
 impl GateMechanism for BrowserGateMechanism {
+    fn is_open(&self) -> bool {
+        self.key_store.has_derived()
+    }
+
     fn lock(&self) {
         self.key_store.drop_derived();
     }
@@ -104,9 +108,8 @@ impl GateMechanism for BrowserGateMechanism {
 /// the re-check is armed on the hub's gate controller with the browser's
 /// mechanism, the controller's away input is fed by the tabs' visibility,
 /// and its lock states are delivered straight to the hub, which states them
-/// to every tab. A gated boot starts locked and asks the one launch prompt,
-/// which is what the spawning tab answers. A return past the grace asks
-/// again, and the tabs learn each state from the hub.
+/// to every tab. The boot's approval leaves the gate open. A return past the
+/// grace asks again, and the tabs learn each state from the hub.
 ///
 /// A boot that is not gated, or a gate the application turned off, arms
 /// nothing, so the away input is ignored and the tabs stay open.
@@ -126,7 +129,4 @@ pub fn install_worker_gate(
     )]
     hub.gate().enable(gate.recheck(), Arc::new(mechanism));
     visibility::track_visibility(Rc::clone(hub.gate()));
-    // A gated boot starts locked, and the one launch prompt is what the
-    // spawning tab answers.
-    hub.gate().unlock();
 }

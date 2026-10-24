@@ -1,4 +1,4 @@
-//! Deploys `examples/dioxus-desktop-demo` to an iOS simulator or a paired
+//! Deploys `examples/dioxus-demo` to an iOS simulator or a paired
 //! iPhone or iPad, or with `--demo tauri` `examples/tauri-leptos-demo` to a
 //! simulator, and walks R88's proof on it, which is sign in, sync, write
 //! offline and upload on reconnect, then R51's re-check after time away.
@@ -88,8 +88,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
 
-const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
-const APP: &str = "target/dx/connetto-dioxus-desktop-demo/debug/ios/ConnettoDioxusDesktopDemo.app";
+const DEMO_DIR: [&str; 2] = ["examples", "dioxus-demo"];
+const APP: &str = "target/dx/connetto-dioxus-demo/debug/ios/ConnettoDioxusDemo.app";
 const TAURI_DIR: [&str; 3] = ["examples", "tauri-leptos-demo", "src-tauri"];
 /// Where `cargo tauri ios build` leaves a simulator build.
 const TAURI_APP: &str = "gen/apple/build/arm64-sim/connetto-tauri-demo.app";
@@ -121,7 +121,7 @@ fn bundle() -> &'static str {
 /// The demo's executable, which names its process.
 fn process() -> &'static str {
     match demo() {
-        Demo::Dioxus => "connetto-dioxus-desktop-demo",
+        Demo::Dioxus => "connetto-dioxus-demo",
         Demo::Tauri => "connetto-tauri-demo",
     }
 }

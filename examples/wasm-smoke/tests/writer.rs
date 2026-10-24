@@ -52,6 +52,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -320,14 +321,20 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
 
     // A valid insert the server never saw, compressed as the bulk frame carries it.
     let insert_patch = |id: rosetta_uuid::Uuid| {
-        let table = SimpleTable::new("orders", &["id", "owner_id", "quantity"], &[0]);
+        let table = SimpleTable::new(
+            "orders",
+            &["id", "owner_id", "quantity", "created_at"],
+            &[0],
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Blob(<[u8; 16]>::from(id).to_vec()))
             .expect("set the id")
             .set(1, Value::Text(user_id.clone()))
             .expect("set the owner")
             .set(2, Value::Integer(5))
-            .expect("set the quantity");
+            .expect("set the quantity")
+            .set(3, Value::Text(common::now_rfc3339()))
+            .expect("set the created at");
         let changeset = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
             .insert(insert)
             .build();

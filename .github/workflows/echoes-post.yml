@@ -30,8 +30,7 @@ jobs:
         name:
           - root
           - connetto-web
-          - dioxus-desktop-demo
-          - dioxus-web-demo
+          - dioxus-demo
           - tauri-leptos-demo
           - wasm-smoke
           - webauthn-unlock

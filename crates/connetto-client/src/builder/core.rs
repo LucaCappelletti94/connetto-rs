@@ -31,11 +31,7 @@ use crate::builder::sign_in::HeldCredential;
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
 use crate::live::ConnettoClient;
-#[cfg(not(feature = "native-transport"))]
-use crate::reconnect::NoSleep;
-#[cfg(feature = "native-transport")]
-use crate::reconnect::TokioSleeper;
-use crate::reconnect::{ReconnectPolicy, Sleeper};
+use crate::reconnect::ReconnectPolicy;
 use crate::replica::Encrypted;
 #[cfg(feature = "native-transport")]
 use crate::replica::provision_replica_key;
@@ -173,28 +169,11 @@ type SleeperFn =
 #[cfg(not(feature = "native-transport"))]
 type SleeperFn = Box<dyn FnMut(Duration) -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
 
-/// The backoff sleep a build that named none rides. Native takes the ambient
-/// runtime's timer. Wasm names its own, because the built-in sleep is instant
-/// and turns the backoff into a retry loop with no pause.
+/// The backoff sleep a build that named none rides, the platform timer the
+/// handshake bound waits on. An instant sleep would turn the backoff and the
+/// keepalive wait into a loop that never yields.
 fn default_sleeper() -> SleeperFn {
-    #[cfg(feature = "native-transport")]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = TokioSleeper;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
-    #[cfg(not(feature = "native-transport"))]
-    {
-        Box::new(|d| {
-            Box::pin(async move {
-                let mut sleeper = NoSleep;
-                sleeper.sleep(d).await;
-            })
-        })
-    }
+    Box::new(|d| Box::pin(crate::timer_wait(d)))
 }
 
 /// The fields every stage carries and moves into the next.
@@ -1351,9 +1330,10 @@ pub(crate) enum FirstDial {
 }
 
 /// The shared connect opens the replica so local reads answer at once, then
-/// tries one dial and attaches it on success. A refusal no retry can cure fails
-/// the build either way, and any other failure follows `first_dial`. The
-/// replica is opened by the caller, which knows its storage.
+/// tries one dial and attaches it on success. A refusal no retry can cure
+/// fails the build either way, an unanswered handshake starts offline when a
+/// reconnect loop will redial, and any other failure follows `first_dial`.
+/// The replica is opened by the caller, which knows its storage.
 #[expect(
     clippy::too_many_arguments,
     reason = "Replica, credentials and first-dial policy are independent inputs."
@@ -1389,7 +1369,19 @@ where
         conn.prepare_share_keys().await?;
     }
     match dialer.connect().await {
-        Ok(transport) => conn.attach(transport).await?,
+        Ok(transport) => match conn.attach(transport).await {
+            Err(err)
+                if matches!(err, ClientError::HandshakeUnanswered)
+                    && first_dial == FirstDial::MayFail =>
+            {
+                tracing::warn!(
+                    error = %err,
+                    "the handshake drew no answer, starting offline"
+                );
+            }
+            Err(err) => return Err(err),
+            Ok(()) => {}
+        },
         Err(err) => {
             if err.is_permanent() || first_dial == FirstDial::Required {
                 return Err(dial_error(err));

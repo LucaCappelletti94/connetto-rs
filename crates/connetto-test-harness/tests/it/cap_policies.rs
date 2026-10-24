@@ -8,10 +8,10 @@ use diesel_async::RunQueryDsl as _;
 
 /// The demo's own deployment, provisioned exactly as `connetto-demo-stack` does.
 const DEMO: Deployment = Deployment {
-    schema: include_str!("../../../../examples/dioxus-desktop-demo/schema.sql"),
-    roles: include_str!("../../../../examples/dioxus-desktop-demo/roles.sql"),
-    content: include_str!("../../../../examples/dioxus-desktop-demo/content.sql"),
-    policies: include_str!("../../../../examples/dioxus-desktop-demo/policies.sql"),
+    schema: include_str!("../../../../examples/deployment/schema.sql"),
+    roles: include_str!("../../../../examples/deployment/roles.sql"),
+    content: include_str!("../../../../examples/deployment/content.sql"),
+    policies: include_str!("../../../../examples/deployment/policies.sql"),
     published: &["orders", "order_lines", "photos"],
     writable: "orders,photos",
 };

@@ -31,7 +31,7 @@ A structured inventory of every component that must exist. This is not a depende
 | Client connector | Opens the connection, sends handshake, drives the read loop, and exposes a typed message channel to higher layers. |
 | Reconnect loop | Client-side: exponential back-off, re-sends subscriptions and pending mutations after reconnect. *(Reliability: see §10.)* |
 | Flow control | Per-session send-window to prevent the server from flooding a slow client. Server back-pressures CDC delivery when window is exhausted. |
-| Keepalive | Ping/pong at a configurable interval; server drops a session after N missed heartbeats. |
+| Keepalive | **Built.** After `SyncTuning::probe_after` (15 s) with no inbound frame the client sends `Ping`, and after `answer_within` (10 s) more with no inbound frame it drops the transport and recovers, the same bound covering a reconnect's handshake. The server closes a session with no inbound frame for `SessionConfig::idle_limit` (60 s). The native pump and the browser hub run the one rule on `ConnettoConnection`, also while the away gate is locked. |
 
 ---
 

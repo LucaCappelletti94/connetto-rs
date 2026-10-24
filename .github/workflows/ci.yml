@@ -44,30 +44,39 @@ jobs:
           - name: root native
             cwd: .
             target: ""
+            flags: --all-features
           - name: connetto-web wasm
             cwd: crates/connetto-web
             target: --target wasm32-unknown-unknown
+            flags: --all-features
           - name: wasm-smoke wasm
             cwd: examples/wasm-smoke
             target: --target wasm32-unknown-unknown
-          - name: dioxus-web-demo wasm
-            cwd: examples/dioxus-web-demo
+            flags: --all-features
+          - name: dioxus-demo wasm
+            cwd: examples/dioxus-demo
             target: --target wasm32-unknown-unknown
+            flags: --no-default-features --features web
           - name: yew-web-demo wasm
             cwd: examples/yew-web-demo
             target: --target wasm32-unknown-unknown
+            flags: --all-features
           - name: webauthn-unlock wasm
             cwd: examples/webauthn-unlock
             target: --target wasm32-unknown-unknown
-          - name: dioxus-desktop-demo native
-            cwd: examples/dioxus-desktop-demo
+            flags: --all-features
+          - name: dioxus-demo native
+            cwd: examples/dioxus-demo
             target: ""
+            flags: --all-features
           - name: tauri-leptos-demo native
             cwd: examples/tauri-leptos-demo
             target: ""
+            flags: --all-features
           - name: tauri-leptos-demo ui wasm
             cwd: examples/tauri-leptos-demo/ui
             target: --target wasm32-unknown-unknown
+            flags: --all-features
     steps:
       - uses: actions/checkout@v7
 
@@ -92,7 +101,7 @@ jobs:
       # The root legs pass --all-features, which turns on connetto-dioxus's
       # desktop feature and its webview stack, and Tauri links the same one.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
+        if: matrix.cwd == 'examples/dioxus-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
         uses: $/.github/actions/install-desktop-deps
 
       # Tauri's context macro needs the UI's output directory, which only the
@@ -113,7 +122,7 @@ jobs:
         run: |
           cargo +stable clippy \
             --all-targets \
-            --all-features \
+            ${{ matrix.flags }} \
             ${{ matrix.target }} \
             -- \
             -D warnings
@@ -125,7 +134,7 @@ jobs:
           RUSTDOCFLAGS="-D warnings" \
             cargo +stable doc \
               --no-deps \
-              --all-features \
+              ${{ matrix.flags }} \
               ${{ matrix.target }}
 
       - name: Save cargo downloads
@@ -181,22 +190,22 @@ jobs:
       - name: Run nightly clippy
         run: |
           failed=()
-          while read -r cwd target; do
-            echo "::group::nightly clippy ${cwd} ${target}"
-            if ! (cd "$cwd" && cargo +nightly clippy --all-targets --all-features ${target:+"$target"} -- -D warnings </dev/null); then
+          while read -r cwd args; do
+            echo "::group::nightly clippy ${cwd} ${args}"
+            if ! (cd "$cwd" && cargo +nightly clippy --all-targets $args -- -D warnings </dev/null); then
               failed+=("$cwd")
             fi
             echo "::endgroup::"
           done <<'EOF'
-          .
-          crates/connetto-web --target=wasm32-unknown-unknown
-          examples/wasm-smoke --target=wasm32-unknown-unknown
-          examples/dioxus-web-demo --target=wasm32-unknown-unknown
-          examples/yew-web-demo --target=wasm32-unknown-unknown
-          examples/webauthn-unlock --target=wasm32-unknown-unknown
-          examples/dioxus-desktop-demo
-          examples/tauri-leptos-demo
-          examples/tauri-leptos-demo/ui --target=wasm32-unknown-unknown
+          . --all-features
+          crates/connetto-web --all-features --target=wasm32-unknown-unknown
+          examples/wasm-smoke --all-features --target=wasm32-unknown-unknown
+          examples/dioxus-demo --no-default-features --features=web --target=wasm32-unknown-unknown
+          examples/yew-web-demo --all-features --target=wasm32-unknown-unknown
+          examples/webauthn-unlock --all-features --target=wasm32-unknown-unknown
+          examples/dioxus-demo --all-features
+          examples/tauri-leptos-demo --all-features
+          examples/tauri-leptos-demo/ui --all-features --target=wasm32-unknown-unknown
           EOF
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::nightly clippy failed in ${failed[*]}"
@@ -214,10 +223,10 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
   android:
-    # R88: the phone build of the desktop demo, built and linked without a
-    # device. Its own job because the matrix legs pass --all-features, which
+    # R88: the phone build of the demo, built and linked without a
+    # device. Its own job because the matrix legs pass their own flags, which
     # would switch the desktop renderer on for the phone.
-    name: Build dioxus-desktop-demo android
+    name: Build dioxus-demo android
     runs-on: *light-runner
     timeout-minutes: 30
     steps:
@@ -241,7 +250,7 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Build the demo for Android
-        working-directory: examples/dioxus-desktop-demo
+        working-directory: examples/dioxus-demo
         run: |
           ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -265,10 +274,10 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
   ios:
-    # R88: the phone build of the desktop demo for iOS, built without a
+    # R88: the phone build of the demo for iOS, built without a
     # device, for the same reason the Android leg is its own job. It links,
     # because only the link sees a C object built for another iOS version.
-    name: Build dioxus-desktop-demo ios
+    name: Build dioxus-demo ios
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -291,7 +300,7 @@ jobs:
           targets: aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Build the demo for iOS devices and the simulator
-        working-directory: examples/dioxus-desktop-demo
+        working-directory: examples/dioxus-demo
         run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
             cargo +stable build \

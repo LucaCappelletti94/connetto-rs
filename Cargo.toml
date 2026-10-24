@@ -21,7 +21,7 @@ members = [
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
 ]
-exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
+exclude = ["examples/dioxus-demo", "examples/webauthn-unlock"]
 
 [workspace.package]
 version = "0.0.0"

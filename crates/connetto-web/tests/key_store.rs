@@ -361,6 +361,39 @@ async fn read_enrolled_ids() -> Vec<String> {
 }
 
 // ────────────────────────── derived-rung tests ────────────────────────────
+#[wasm_bindgen_test]
+async fn a_boot_approval_keeps_the_browser_gate_open_until_it_locks() {
+    use connetto_client::away::GateMechanism as _;
+    use connetto_web::gate::BrowserGateMechanism;
+    use std::rc::Rc;
+
+    on_the_ungated_rung().await;
+    let store = Rc::new(IdbKeyStore::open().await.expect("open"));
+    let record = name("gate-approval");
+    let key = key_from_byte(0x32);
+    let hkdf = hkdf_key_from_bytes(&[0x41; 32]).await;
+    store
+        .adopt_derived(hkdf.clone(), TEST_CRED_ID)
+        .await
+        .expect("approve enrolment");
+    store.store(&record, &key).await.expect("store");
+    let mechanism = BrowserGateMechanism::new(Rc::clone(&store));
+
+    assert!(mechanism.is_open(), "boot already verified the user");
+    mechanism.lock();
+    assert!(!mechanism.is_open(), "a re-check drops the approval");
+    assert!(matches!(
+        store.load(&record).await,
+        Err(connetto_web::auth::AuthError::Locked { .. })
+    ));
+
+    store
+        .use_derived(hkdf, TEST_CRED_ID)
+        .await
+        .expect("approve unlock");
+    assert!(mechanism.is_open(), "unlock restores the approval");
+    assert_eq!(store.load(&record).await.expect("load"), Some(key));
+}
 
 #[wasm_bindgen_test]
 async fn after_adopt_derived_the_stored_kek_is_absent() {

@@ -42,6 +42,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -53,6 +54,7 @@ pub struct Order {
     pub id: rosetta_uuid::Uuid,
     pub owner_id: String,
     pub quantity: i64,
+    pub created_at: String,
 }
 
 /// Progress marker for diagnosing a harness timeout: the stages appear in the

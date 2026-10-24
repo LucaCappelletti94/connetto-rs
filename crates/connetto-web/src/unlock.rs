@@ -586,21 +586,10 @@ async fn create_credential() -> Result<Option<(Vec<u8>, web_sys::CryptoKey)>, Js
     // re-enrols, which is a stated property rather than a defect.
     let rp = web_sys::PublicKeyCredentialRpEntity::new(&origin_host());
 
-    // The user entity names the device, never a person, because this credential
-    // is one per device and unwraps every account's records: labelling it after
-    // whoever enrolled first would show one person's name standing for all of
-    // them, permanently, since WebAuthn has no rename and a second enrolment is
-    // refused. See the plan's R23 decision 10. Both strings are display only,
-    // and neither names connetto, which is a library an embedder's users should
-    // never be shown.
-    //
-    // user.id stays a fixed literal for the same reason: platform
-    // authenticators deduplicate by rp.id plus user.id, so a second sign-in does
-    // not mint a second passkey. The bytes spell connetto/gate/v1.
-    let user_id_bytes: [u8; 16] = [
-        0x63, 0x6f, 0x6e, 0x6e, 0x65, 0x74, 0x74, 0x6f, 0x2f, 0x67, 0x61, 0x74, 0x65, 0x2f, 0x76,
-        0x31,
-    ];
+    // Authenticators replace credentials sharing an RP and user handle.
+    let mut user_id_bytes = [0_u8; 32];
+    getrandom::fill(&mut user_id_bytes)
+        .map_err(|err| JsValue::from_str(&format!("credential user id: {err}")))?;
     let user_id_arr = Uint8Array::from(&user_id_bytes[..]);
     let user = web_sys::PublicKeyCredentialUserEntity::new_with_u8_array(
         "this device",

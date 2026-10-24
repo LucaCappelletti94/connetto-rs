@@ -1,4 +1,4 @@
-//! Deploys `examples/dioxus-desktop-demo`, or with `--app tauri`
+//! Deploys `examples/dioxus-demo`, or with `--app tauri`
 //! `examples/tauri-leptos-demo`, to an attached Android device or emulator
 //! and walks R88's proof on it, which is sign in, sync, write offline and
 //! upload on reconnect.
@@ -2190,7 +2190,7 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     if let Demo::Tauri = demo_app() {
         return build_tauri_apk(target).await;
     }
-    let demo = repo_path(&["examples", "dioxus-desktop-demo"])?;
+    let demo = repo_path(&["examples", "dioxus-demo"])?;
     let status = Command::new("dx")
         .args([
             "build",
@@ -2209,7 +2209,7 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
         bail!("dx build exited with {status}");
     }
     Ok(demo.join(
-        "target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk",
+        "target/dx/connetto-dioxus-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk",
     ))
 }
 

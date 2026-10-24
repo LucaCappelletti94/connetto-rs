@@ -359,6 +359,23 @@ async fn passkey_gate_enrol_use_and_lock() -> Result<()> {
         step1 == "step1:ok",
         "assertion 1: derived key opens a record it wrote (got {step1:?})",
     );
+    let sibling_port = free_port()?;
+    start_file_server(sibling_port).await?;
+    driver
+        .navigate(&format!("http://localhost:{sibling_port}/index.html"))
+        .await
+        .context("enrolling another origin on the same authenticator")?;
+    assert_eq!(
+        poll_result(&driver, Duration::from_secs(30)).await?,
+        "step1:ok",
+        "another origin can protect its own records"
+    );
+    driver.navigate(&page_url).await?;
+    assert_eq!(
+        poll_result(&driver, Duration::from_secs(90)).await?,
+        "step2:ok",
+        "another origin's enrolment must preserve the first origin's credential"
+    );
 
     // Restart the worker so step 2 runs a fresh boot with the enrolled profile.
     driver

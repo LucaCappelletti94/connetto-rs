@@ -99,7 +99,7 @@ The browser provides a native `WebSocket` API. In the WASM context:
 
 - The WASM client calls `web-sys::WebSocket` (or a JS interop shim).
 - The same `Transport` trait interface used by the native client is implemented for the browser context.
-- Reconnect and keepalive logic is the same. Only the underlying socket is different.
+- Reconnect and keepalive logic is the same. Only the underlying socket and the timer are different. The relay hub fires the worker connection's keepalive deadline beside its other wakes.
 
 **Gotcha**: browser WebSocket connections are subject to browser-imposed limits (e.g. max 6 concurrent connections per origin in some implementations). Leader election ensures a single dedicated `Worker` holds one connection across all tabs, avoiding this limit.
 

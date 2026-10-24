@@ -558,6 +558,8 @@ pub struct SessionConfig {
     write_retry_budget: Duration,
     /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
     first_frame_budget: Duration,
+    /// The silence after which an idle session is closed, reset by every inbound frame.
+    idle_limit: Duration,
     #[cfg(feature = "test-seams")]
     key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
@@ -570,6 +572,7 @@ impl Default for SessionConfig {
             resume_read_budget: Duration::from_secs(30),
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
+            idle_limit: Duration::from_secs(60),
             #[cfg(feature = "test-seams")]
             key_expiry_clock: None,
         }
@@ -618,6 +621,12 @@ impl SessionConfig {
         self
     }
 
+    /// Sets the silence after which an idle session is closed, reset by every inbound frame.
+    #[must_use]
+    pub const fn with_idle_limit(mut self, limit: Duration) -> Self {
+        self.idle_limit = limit;
+        self
+    }
     /// Uses the supplied time for share-key expiry scheduling and comparison.
     #[cfg(feature = "test-seams")]
     #[must_use]
@@ -648,8 +657,13 @@ impl SessionConfig {
     pub const fn first_frame_budget(&self) -> Duration {
         self.first_frame_budget
     }
-}
 
+    /// The silence after which an idle session is closed, reset by every inbound frame.
+    #[must_use]
+    pub const fn idle_limit(&self) -> Duration {
+        self.idle_limit
+    }
+}
 /// Backoff policy for reconnecting a dropped CDC stream.
 ///
 /// [`SessionManager::ingest_with_reconnect`] reconnects the source after the
@@ -4185,6 +4199,7 @@ where
         self.send_revocation_lists(&mut transport, &state).await;
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
+        let mut last_inbound = tokio::time::Instant::now();
         let ended: Result<(), SessionError> = loop {
             if state.closing {
                 break Ok(());
@@ -4206,21 +4221,10 @@ where
             // Moving either arm onto its own task breaks that silently.
             tokio::select! {
                 incoming = transport.recv() => {
-                    let handled = match incoming.map_err(transport_err) {
-                        Err(err) => Err(err),
-                        Ok(None) => break Ok(()),
-                        Ok(Some(IncomingFrame::Control(msg))) => {
-                            self.handle_control(&mut transport, msg, &mut state).await
-                        }
-                        Ok(Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch)))) => {
-                            self.handle_mutation(&mut transport, patch, &mut state).await
-                        }
-                        Ok(Some(IncomingFrame::Bulk(_))) => Err(SessionError::Protocol(
-                            "unexpected bulk frame from client".into(),
-                        )),
-                    };
-                    if let Err(err) = handled {
-                        break Err(err);
+                    match self.handle_incoming(&mut transport, incoming, &mut state).await {
+                        Ok(true) => last_inbound = tokio::time::Instant::now(),
+                        Ok(false) => break Ok(()),
+                        Err(err) => break Err(err),
                     }
                 }
                 outbound = outbound_rx.recv() => {
@@ -4232,6 +4236,8 @@ where
                     }
                 }
                 () = next_key_expiry(&state.key_expiry, &self.config) => self.expire_keys(&mut state).await,
+                // Only an inbound frame moves `last_inbound`, so this is the client's silence.
+                () = tokio::time::sleep_until(last_inbound + self.config.idle_limit()) => break Ok(()),
             }
         };
 
@@ -4256,6 +4262,28 @@ where
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
         ended
+    }
+
+    /// Handle one transport read, answering whether the session goes on.
+    async fn handle_incoming<T: Transport>(
+        &self,
+        transport: &mut T,
+        incoming: Result<Option<IncomingFrame>, T::Error>,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<bool, SessionError> {
+        match incoming.map_err(transport_err)? {
+            None => return Ok(false),
+            Some(IncomingFrame::Control(msg)) => self.handle_control(transport, msg, state).await?,
+            Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
+                self.handle_mutation(transport, patch, state).await?;
+            }
+            Some(IncomingFrame::Bulk(_)) => {
+                return Err(SessionError::Protocol(
+                    "unexpected bulk frame from client".into(),
+                ));
+            }
+        }
+        Ok(true)
     }
 
     /// Deliver one item the dispatch side produced for this session, answering

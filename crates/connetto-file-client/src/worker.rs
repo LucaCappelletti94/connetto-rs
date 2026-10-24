@@ -334,6 +334,19 @@ where
         db::pins(connection.conn()).map_err(ContentError::Replica)
     }
 
+    /// Every file id a pin covers, so a caller can tell which files this
+    /// device keeps.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the pins cannot be read.
+    pub fn pinned_files<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<HashSet<FileId>, ContentError> {
+        crate::retain::pinned_ids(connection.conn())
+    }
+
     /// Chunks one file into the encrypted store without touching the replica.
     ///
     /// The slow half of staging a file, so a hub can keep serving local work
@@ -395,6 +408,27 @@ where
                 |conn| row(conn, file_id),
             )
             .map(|((), outcome)| outcome)
+    }
+
+    /// Records a manifest fetched from the server, the bookkeeping half of a
+    /// fetch: no outbox entry, because the file is already the server's, and
+    /// no naming row, because the file was never authored here.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the manifest write fails.
+    pub fn record_fetched<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        manifest: &Manifest,
+    ) -> Result<(), ContentError> {
+        connection
+            .transact_with_bookkeeping(
+                |conn| db::put_manifest(conn, manifest),
+                |_| Ok::<(), diesel::result::Error>(()),
+            )
+            .map(|((), ())| ())
+            .map_err(ContentError::Replica)
     }
 
     /// The answer about this file's bytes this device can give on its own.
@@ -2486,6 +2520,17 @@ mod tests {
     }
 
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    diesel::table! {
+        /// The application's photo entries, as the fixture creates them.
+        photos (id) {
+            /// Entry identifier.
+            id -> diesel::sql_types::Integer,
+            /// BLAKE3 identity of the photo's bytes.
+            content_id -> diesel::sql_types::Binary,
+        }
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     fn staged_fixture() -> (
         tempfile::TempDir,
         super::ContentArchive<crate::store::FsStore>,
@@ -2625,6 +2670,65 @@ mod tests {
         match answer {
             Resolved::Local { bytes: served, .. } => assert_eq!(served, bytes),
             other => panic!("unsent content must resolve locally, got {other:?}"),
+        }
+        assert!(observed.is_empty(), "no round trip ran");
+    }
+
+    /// A fetched file answers from the store and is never sent back, because
+    /// the record the fetch writes has no outbox entry. The pin is what makes
+    /// the answer local at all.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_fetched_file_resolves_locally_and_queues_no_upload() {
+        use crate::db;
+        use crate::resolve::Resolved;
+        use connetto_file_core::MimeClass;
+        use diesel::{ExpressionMethods, RunQueryDsl};
+
+        let (_dir, archive, mut connection) = staged_fixture();
+        let bytes = vec![6u8; 1024];
+        let manifest = archive
+            .chunk_file(&bytes[..], MimeClass::Jpeg)
+            .await
+            .expect("the bytes chunk");
+        let id = manifest.file_id();
+        diesel::insert_into(photos::table)
+            .values((
+                photos::id.eq(1),
+                photos::content_id.eq(id.as_bytes().to_vec()),
+            ))
+            .execute(connection.conn())
+            .expect("the naming row lands");
+        archive
+            .pin_content(
+                &mut connection,
+                "album",
+                "SELECT content_id FROM photos",
+                "content_id",
+            )
+            .expect("the pin lands");
+
+        archive
+            .record_fetched(&mut connection, &manifest)
+            .expect("the fetched record lands");
+
+        assert!(
+            db::outbox(connection.conn())
+                .expect("the outbox reads")
+                .is_empty(),
+            "the file is the server's, so it is not queued back"
+        );
+        assert!(
+            !db::is_unsent(connection.conn(), id).expect("the unsent read"),
+            "a fetched file queues no upload of any kind"
+        );
+
+        let (answer, observed) = archive
+            .resolve_connection(&mut connection, id, core::future::pending::<()>())
+            .await;
+        match answer {
+            Resolved::Local { bytes: served, .. } => assert_eq!(served, bytes),
+            other => panic!("a fetched pinned file must resolve locally, got {other:?}"),
         }
         assert!(observed.is_empty(), "no round trip ran");
     }

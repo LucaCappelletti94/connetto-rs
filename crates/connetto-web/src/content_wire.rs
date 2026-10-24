@@ -65,6 +65,63 @@ pub enum ContentFrame {
         /// The answer.
         answer: WirePins,
     },
+    /// The tab asks for every refused upload, with its refusal detail.
+    RefusedContent {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+    },
+    /// The tab clears the refusal mark on one outbox entry so the next walk
+    /// attempts it.
+    RetryRefused {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+        /// The entry whose refusal mark is cleared.
+        file_id: [u8; 32],
+    },
+    /// The tab asks for every retired file.
+    RetiredContent {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+    },
+    /// The tab drops the retired losses it has dealt with.
+    ForgetRetiredContent {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+        /// The losses to drop.
+        file_ids: Vec<[u8; 32]>,
+    },
+    /// The hub's answer to a queue frame.
+    QueueReply {
+        /// The `request_id` being answered.
+        request_id: u64,
+        /// The answer.
+        answer: WireQueue,
+    },
+    /// The tab asks the worker to fetch every pinned file whose bytes are
+    /// missing locally.
+    FetchPinned {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+    },
+    /// The hub's answer to a [`ContentFrame::FetchPinned`].
+    FetchPinnedReply {
+        /// The `request_id` being answered.
+        request_id: u64,
+        /// The answer.
+        answer: WireFetch,
+    },
+    /// The tab asks the worker to free the local bytes no pin keeps.
+    Tidy {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+    },
+    /// The hub's answer to a [`ContentFrame::Tidy`].
+    TidyReply {
+        /// The `request_id` being answered.
+        request_id: u64,
+        /// The answer.
+        answer: WireFetch,
+    },
 }
 
 /// A pin answer in its wire shape.
@@ -74,6 +131,31 @@ pub enum WirePins {
     Done,
     /// Every pin, as name, query and file-id column, in name order.
     Pins(Vec<(String, String, String)>),
+    /// The hub refused, with the reason.
+    Refused(String),
+}
+
+/// A queue answer in its wire shape.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireQueue {
+    /// The retry or forget was recorded.
+    Done,
+    /// Every refused entry, as identity and refusal detail.
+    Refusals(Vec<([u8; 32], String)>),
+    /// Every retired file identity.
+    Retired(Vec<[u8; 32]>),
+    /// The hub refused, with the reason.
+    Refused(String),
+}
+
+/// A fetch or tidy answer in its wire shape.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireFetch {
+    /// The pinned files whose bytes the fetch restored, in no particular
+    /// order.
+    Arrived(Vec<[u8; 32]>),
+    /// The records a tidy released from local retention.
+    Tidied(usize),
     /// The hub refused, with the reason.
     Refused(String),
 }
