@@ -6,13 +6,15 @@
 //! Native and offline. A loopback pair stands in for each server, so each
 //! test scripts exactly what that server answers and reads what it was sent.
 
+use core::time::Duration;
+
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoConnection, DataDir, MemoryRefreshStore, SyncSchema,
+    ClientBuilder, ClientEvent, ConnettoConnection, DataDir, Grant, MemoryRefreshStore, SyncSchema,
 };
 use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
-    MutationApplied, MutationReject, MutationRejectReason, Provenance, RateLimited, WriterGrant,
-    WriterRef, WriterRequest,
+    MutationApplied, MutationReject, MutationRejectReason, Provenance, RateLimited,
+    ShareKeysReplaced, WriterGrant, WriterRef, WriterRequest,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -707,4 +709,112 @@ async fn a_dropped_drain_wire_reports_its_held_work_as_wire_lost() {
         "the held write is still owed after the drain wire dropped"
     );
     assert_eq!(conn.unsynced().len(), 1);
+}
+
+async fn held_writer_after_key_expiry(
+    dir: &TempDir,
+    frontier: u64,
+) -> (ConnettoConnection<LoopbackTransport>, LoopbackTransport) {
+    let (mut conn, old_version) = held_under_number(dir).await;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the wall clock")
+        .as_secs()
+        + 5;
+    let grant: Grant =
+        super::share_key_protocol::mint(Some(i64::try_from(expires).expect("expiry fits")));
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&grant, &subject)
+        .await
+        .expect("hold an expiring key");
+    let wait = conn.share_key_timer().expect("the key expires").wait() + Duration::from_millis(20);
+    let (transport, mut old) = loopback();
+    let timer = conn.drain_timer().expect("the held writer owes a dial");
+    let answer = async {
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), old.recv())
+                .await
+                .expect("receive within the bound")
+                .expect("receive"),
+            Some(IncomingFrame::Control(ControlMessage::Handshake(_))),
+        ));
+        tokio::time::sleep(wait).await;
+        old.send_control(ControlMessage::HandshakeAck(HandshakeAck {
+            connection_id: "expired-held-writer".to_owned(),
+            session_token: "expired-held-writer".to_owned(),
+            resume_token: "expired-held-writer".to_owned(),
+            current_cursor: Cursor::new(Vec::new()),
+            schema_version: Some(old_version),
+            initial_credits: 64,
+            writer: Some(WriterGrant {
+                number: NUMBER,
+                frontier,
+            }),
+        }))
+        .await
+        .expect("accept the held writer after key expiry");
+    };
+    let (attached, ()) = tokio::join!(conn.attach_drain(timer, transport), answer);
+    attached.expect("attach the held writer");
+    (conn, old)
+}
+
+#[tokio::test]
+async fn a_key_expiring_during_the_drain_handshake_holds_its_write_until_replacement() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, mut old) = held_writer_after_key_expiry(&dir, 0).await;
+    assert!(!conn.unsynced().is_empty());
+    conn.pump_one_or(async {})
+        .await
+        .expect("replace the expired key");
+    let frame = tokio::time::timeout(Duration::from_secs(5), old.recv())
+        .await
+        .expect("the replacement arrives within its bound")
+        .expect("receive the replacement");
+    let Some(IncomingFrame::Control(ControlMessage::ReplaceShareKeys(request))) = frame else {
+        panic!("the held write must wait for replacement authority");
+    };
+    old.send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+        request_id: request.request_id,
+    }))
+    .await
+    .expect("acknowledge the correlated replacement");
+    conn.pump_one_or(tokio::time::sleep(Duration::from_secs(5)))
+        .await
+        .expect("accept replacement authority");
+    let frame = tokio::time::timeout(Duration::from_secs(5), old.recv())
+        .await
+        .expect("the held write arrives within its bound")
+        .expect("receive the held write");
+    let Some(IncomingFrame::Control(ControlMessage::MutationHeader(header))) = frame else {
+        panic!("the accepted drain must release its held write");
+    };
+    old.send_control(ControlMessage::MutationApplied(MutationApplied {
+        client_seq: header.client_seq,
+    }))
+    .await
+    .expect("settle the released held write");
+    let events = pump_until(&mut conn, drained).await;
+    assert!(conn.unsynced().is_empty());
+    assert!(events.contains(&ClientEvent::Held(HeldWork::Applied {
+        major: one(),
+        write: HeldWrite {
+            writer: WriterRef::Number(NUMBER),
+            seq: 1
+        },
+    })));
+}
+
+#[tokio::test]
+async fn an_expired_key_does_not_hold_a_batch_its_handshake_frontier_settled() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, _old) = held_writer_after_key_expiry(&dir, 1).await;
+    assert!(conn.unsynced().is_empty());
+    assert_eq!(conn.draining_major(), None);
+    let events = pump_until(&mut conn, drained).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| { matches!(event, ClientEvent::Held(HeldWork::WireLost { .. })) })
+    );
 }

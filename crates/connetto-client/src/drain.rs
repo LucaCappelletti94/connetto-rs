@@ -24,7 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, FatalErrorReason, HeldWork, HeldWrite,
-    MutationRejectReason, Provenance, WriterAnswer, WriterOutcome, WriterRef, WriterRequest,
+    MutationRejectReason, Provenance, ReplaceShareKeys, WriterAnswer, WriterOutcome, WriterRef,
+    WriterRequest,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Backoff, Major, RetryPolicy, SchemaVersion};
@@ -32,12 +33,13 @@ use core::time::Duration;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 
+use crate::away::Clock as _;
 use crate::majors::held_batch;
 use crate::{
     ClientError, ClientEvent, ConnettoConnection, EntryRecord, HandshakeInput, HandshakeOk,
-    SuspendedCapture, WriterQueue, clock, delete_pending, delete_writer_pending,
-    exchange_handshake, is_real_writer, persist_pending, persist_retire, persist_writer_state,
-    unissued,
+    SHARE_KEY_REQUEST_WAIT, ShareKeyRequest, SuspendedCapture, WriterQueue, clock, delete_pending,
+    delete_writer_pending, exchange_handshake, is_real_writer, live_share_grants, persist_pending,
+    persist_retire, persist_writer_state, share_key_request_id, unissued,
 };
 
 /// How a drain dial backs off, the reconnect loop's own shape: 200 ms first,
@@ -75,10 +77,18 @@ struct DrainBind {
     deadline: Duration,
 }
 
+enum DrainAuthorization {
+    NoWire,
+    Current(u64),
+    Replacing(ShareKeyRequest),
+    Deferred(Duration),
+}
+
 /// The drain's state beside the connection's own wire.
 pub(crate) struct Drain<T> {
     batch: Option<HeldBatch>,
     wire: Option<T>,
+    authorization: DrainAuthorization,
     /// The writer the drain wire writes as, once the old major bound it.
     writer: Option<WriterRef>,
     /// The sequences sent on the drain wire and not yet answered.
@@ -102,6 +112,7 @@ impl<T> Drain<T> {
         Self {
             batch: None,
             wire: None,
+            authorization: DrainAuthorization::NoWire,
             writer: None,
             in_flight: BTreeSet::new(),
             #[cfg(feature = "device-identity")]
@@ -117,6 +128,13 @@ impl<T> Drain<T> {
     /// The live drain wire, if any.
     pub(crate) fn wire_mut(&mut self) -> Option<&mut T> {
         self.wire.as_mut()
+    }
+    pub(crate) fn authorization_deadline(&self) -> Option<Duration> {
+        match &self.authorization {
+            DrainAuthorization::Replacing(request) => Some(request.deadline),
+            DrainAuthorization::Deferred(at) => Some(*at),
+            DrainAuthorization::NoWire | DrainAuthorization::Current(_) => None,
+        }
     }
 
     /// Owe a dial after `wait`.
@@ -139,6 +157,7 @@ impl<T> Drain<T> {
 
     /// Forget what the drain wire was bound to and had in flight.
     fn unbind(&mut self) {
+        self.authorization = DrainAuthorization::NoWire;
         self.writer = None;
         self.in_flight.clear();
         #[cfg(feature = "device-identity")]
@@ -383,6 +402,7 @@ where
                 self.drain.dial = timer.armed;
                 self.drain.wire = Some(transport);
                 self.drain.unbind();
+                self.drain.authorization = DrainAuthorization::Current(self.share_key_generation);
                 self.drain_bound(major, writer, request, ack).await
             }
             Err(
@@ -465,7 +485,6 @@ where
     /// wait.
     #[cfg(feature = "device-identity")]
     async fn drain_bind(&mut self, key_id: [u8; 32], ack: &HandshakeOk) -> Result<(), ClientError> {
-        use crate::away::Clock as _;
         let (Some(challenge), Some(keys)) = (ack.challenge, self.writer_keys.clone()) else {
             self.drop_drain_wire().await;
             return Ok(());
@@ -521,12 +540,10 @@ where
         Ok(())
     }
 
-    /// Drop the drain wire when its device bind overran the answer bound, so
-    /// the next dial binds again.
+    /// Recover a drain whose device or share-key answer exceeded its deadline.
     pub(crate) async fn check_drain_deadline(&mut self) {
         #[cfg(feature = "device-identity")]
         {
-            use crate::away::Clock as _;
             if self
                 .drain
                 .bind
@@ -539,6 +556,60 @@ where
                 self.drop_drain_wire().await;
             }
         }
+        if matches!(
+            &self.drain.authorization,
+            DrainAuthorization::Replacing(request)
+                if crate::away::SystemClock.monotonic() >= request.deadline
+        ) {
+            tracing::warn!("the drain's share-key answer overran its bound");
+            self.drop_drain_wire().await;
+        }
+    }
+
+    fn drain_authorized(&self) -> bool {
+        matches!(
+            self.drain.authorization,
+            DrainAuthorization::Current(generation) if generation == self.share_key_generation
+        ) && self.share_key_expiry.is_none_or(|expiry| {
+            u64::try_from(expiry)
+                .is_ok_and(|expiry| crate::away::SystemClock.wall().as_secs() < expiry)
+        })
+    }
+
+    pub(crate) async fn step_drain_share_keys(&mut self) -> Result<(), ClientError> {
+        let owed = match self.drain.authorization {
+            DrainAuthorization::Current(generation) => generation != self.share_key_generation,
+            DrainAuthorization::Deferred(at) => crate::away::SystemClock.monotonic() >= at,
+            DrainAuthorization::NoWire | DrainAuthorization::Replacing(_) => false,
+        };
+        if !owed {
+            return Ok(());
+        }
+        let now = clock::now_secs(&mut self.db)?;
+        let keys = live_share_grants(&self.config, now).cloned().collect();
+        let request_id = share_key_request_id();
+        let deadline = crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT;
+        let Some(wire) = self.drain.wire.as_mut() else {
+            self.drain.authorization = DrainAuthorization::NoWire;
+            return Ok(());
+        };
+        if let Err(error) = wire
+            .send_control(ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
+                request_id: request_id.clone(),
+                keys,
+            }))
+            .await
+        {
+            tracing::warn!(error = %error, "the drain wire failed while replacing share keys");
+            self.drop_drain_wire().await;
+            return Ok(());
+        }
+        self.drain.authorization = DrainAuthorization::Replacing(ShareKeyRequest {
+            request_id,
+            generation: self.share_key_generation,
+            deadline,
+        });
+        Ok(())
     }
 
     /// Settle what the old major reports at or below `frontier` for the bound
@@ -583,6 +654,13 @@ where
     /// sequence order, stopping at the first entry another major captured or
     /// an earlier entry of another major holds back.
     async fn send_held(&mut self, major: Major) -> Result<(), ClientError> {
+        if !self.drain_authorized() {
+            return self.finish_batch().await;
+        }
+        #[cfg(feature = "device-identity")]
+        if self.drain.bind.is_some() {
+            return Ok(());
+        }
         let Some(writer) = self.drain.writer else {
             return self.after_drain_settle(major).await;
         };
@@ -730,7 +808,6 @@ where
     /// Record that `writer` is owed a retirement and send it now when the
     /// connection's own wire is up.
     async fn owe_retire(&mut self, writer: WriterRef) -> Result<(), ClientError> {
-        use crate::away::Clock as _;
         {
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             persist_retire(&mut self.db, &writer)?;
@@ -901,6 +978,21 @@ where
             Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
                 return self.drain_fatal(major, fatal.reason).await;
             }
+            Some(IncomingFrame::Control(ControlMessage::ShareKeysReplaced(answer))) => {
+                let DrainAuthorization::Replacing(request) = &self.drain.authorization else {
+                    return Err(ClientError::Protocol(
+                        "a share-key answer arrived with nothing in flight".to_owned(),
+                    ));
+                };
+                if request.request_id != answer.request_id {
+                    return Err(ClientError::Protocol(
+                        "the share-key answer names a foreign request".to_owned(),
+                    ));
+                }
+                self.drain.authorization = DrainAuthorization::Current(request.generation);
+                self.step_drain_share_keys().await?;
+                return self.send_held(major).await;
+            }
             // The content layer's held-file tickets, answered on this wire.
             Some(IncomingFrame::Control(ControlMessage::ContentTicketGrant(grant))) => {
                 self.notices.push_back(ClientEvent::ContentTicket {
@@ -917,6 +1009,21 @@ where
                 return Ok(());
             }
             Some(IncomingFrame::Control(ControlMessage::RateLimited(limited))) => {
+                if matches!(
+                    &self.drain.authorization,
+                    DrainAuthorization::Replacing(request)
+                        if limited.related_to.as_deref() == Some(request.request_id.as_str())
+                ) {
+                    self.drain.authorization = DrainAuthorization::Deferred(
+                        crate::away::SystemClock.monotonic()
+                            + Duration::from_millis(limited.retry_after_ms),
+                    );
+                    self.notices.push_back(ClientEvent::RateLimited {
+                        related_to: limited.related_to,
+                        retry_after_ms: limited.retry_after_ms,
+                    });
+                    return Ok(());
+                }
                 // A held write we sent on this wire and have not settled yet
                 // could never come back on the main wire, so the wire is
                 // dropped and the redial sends it again.
@@ -1029,14 +1136,19 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::NotConnected`] when no drain wire is up, and
-    /// [`ClientError::Transport`] when the request cannot be sent.
+    /// [`ClientError::NotConnected`] without a drain wire, [`ClientError::ShareKeysPending`] while its authority is pending, or [`ClientError::Transport`] when sending fails.
     pub async fn request_held_ticket(
         &mut self,
         request_id: String,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> Result<(), ClientError> {
+        if self.drain.wire.is_none() {
+            return Err(ClientError::NotConnected);
+        }
+        if !self.drain_authorized() {
+            return Err(ClientError::ShareKeysPending);
+        }
         let wire = self.drain.wire.as_mut().ok_or(ClientError::NotConnected)?;
         wire.send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
             request_id,
@@ -1047,12 +1159,12 @@ where
         .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
-    /// Whether the drain wire is up and its major's writes settled, so held
-    /// files may ask for tickets on it.
+    /// The authorized drain major whose writes have settled and whose files may request tickets.
     #[must_use]
     pub fn held_files_ready(&self) -> Option<Major> {
         let batch = self.drain.batch.as_ref()?;
-        (self.drain.wire.is_some() && !self.holds_major(batch.major)).then_some(batch.major)
+        (self.drain.wire.is_some() && self.drain_authorized() && !self.holds_major(batch.major))
+            .then_some(batch.major)
     }
 
     /// Whether the draining major still holds files, whatever the wire state

@@ -2378,8 +2378,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Transport`] when no drain wire is up or the request
-    /// cannot be sent.
+    /// [`ClientError::NotConnected`] without a drain wire, [`ClientError::ShareKeysPending`] while its authority is pending, or [`ClientError::Transport`] when sending fails.
     pub async fn request_held_ticket(
         &self,
         request_id: String,

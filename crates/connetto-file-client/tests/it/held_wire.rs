@@ -6,12 +6,16 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Gate, Grant, HeldCredential,
-    MemoryRefreshStore, SyncSchema,
+    ClientBuilder, ClientError, ClientEvent, ConnettoClient, ConnettoConnection, Gate, Grant,
+    HeldCredential, MemoryRefreshStore, SyncSchema,
 };
-use connetto_core::messages::{ContentTicketGrant, ControlMessage, HandshakeAck, HeldWork};
+use connetto_core::messages::{
+    ContentTicketGrant, ContentVerb, ControlMessage, HandshakeAck, HeldWork, RateLimited,
+    ReplaceShareKeys, ShareKeysReplaced,
+};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, MAJOR_DIRECTIVE, Major, SchemaVersion, loopback};
@@ -441,4 +445,420 @@ async fn an_interrupted_held_ticket_its_answer_settles_the_next_walk() {
     );
     let _ = kill1_tx;
     finish_upload(&archive, &mut conn, &upload).await;
+}
+
+async fn control(server: &mut LoopbackTransport) -> ControlMessage {
+    match tokio::time::timeout(Duration::from_secs(5), server.recv())
+        .await
+        .expect("the correlated request arrives within its bound")
+        .expect("receive the request")
+    {
+        Some(IncomingFrame::Control(message)) => message,
+        _ => panic!("expected a control request"),
+    }
+}
+
+async fn attach_held(conn: &mut ConnettoConnection<LoopbackTransport>) -> LoopbackTransport {
+    let (transport, mut server) = loopback();
+    let timer = conn.drain_timer().expect("the held batch owes a dial");
+    let answer = async {
+        assert!(matches!(
+            control(&mut server).await,
+            ControlMessage::Handshake(_)
+        ));
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "held-key-fence".to_owned(),
+                session_token: "held-key-fence".to_owned(),
+                resume_token: "held-key-fence".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(schema(1).version()),
+                initial_credits: 64,
+                writer: None,
+            }))
+            .await
+            .expect("acknowledge the held handshake");
+    };
+    let (attached, ()) = tokio::join!(conn.attach_drain(timer, transport), answer);
+    attached.expect("attach the held drain");
+    server
+}
+
+async fn replacement(server: &mut LoopbackTransport) -> ReplaceShareKeys {
+    match control(server).await {
+        ControlMessage::ReplaceShareKeys(request) => request,
+        _ => panic!("expected the held share-key replacement"),
+    }
+}
+
+async fn accept_keys(
+    conn: &mut ConnettoConnection<LoopbackTransport>,
+    server: &mut LoopbackTransport,
+    request_id: String,
+) {
+    server
+        .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+            request_id,
+        }))
+        .await
+        .expect("answer the correlated replacement");
+    conn.pump_one_or(tokio::time::sleep(Duration::from_secs(5)))
+        .await
+        .expect("process the replacement answer");
+}
+
+async fn upload_authorized_file(
+    dir: &TempDir,
+    conn: &mut ConnettoConnection<LoopbackTransport>,
+    server: &mut LoopbackTransport,
+) {
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let mut state = ContentFlushState::default();
+    let answer = async {
+        let ControlMessage::ContentTicketRequest(request) = control(server).await else {
+            panic!("expected the held file's ticket request");
+        };
+        server
+            .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+                request_id: request.request_id,
+                url: GRANT_URL.to_owned(),
+            }))
+            .await
+            .expect("grant the correlated file ticket");
+    };
+    let ((start, _), ()) = tokio::join!(
+        begin(
+            &archive,
+            conn,
+            &mut state,
+            tokio::time::sleep(Duration::from_secs(5))
+        ),
+        answer,
+    );
+    let ContentFlushStart::Upload(upload) = start.expect("the authorized file gets a ticket")
+    else {
+        panic!("the authorized file must upload");
+    };
+    assert_eq!(
+        finish_upload(&archive, conn, &upload).await,
+        ContentFlush::Progressed
+    );
+    assert!(!conn.held_files_pending().expect("read the held files"));
+    assert_eq!(conn.draining_major(), None);
+}
+
+#[tokio::test]
+async fn a_key_change_holds_tickets_until_the_drain_accepts_its_current_keys() {
+    let (dir, file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&Grant::new("grant-a"), &subject)
+        .await
+        .expect("add the initial share key");
+    let mut server = attach_held(&mut conn).await;
+    let dial = conn.drain_dial_generation();
+    assert_eq!(conn.held_files_ready(), Some(one()));
+    conn.remove_share_key(&subject)
+        .await
+        .expect("remove the initial share key");
+    assert_eq!(conn.held_files_ready(), None);
+    assert!(matches!(
+        conn.request_held_ticket(
+            "blocked-ticket".to_owned(),
+            *file_id.as_bytes(),
+            ContentVerb::Write { declared_len: 4 }
+        )
+        .await,
+        Err(ClientError::ShareKeysPending),
+    ));
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let mut state = ContentFlushState::default();
+    let (start, _) = begin(&archive, &mut conn, &mut state, async {}).await;
+    assert!(matches!(
+        start,
+        Ok(ContentFlushStart::Complete(ContentFlush::Deferred))
+    ));
+    assert!(!state.is_waiting());
+    assert!(
+        conn.held_files_pending()
+            .expect("the deferred file remains held")
+    );
+    conn.pump_one_or(async {})
+        .await
+        .expect("send the replacement");
+    let first = replacement(&mut server).await;
+    conn.add_share_key(&Grant::new("grant-b"), &subject)
+        .await
+        .expect("advance the desired key generation");
+    server
+        .send_control(ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+            request_id: "foreign-key-request".to_owned(),
+        }))
+        .await
+        .expect("send an unrelated answer");
+    assert!(matches!(
+        conn.pump_one_or(tokio::time::sleep(Duration::from_secs(5)))
+            .await,
+        Err(ClientError::Protocol(_)),
+    ));
+    assert_eq!(conn.held_files_ready(), None);
+    accept_keys(&mut conn, &mut server, first.request_id).await;
+    assert_eq!(conn.held_files_ready(), None);
+    let latest = replacement(&mut server).await;
+    assert!(matches!(
+        conn.request_held_ticket(
+            "still-blocked".to_owned(),
+            *file_id.as_bytes(),
+            ContentVerb::Write { declared_len: 4 }
+        )
+        .await,
+        Err(ClientError::ShareKeysPending),
+    ));
+    accept_keys(&mut conn, &mut server, latest.request_id).await;
+    assert_eq!(conn.held_files_ready(), Some(one()));
+    assert_eq!(conn.drain_dial_generation(), dial);
+    assert_eq!(conn.drain_timer(), None);
+    upload_authorized_file(&dir, &mut conn, &mut server).await;
+}
+
+#[tokio::test]
+async fn a_throttled_drain_replacement_waits_for_its_floor_and_uses_the_latest_keys() {
+    let (dir, _) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let mut server = attach_held(&mut conn).await;
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&Grant::new("grant-a"), &subject)
+        .await
+        .expect("add a key");
+    conn.pump_one_or(async {})
+        .await
+        .expect("send the replacement");
+    let first = replacement(&mut server).await;
+    server
+        .send_control(ControlMessage::RateLimited(RateLimited {
+            related_to: Some(first.request_id),
+            retry_after_ms: 30_000,
+        }))
+        .await
+        .expect("defer the correlated replacement");
+    conn.pump_one_or(tokio::time::sleep(Duration::from_secs(5)))
+        .await
+        .expect("process the retry floor");
+    conn.remove_share_key(&subject)
+        .await
+        .expect("remove the deferred key");
+    conn.pump_one_or(async {})
+        .await
+        .expect("honor the retry floor");
+    assert_eq!(conn.held_files_ready(), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), server.recv())
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(
+        conn.share_key_timer()
+            .expect("the retry floor wakes the pump")
+            .wait(),
+    )
+    .await;
+    conn.pump_one_or(async {})
+        .await
+        .expect("retry the latest set");
+    let latest = replacement(&mut server).await;
+    assert!(latest.keys.is_empty());
+    accept_keys(&mut conn, &mut server, latest.request_id).await;
+    assert_eq!(conn.held_files_ready(), Some(one()));
+    assert_eq!(conn.drain_timer(), None);
+    upload_authorized_file(&dir, &mut conn, &mut server).await;
+}
+
+#[tokio::test]
+async fn an_unanswered_drain_replacement_recovers_without_losing_its_file() {
+    let (dir, file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let mut server = attach_held(&mut conn).await;
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&Grant::new("grant-a"), &subject)
+        .await
+        .expect("add a key");
+    conn.pump_one_or(async {})
+        .await
+        .expect("send the replacement");
+    let _unanswered = replacement(&mut server).await;
+    tokio::time::sleep(
+        conn.share_key_timer()
+            .expect("the answer has a deadline")
+            .wait(),
+    )
+    .await;
+    let event = conn
+        .pump_one_or(async {})
+        .await
+        .expect("expire the unanswered request");
+    assert!(
+        matches!(event, Some(ClientEvent::Held(HeldWork::WireLost { major })) if major == one())
+    );
+    assert!(conn.held_files_pending().expect("keep the held file"));
+    assert!(matches!(
+        conn.request_held_ticket(
+            "disconnected-ticket".to_owned(),
+            *file_id.as_bytes(),
+            ContentVerb::Write { declared_len: 4 }
+        )
+        .await,
+        Err(ClientError::NotConnected),
+    ));
+    let mut recovered = attach_held(&mut conn).await;
+    assert_eq!(conn.held_files_ready(), Some(one()));
+    upload_authorized_file(&dir, &mut conn, &mut recovered).await;
+}
+
+fn expiring_grant(expires: u64) -> Grant {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let payload = format!(r#"{{"exp":{expires}}}"#);
+    let body: String = payload
+        .as_bytes()
+        .chunks(3)
+        .flat_map(|chunk| {
+            let word = (u32::from(chunk[0]) << 16)
+                | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+                | u32::from(chunk.get(2).copied().unwrap_or(0));
+            (0..(chunk.len() * 8).div_ceil(6))
+                .map(move |index| char::from(ALPHABET[((word >> (18 - index * 6)) & 63) as usize]))
+        })
+        .collect();
+    Grant::new(format!("h.{body}.s"))
+}
+
+#[tokio::test]
+async fn a_held_file_waits_for_the_drain_to_remove_an_expired_key() {
+    let (dir, file_id) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the wall clock")
+        .as_secs()
+        + 5;
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&expiring_grant(expires), &subject)
+        .await
+        .expect("hold an expiring key");
+    let mut server = attach_held(&mut conn).await;
+    assert_eq!(conn.held_files_ready(), Some(one()));
+    tokio::time::sleep(
+        conn.share_key_timer()
+            .expect("the key has an expiry")
+            .wait()
+            + Duration::from_millis(20),
+    )
+    .await;
+    assert_eq!(conn.held_files_ready(), None);
+    assert!(matches!(
+        conn.request_held_ticket(
+            "expired-ticket".to_owned(),
+            *file_id.as_bytes(),
+            ContentVerb::Write { declared_len: 4 }
+        )
+        .await,
+        Err(ClientError::ShareKeysPending),
+    ));
+    conn.pump_one_or(async {})
+        .await
+        .expect("replace the expired key");
+    let latest = replacement(&mut server).await;
+    assert!(latest.keys.is_empty());
+    accept_keys(&mut conn, &mut server, latest.request_id).await;
+    assert_eq!(conn.drain_timer(), None);
+    upload_authorized_file(&dir, &mut conn, &mut server).await;
+}
+
+#[tokio::test]
+async fn a_held_ticket_already_sent_finishes_while_share_keys_are_pending() {
+    let (dir, _) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let mut server = attach_held(&mut conn).await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    let mut state = ContentFlushState::default();
+    let (start, _) = begin(&archive, &mut conn, &mut state, async {}).await;
+    assert!(matches!(
+        start,
+        Ok(ContentFlushStart::Complete(ContentFlush::Interrupted))
+    ));
+    let ControlMessage::ContentTicketRequest(ticket) = control(&mut server).await else {
+        panic!("expected the earlier held ticket request");
+    };
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&Grant::new("grant-a"), &subject)
+        .await
+        .expect("add a key");
+    conn.pump_one_or(async {})
+        .await
+        .expect("send the replacement");
+    let _pending = replacement(&mut server).await;
+    server
+        .send_control(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+            request_id: ticket.request_id,
+            url: GRANT_URL.to_owned(),
+        }))
+        .await
+        .expect("answer the earlier ticket");
+    let (start, _) = begin(
+        &archive,
+        &mut conn,
+        &mut state,
+        tokio::time::sleep(Duration::from_secs(5)),
+    )
+    .await;
+    let ContentFlushStart::Upload(upload) = start.expect("the earlier ticket settles") else {
+        panic!("the granted earlier ticket must upload");
+    };
+    assert_eq!(conn.held_files_ready(), None);
+    assert!(!state.is_waiting());
+    assert_eq!(
+        finish_upload(&archive, &mut conn, &upload).await,
+        ContentFlush::Progressed
+    );
+    assert!(!conn.held_files_pending().expect("the granted file settled"));
+}
+
+#[tokio::test]
+async fn the_native_pump_bounds_a_held_key_replacement_without_another_wake() {
+    let (dir, _) = held_file_offline().await;
+    let mut conn = reopen_held(&dir).await;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the wall clock")
+        .as_secs()
+        + 3;
+    let subject = connetto_core::auth::CapabilitySubject::<String>::new("key:a");
+    conn.add_share_key(&expiring_grant(expires), &subject)
+        .await
+        .expect("hold an expiring key");
+    let mut server = attach_held(&mut conn).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    let pump = tokio::spawn(pump);
+    let pending = replacement(&mut server).await;
+    let closed = matches!(
+        tokio::time::timeout(Duration::from_secs(35), server.recv()).await,
+        Ok(Ok(None)),
+    );
+    assert!(
+        client
+            .held_files_pending()
+            .await
+            .expect("keep the held file")
+    );
+    tokio::time::timeout(Duration::from_secs(5), client.close())
+        .await
+        .expect("close the retained client");
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("the pump finishes")
+        .expect("the pump does not panic");
+    assert!(
+        closed,
+        "the native pump must bound held replacement {} without an external wake",
+        pending.request_id,
+    );
 }
