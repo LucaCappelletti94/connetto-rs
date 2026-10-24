@@ -23,8 +23,10 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 async fn a_second_viewer_cannot_resolve_another_users_photo() {
     harness::relay_worker_breadcrumbs();
     common::play_the_tab();
-    let worker = photo::spawn_photo_worker(&harness::glue_url());
-    await_db_worker_ready(&[]).await.expect("db worker ready");
+    let (worker, boot) = photo::spawn_photo_worker(&harness::glue_url());
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
     harness::stage("db worker booted");
 
     let (_, identity) = common::mint_session().await;

@@ -323,7 +323,7 @@ async fn await_db_worker_ready_ignores_a_failure_with_foreign_identity() {
         crate::workers::sleep(core::time::Duration::from_millis(20)).await;
         let _ = sender.post_message(&JsValue::from_str("failed:foreign00000000:some-error"));
     });
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0, 300.0)
         .await
         .expect_err("deadline must expire");
     assert!(
@@ -351,9 +351,10 @@ async fn await_db_worker_ready_reports_failure_for_own_identity() {
             "failed:{id_str}:schema-mismatch"
         )));
     });
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
-        .await
-        .expect_err("own-identity failure is reported");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0, 2_000.0)
+            .await
+            .expect_err("own-identity failure is reported");
     assert!(
         matches!(&error, IntakeError::BootFailed { detail } if detail.contains("schema-mismatch")),
         "expected BootFailed with the worker detail, got {error:?}"
@@ -378,7 +379,7 @@ async fn await_db_worker_ready_reports_failure_for_announced_identity() {
             "failed:{id_str}:network-error"
         )));
     });
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0, 2_000.0)
         .await
         .expect_err("announced failure is reported");
     assert!(
@@ -424,12 +425,12 @@ async fn request_custody_without_worker_returns_timeout() {
     let error = crate::workers::intake::request_custody_bounded(300.0)
         .await
         .expect_err("no worker is running");
-    let IntakeError::Timeout { deadline_ms } = error else {
+    let IntakeError::Timeout { elapsed_ms } = error else {
         panic!("expected Timeout, got {error:?}")
     };
     assert!(
-        (deadline_ms - 300.0).abs() < f64::EPSILON,
-        "expected the deadline it was given, got {deadline_ms}"
+        (300.0..=500.0).contains(&elapsed_ms),
+        "expected the wait to run about the base, got {elapsed_ms}"
     );
 }
 
@@ -464,9 +465,10 @@ async fn a_wait_scoped_to_one_boot_ignores_a_later_spawn() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[older], 500.0)
-        .await
-        .expect_err("no worker reports readiness here");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[older], 500.0, 500.0)
+            .await
+            .expect_err("no worker reports readiness here");
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "the newer boot {newer}'s failure must not resolve this wait, got {error:?}"
@@ -493,9 +495,10 @@ async fn an_implicit_wait_refuses_another_boot_while_its_own_is_in_flight() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 600.0)
-        .await
-        .expect_err("no worker reports readiness here");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 600.0, 600.0)
+            .await
+            .expect_err("no worker reports readiness here");
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "another boot's failure must not resolve a wait for this context's boot, got {error:?}"
@@ -519,7 +522,7 @@ async fn a_failure_after_readiness_does_not_undo_it() {
         }
     });
 
-    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0, 2_000.0)
         .await
         .expect("readiness stands even when the worker throws right after it");
 }
@@ -544,7 +547,8 @@ async fn a_waiter_does_not_announce_the_boot_it_holds() {
     listener.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
     spawn_local(async move {
-        let _ = crate::workers::intake::await_db_worker_ready_bounded(hello, &[held], 600.0).await;
+        let _ = crate::workers::intake::await_db_worker_ready_bounded(hello, &[held], 600.0, 600.0)
+            .await;
     });
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
     let _ = listener.post_message(&JsValue::from_str("ask"));
@@ -573,7 +577,7 @@ async fn an_error_after_ready_is_not_replayed_as_a_boot_failure() {
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 400.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 400.0, 400.0)
         .await
         .expect_err("no worker answers this wait");
     assert!(
@@ -613,10 +617,14 @@ async fn a_ready_boot_stops_reporting_worker_errors() {
         }
     });
 
-    let error =
-        crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[identity], 600.0)
-            .await
-            .expect_err("nothing answers this wait");
+    let error = crate::workers::intake::await_db_worker_ready_bounded(
+        HELLO_CHANNEL,
+        &[identity],
+        600.0,
+        600.0,
+    )
+    .await
+    .expect_err("nothing answers this wait");
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
         "a booted worker's later error must not read as a boot failure, got {error:?}"
@@ -645,7 +653,7 @@ async fn a_replacement_announcement_drops_the_boot_it_replaced() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 600.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 600.0, 600.0)
         .await
         .expect_err("nothing reports readiness here");
     assert!(
@@ -674,7 +682,7 @@ async fn an_unscoped_readiness_does_not_spend_a_pending_boot() {
     }
     crate::workers::sleep(core::time::Duration::from_millis(50)).await;
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 1_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 1_000.0, 1_000.0)
         .await
         .expect_err("the replacement's failure must still be tellable");
     assert!(
@@ -699,7 +707,7 @@ async fn a_failure_broadcast_before_the_wait_is_replayed_to_it() {
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 2_000.0, 2_000.0)
         .await
         .expect_err("a wait that starts after the failure must still learn of it");
     assert!(
@@ -727,7 +735,7 @@ async fn an_announcer_answers_a_waiter_that_joined_late() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 3_000.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 3_000.0, 3_000.0)
         .await
         .expect_err("the late joiner must act on the announced boot's failure");
     assert!(
@@ -756,7 +764,7 @@ async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 400.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 400.0, 400.0)
         .await
         .expect_err("no worker reports readiness here");
     assert!(
@@ -778,6 +786,135 @@ fn post_later(hello: &'static str, gap_ms: u64, messages: Vec<String>) {
     });
 }
 
+/// Progress keeps a boot alive past its base deadline, so a slow boot that keeps reporting
+/// never times out.
+#[wasm_bindgen_test]
+async fn progress_keeps_a_boot_alive_past_the_base_deadline() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-progress-keeps-alive";
+    post_later(
+        hello,
+        200,
+        vec![
+            format!("progress:{identity}"),
+            format!("progress:{identity}"),
+            format!("progress:{identity}"),
+            format!("ready:{identity}"),
+        ],
+    );
+    // The ready lands at about 800 ms, well past the 400 ms base; the beats keep the deadline
+    // ahead of it.
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0, 500.0)
+        .await
+        .expect("progress must keep the boot alive past the base");
+}
+
+/// Silence after the last progress fails the wait at the silence, not at the base.
+#[wasm_bindgen_test]
+async fn silence_after_the_last_progress_fails_at_silence() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-silence-after-progress";
+    post_later(hello, 200, vec![format!("progress:{identity}")]);
+    let started = Date::now();
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0, 600.0)
+            .await
+            .expect_err("silence must fail the wait");
+    let elapsed = Date::now() - started;
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+    // The beat at about 200 ms pushes the deadline to about 800 ms, past the 400 ms base.
+    assert!(
+        (700.0..=1200.0).contains(&elapsed),
+        "the deadline must count from the last progress, expired after {elapsed} ms"
+    );
+}
+
+/// Without any progress, the wait fails at the base deadline.
+#[wasm_bindgen_test]
+async fn no_progress_fails_at_the_base_deadline() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-no-progress";
+    let started = Date::now();
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0, 400.0)
+            .await
+            .expect_err("no progress and no readiness must time out");
+    let elapsed = Date::now() - started;
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+    assert!(
+        (350.0..=800.0).contains(&elapsed),
+        "the deadline must be the base, expired after {elapsed} ms"
+    );
+}
+
+/// Progress while the boot waits on the user does not move the deadline, and the resume
+/// restarts it at the base.
+#[wasm_bindgen_test]
+async fn progress_while_at_user_does_not_move_the_deadline() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-progress-at-user";
+    post_later(
+        hello,
+        100,
+        vec![
+            format!("waiting:{identity}:1"),
+            format!("progress:{identity}"),
+            format!("resumed:{identity}:1"),
+        ],
+    );
+    let started = Date::now();
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0, 3000.0)
+            .await
+            .expect_err("silence after the resume must fail the wait");
+    let elapsed = Date::now() - started;
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+    // The resume at about 300 ms restarts the deadline at 300 + 400 = 700 ms; a progress that
+    // wrongly aimed at the 3000 ms silence would push it far later.
+    assert!(
+        (600.0..=1000.0).contains(&elapsed),
+        "the deadline must restart at the base on resume, expired after {elapsed} ms"
+    );
+}
+
+/// Progress for a boot this wait does not act on does not extend the deadline.
+#[wasm_bindgen_test]
+async fn progress_for_an_unknown_identity_does_not_extend() {
+    let mine = super::boot::BootIdentity::mint();
+    let other = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-progress-foreign";
+    post_later(
+        hello,
+        200,
+        vec![format!("progress:{other}"), format!("progress:{other}")],
+    );
+    let started = Date::now();
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 400.0, 3000.0)
+            .await
+            .expect_err("foreign progress must not hold the wait");
+    let elapsed = Date::now() - started;
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+    // The base is 400 ms; a foreign progress that wrongly aimed at the 3000 ms silence would
+    // push it far later.
+    assert!(
+        (350.0..=800.0).contains(&elapsed),
+        "the deadline must stay at the base, expired after {elapsed} ms"
+    );
+}
+
 /// A boot waiting on the user is not late, so the wait outlasts its deadline for as long as the
 /// user takes and then ends with the readiness that follows.
 #[wasm_bindgen_test]
@@ -796,7 +933,7 @@ async fn a_boot_waiting_on_the_user_is_not_timed_out() {
     // The user step runs from about 400 ms to 800 ms and the ready lands at about 1200 ms, past a
     // 1000 ms deadline counted from the start. Each message keeps 600 ms of slack inside its
     // window, and a delayed message only lands later, past the deadline still.
-    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 1000.0)
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 1000.0, 1000.0)
         .await
         .expect("the user step must pause the deadline");
 }
@@ -815,9 +952,10 @@ async fn a_resumed_boot_gets_a_fresh_deadline_and_no_more() {
         ],
     );
     let started = Date::now();
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0)
-        .await
-        .expect_err("nothing reports readiness after the resume");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0, 400.0)
+            .await
+            .expect_err("nothing reports readiness after the resume");
     let elapsed = Date::now() - started;
     assert!(
         matches!(&error, IntakeError::Timeout { .. }),
@@ -836,7 +974,7 @@ async fn another_boot_waiting_on_its_user_pauses_nothing() {
     let other = super::boot::BootIdentity::mint();
     let hello = "connetto-hello-foreign-waiting";
     post_later(hello, 50, vec![format!("waiting:{other}:1")]);
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 300.0)
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 300.0, 300.0)
         .await
         .expect_err("a foreign pause must not hold this wait");
     assert!(
@@ -858,9 +996,10 @@ async fn a_boot_failing_during_the_user_step_is_reported() {
             format!("failed:{identity}:login-cancelled"),
         ],
     );
-    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
-        .await
-        .expect_err("the failure must be reported");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0, 2_000.0)
+            .await
+            .expect_err("the failure must be reported");
     assert!(
         matches!(&error, IntakeError::BootFailed { detail } if detail.contains("login-cancelled")),
         "expected the failure, got {error:?}"
@@ -880,7 +1019,7 @@ async fn a_late_waiter_learns_the_boot_is_waiting_on_the_user() {
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
     post_later(hello, 900, vec![format!("ready:{identity}")]);
-    crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0)
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0, 300.0)
         .await
         .expect("the announcer must tell a late waiter the boot is paused");
     drop(announcer);
@@ -904,7 +1043,7 @@ async fn a_user_step_the_worker_runs_pauses_the_wait() {
             let _ = sender.post_message(&JsValue::from_str(&format!("ready:{id}")));
         }
     });
-    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 300.0)
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 300.0, 300.0)
         .await
         .expect("a user step the worker announces must pause the deadline");
 }
@@ -961,7 +1100,7 @@ async fn a_replayed_user_step_arriving_after_its_resume_pauses_nothing() {
     );
     let known = [identity];
     let outcome = tokio::select! {
-        outcome = crate::workers::intake::await_db_worker_ready_bounded(page, &known, 400.0) => outcome,
+        outcome = crate::workers::intake::await_db_worker_ready_bounded(page, &known, 400.0, 400.0) => outcome,
         () = crate::workers::sleep(core::time::Duration::from_secs(3)) => {
             panic!("the stale replay paused the wait for good")
         }
@@ -997,9 +1136,10 @@ async fn a_worker_error_is_reported_by_the_context_that_spawned_it() {
         }
     });
 
-    let error = crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 2_000.0)
-        .await
-        .expect_err("a worker that raised an error must not report readiness");
+    let error =
+        crate::workers::intake::await_db_worker_ready_bounded(HELLO_CHANNEL, &[], 2_000.0, 2_000.0)
+            .await
+            .expect_err("a worker that raised an error must not report readiness");
     assert!(
         matches!(&error, IntakeError::BootFailed { .. }),
         "expected the failure to be attributed, got {error:?}"
@@ -1055,7 +1195,7 @@ fn boot_tagged_url_replaces_an_existing_boot_parameter() {
 #[wasm_bindgen_test]
 fn boot_generated_bootstrap_carries_its_identity() {
     let identity = super::boot::BootIdentity::mint();
-    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity, None)
         .expect("a relative glue URL must produce a bootstrap source");
     assert!(
         source.contains(&format!("self.connettoBoot = \"{identity}\"")),
@@ -1068,7 +1208,7 @@ fn boot_generated_bootstrap_carries_its_identity() {
 #[wasm_bindgen_test]
 fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
     let identity = super::boot::BootIdentity::mint();
-    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity, None)
         .expect("a relative glue URL must produce a bootstrap source");
     assert!(
         !source.contains("\"./db-worker.js\""),
@@ -1086,7 +1226,7 @@ fn boot_generated_bootstrap_imports_the_glue_by_absolute_url() {
 fn boot_generated_bootstrap_source_carries_the_boot_identity() {
     let identity = super::boot::BootIdentity::mint();
     let id_str = identity.to_string();
-    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity)
+    let source = super::boot::generated_bootstrap_source("./db-worker.js", &identity, None)
         .expect("a relative glue URL must produce a bootstrap source");
     assert!(
         source.contains(&format!("\"failed:{id_str}:\" + err")),
@@ -1105,5 +1245,40 @@ async fn the_monotonic_clock_counts_time_in_a_worker() {
     assert!(
         after.saturating_sub(before) >= core::time::Duration::from_millis(49),
         "a 50 ms sleep moved the monotonic clock from {before:?} to {after:?}"
+    );
+}
+
+/// The generated bootstrap with an entry point awaits that entry call on the glue after init and
+/// still carries the boot identity and the progress beat, so a slow load keeps the wait alive.
+#[wasm_bindgen_test]
+fn boot_generated_bootstrap_with_entry_point_calls_it_after_init() {
+    let identity = super::boot::BootIdentity::mint();
+    let source = super::boot::generated_bootstrap_source(
+        "./db-worker.js",
+        &identity,
+        Some("db_worker_photo_boot()"),
+    )
+    .expect("a relative glue URL must produce a bootstrap source");
+    assert!(
+        source.contains("await mod.db_worker_photo_boot();"),
+        "the source must call the entry point: {source}"
+    );
+    let init_pos = source
+        .find("await mod.default(")
+        .expect("the init call must be present");
+    let call_pos = source
+        .find("await mod.db_worker_photo_boot();")
+        .expect("the entry call must be present");
+    assert!(
+        init_pos < call_pos,
+        "the entry call must come after init: {source}"
+    );
+    assert!(
+        source.contains(&format!("self.connettoBoot = \"{identity}\"")),
+        "the source must carry the identity: {source}"
+    );
+    assert!(
+        source.contains(&format!("\"progress:{identity}\"")),
+        "the source must carry the progress beat: {source}"
     );
 }

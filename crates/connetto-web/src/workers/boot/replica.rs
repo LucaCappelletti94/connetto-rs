@@ -305,9 +305,10 @@ pub(super) async fn subscribe_and_boot(
     worker: &mut ConnettoConnection<BrowserSocket>,
     config: &WebConfig,
 ) -> Result<(), BootError> {
-    // Matches the hello-channel HELLO_TIMEOUT_MS so a silent server is detected
-    // as fast as the tab's own wait expires.
+    // Matches the hello-channel SILENCE so a silent server is detected as the page's wait expires.
     const BOOT_TIMEOUT_MS: f64 = 15_000.0;
+    // How often a frame's progress is reported to the waiting page.
+    const PROGRESS_THROTTLE_MS: f64 = 1_000.0;
     if !worker.is_connected() {
         return Ok(());
     }
@@ -325,6 +326,7 @@ pub(super) async fn subscribe_and_boot(
         .performance()
         .ok_or_else(|| BootError::NotWorkerScope("no Performance API in worker scope".into()))?;
     let mut last_activity = performance.now();
+    let mut last_progress = performance.now();
     loop {
         let elapsed = performance.now() - last_activity;
         if elapsed >= BOOT_TIMEOUT_MS {
@@ -352,6 +354,10 @@ pub(super) async fn subscribe_and_boot(
             // Any non-Pong frame resets the inactivity timer; the sync is progressing.
             Some(_) => {
                 last_activity = performance.now();
+                if last_activity - last_progress >= PROGRESS_THROTTLE_MS {
+                    last_progress = last_activity;
+                    super::report_boot_progress();
+                }
             }
             None => {}
         }

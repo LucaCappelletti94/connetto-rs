@@ -66,8 +66,10 @@ async fn blob_bytes(blob: &web_sys::Blob) -> Vec<u8> {
 async fn a_pinned_photo_stays_local_and_heals_the_lost_server_copy() {
     harness::relay_worker_breadcrumbs();
     common::play_the_tab();
-    let worker = photo::spawn_photo_worker(&harness::glue_url());
-    await_db_worker_ready(&[]).await.expect("db worker ready");
+    let (worker, boot) = photo::spawn_photo_worker(&harness::glue_url());
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
     harness::stage("db worker booted");
 
     let (_, identity) = common::mint_session().await;
