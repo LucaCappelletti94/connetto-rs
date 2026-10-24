@@ -32,6 +32,7 @@ use super::{
 };
 use crate::ClientError;
 use crate::ClientEvent;
+use crate::ConnectionNumber;
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
@@ -406,6 +407,9 @@ struct FakeState {
     list_gate: Option<Arc<tokio::sync::Notify>>,
     /// How many list stores have started.
     list_stores: usize,
+    /// The number of the connection the fake stands on, moved by a test to
+    /// stand for a new connection.
+    connection: u64,
 }
 
 /// How the fake link drives one enrolment.
@@ -459,8 +463,9 @@ impl Link for FakeLink {
         })
     }
 
-    fn connected(&self) -> impl Future<Output = bool> + Send {
-        Box::pin(async { true })
+    fn connection(&self) -> impl Future<Output = Option<ConnectionNumber>> + Send {
+        let connection = self.state.lock().connection;
+        Box::pin(async move { Some(ConnectionNumber::new(connection)) })
     }
 
     fn ask(
@@ -745,6 +750,17 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
     events_tx
         .send(ClientEvent::SyncStatus(SyncStatus::Connected))
         .expect("the run listens");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        state.lock().requests.len(),
+        1,
+        "a notice of the connection already asked on asks nothing"
+    );
+
+    state.lock().connection += 1;
+    events_tx
+        .send(ClientEvent::SyncStatus(SyncStatus::Connected))
+        .expect("the run listens");
     poll_until(|| state.lock().requests.len() == 2).await;
     {
         let state = state.lock();
@@ -756,6 +772,89 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         assert_eq!(state.emitted.len(), 2, "the refusal is raised again");
         assert!(state.stored.is_empty());
     }
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A grant the local clock puts before its window leaves the device off the
+/// clock, and the device asks again on its next connection, never on a
+/// notice of the connection it already asked on.
+#[tokio::test(start_paused = true)]
+async fn a_clock_behind_grant_asks_again_only_on_the_next_connection() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events_rx) = broadcast::channel(64);
+    let events_tx = events.clone();
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: Some(now + 2 * HOUR),
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, _handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| state.lock().stored.len() == 1).await;
+    assert!(
+        state
+            .lock()
+            .emitted
+            .contains(&ClientEvent::ClockOutsideWindow { ahead: false }),
+        "the grant says the clock is behind"
+    );
+
+    events_tx
+        .send(ClientEvent::SyncStatus(SyncStatus::Connected))
+        .expect("the run listens");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        let state = state.lock();
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "a notice of the connection already asked on asks nothing"
+        );
+        assert_eq!(state.stored.len(), 1, "no second certificate is kept");
+    }
+
+    state.lock().connection += 1;
+    events_tx
+        .send(ClientEvent::SyncStatus(SyncStatus::Connected))
+        .expect("the run listens");
+    poll_until(|| state.lock().stored.len() == 2).await;
+    assert_eq!(
+        state.lock().requests.len(),
+        2,
+        "the next connection asks again"
+    );
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");

@@ -2998,8 +2998,12 @@ where
         }
     }
 
-    async fn connected(&self) -> bool {
-        self.shared.lock_interrupting().await.conn.is_connected()
+    async fn connection(&self) -> Option<crate::ConnectionNumber> {
+        self.shared
+            .lock_interrupting()
+            .await
+            .conn
+            .connection_number()
     }
 
     async fn ask(
