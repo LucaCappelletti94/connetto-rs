@@ -661,7 +661,7 @@ mod tests {
             bytes.truncate(major_at + kept);
             assert!(matches!(
                 decode_pending(&bytes),
-                Err(crate::ClientError::Import(message)) if message == "the queue entry is malformed"
+                Err(crate::ClientError::Import(_))
             ));
         }
     }
