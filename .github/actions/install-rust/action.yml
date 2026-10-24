@@ -1,0 +1,38 @@
+name: Install a Rust toolchain
+description: >-
+  Installs a minimal-profile toolchain with its components and targets,
+  retrying rustup, which gives up on the first channel download that cannot
+  connect.
+inputs:
+  toolchain:
+    description: The toolchain to install.
+    default: stable
+  components:
+    description: Comma-separated components, or empty for none.
+    default: ""
+  targets:
+    description: Space-separated targets, or empty for none.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        retry() {
+          for attempt in 1 2 3 4; do
+            "$@" && return 0
+            echo "::warning::$* failed on attempt $attempt"
+            sleep $((attempt * 15))
+          done
+          "$@"
+        }
+        install=(rustup toolchain install "$TOOLCHAIN" --profile minimal)
+        if [ -n "$COMPONENTS" ]; then install+=(--component "$COMPONENTS"); fi
+        retry "${install[@]}"
+        for target in $TARGETS; do
+          retry rustup target add "$target" --toolchain "$TOOLCHAIN"
+        done

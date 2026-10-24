@@ -84,14 +84,10 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable rustfmt and clippy
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component rustfmt,clippy
-
-      - name: Add wasm target
-        if: matrix.target != ''
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          components: rustfmt,clippy
+          targets: ${{ matrix.target != '' && 'wasm32-unknown-unknown' || '' }}
 
       # The root legs pass --all-features, which turns on connetto-dioxus's
       # desktop feature and its webview stack, and Tauri links the same one.
@@ -167,11 +163,11 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-nightly-{0}-', runner.os) || '' }}
 
       - name: Install nightly clippy
-        run: |
-          rustup toolchain install nightly \
-            --profile minimal \
-            --component clippy
-          rustup target add wasm32-unknown-unknown --toolchain nightly
+        uses: ./.github/actions/install-rust
+        with:
+          toolchain: nightly
+          components: clippy
+          targets: wasm32-unknown-unknown
 
       - name: Install desktop dependencies
         uses: ./.github/actions/install-desktop-deps
@@ -240,9 +236,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the Android target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add aarch64-linux-android --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          targets: aarch64-linux-android
 
       - name: Build the demo for Android
         working-directory: examples/dioxus-desktop-demo
@@ -290,9 +286,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the iOS targets
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          targets: aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Build the demo for iOS devices and the simulator
         working-directory: examples/dioxus-desktop-demo
@@ -353,9 +349,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the simulator target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add aarch64-apple-ios-sim --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          targets: aarch64-apple-ios-sim
 
       - uses: ./.github/actions/install-tauri-tools
 
@@ -440,9 +436,9 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the simulator target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add aarch64-apple-ios-sim --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          targets: aarch64-apple-ios-sim
 
       # The crates the iOS demo links, with the features it uses.
       - name: Build the crates' tests for the simulator
@@ -565,7 +561,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || '' }}
 
       - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal
+        uses: ./.github/actions/install-rust
 
       # dbus-daemon backs the fake Secret portal the client suite starts.
       - name: Install keyring helpers
@@ -653,7 +649,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal
+        uses: ./.github/actions/install-rust
 
       - name: Install keyring helpers
         run: |
@@ -754,7 +750,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || '' }}
 
       - name: Install stable browser toolchain
-        run: rustup toolchain install stable --profile minimal
+        uses: ./.github/actions/install-rust
 
       - name: Build the browser stack
         run: |
@@ -865,11 +861,10 @@ jobs:
       - name: Mark the prebuilt binaries executable
         run: chmod +x browser-bins/*
 
-      - name: Install stable browser toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
+      - name: Install stable browser toolchain with the wasm target
+        uses: ./.github/actions/install-rust
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.14.0
@@ -957,9 +952,9 @@ jobs:
         run: chmod +x browser-bins/* android-bins/*
 
       - name: Install stable toolchain with the emulator's target
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add x86_64-linux-android --toolchain stable
+        uses: ./.github/actions/install-rust
+        with:
+          targets: x86_64-linux-android
 
       - uses: ./.github/actions/install-tauri-tools
 
@@ -1068,11 +1063,10 @@ jobs:
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
-      - name: Install stable browser toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
+      - name: Install stable browser toolchain with the wasm target
+        uses: ./.github/actions/install-rust
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.14.0
@@ -1128,11 +1122,10 @@ jobs:
           key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || '' }}
 
-      - name: Install stable browser toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
+      - name: Install stable browser toolchain with the wasm target
+        uses: ./.github/actions/install-rust
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.14.0

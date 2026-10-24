@@ -6,6 +6,9 @@ description: >-
 runs:
   using: composite
   steps:
+    - uses: ./.github/actions/install-rust
+      with:
+        targets: wasm32-unknown-unknown
     - shell: bash
       run: |
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
@@ -43,6 +46,5 @@ runs:
         esac
         tar xzf "$dir/$trunk_archive" -C ~/.cargo/bin trunk
         rm -rf "$dir"
-        rustup target add wasm32-unknown-unknown --toolchain stable
         cargo tauri --version
         trunk --version
