@@ -2826,6 +2826,10 @@ async fn wait_timer<D, F: Future<Output = ()> + ?Sized>(
 /// re-declared subscriptions. Local faults (session, apply, protocol) stay
 /// terminal either way and are announced as [`ClientEvent::Stopped`], as is
 /// a refusal the build can never attach under.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps timer ownership with the pump lifecycle"
+)]
 async fn pump<T, F, S>(
     shared: Arc<Shared<T>>,
     alive: Weak<ClientToken>,
