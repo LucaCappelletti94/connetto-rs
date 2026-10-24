@@ -346,10 +346,10 @@ async fn attach_tab(hub: &RelayHub) -> MessageTransport<MessagePort> {
     let channel = web_sys::MessageChannel::new().expect("message channel");
     hub.attach(MessageTransport::<MessagePort>::new(channel.port1()));
     let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        "skd-tab",
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "skd-tab")
+            .with_major(connetto_core::Major::new(1).expect("major 1")),
+    ))
     .await
     .expect("post handshake");
     let ack = tokio::select! {
@@ -1224,10 +1224,10 @@ async fn a_held_ticket_keeps_its_request_through_the_swap() {
     let channel = web_sys::MessageChannel::new().expect("message channel");
     hub.attach_with_content(MessageTransport::<MessagePort>::new(channel.port1()));
     let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        "6f1c9d2e-8a4b-4c5d-9e6f-0a1b2c3d4e5f",
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "6f1c9d2e-8a4b-4c5d-9e6f-0a1b2c3d4e5f")
+            .with_major(connetto_core::Major::new(1).expect("major 1")),
+    ))
     .await
     .expect("post handshake");
     let ack = tokio::select! {
@@ -1411,10 +1411,10 @@ async fn a_held_upload_still_reads_the_swap_answer() {
     let channel = web_sys::MessageChannel::new().expect("message channel");
     hub.attach_with_content(MessageTransport::<MessagePort>::new(channel.port1()));
     let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        "b2a4c6d8-0e1f-2a3b-4c5d-6e7f8090a1b2",
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "b2a4c6d8-0e1f-2a3b-4c5d-6e7f8090a1b2")
+            .with_major(connetto_core::Major::new(1).expect("major 1")),
+    ))
     .await
     .expect("post handshake");
     let ack = tokio::select! {
