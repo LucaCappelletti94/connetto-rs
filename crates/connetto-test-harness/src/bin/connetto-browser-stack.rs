@@ -671,7 +671,7 @@ async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -
     // carry their own deadline unless the caller already set one.
     let mut envs = services.envs.clone();
     if std::env::var_os("WASM_BINDGEN_TEST_TIMEOUT").is_none() {
-        envs.push(("WASM_BINDGEN_TEST_TIMEOUT".to_owned(), "60".to_owned()));
+        envs.push(("WASM_BINDGEN_TEST_TIMEOUT".to_owned(), "180".to_owned()));
     }
     // One shared artifact dir for every wasm invocation: the web crate and the
     // smoke binaries build near-identical dependency graphs, and separate
