@@ -4,9 +4,8 @@
 //! R58 bounded the row snapshot with a per-tier `SET LOCAL statement_timeout`
 //! (see [`snapshot`](crate::snapshot)) and the aggregate paths never got it: an
 //! aggregate's seed and every re-execution triggered by a change ran a full
-//! query with no time limit, on the owner pool that also carries the ingest
-//! loop, the oplog, the ban store and the audit hook. So one aggregate over an
-//! unindexed table could stall live delivery for every client.
+//! query with no time limit, so one aggregate over an unindexed table could
+//! stall every read that shares the connector's pool with it.
 //!
 //! subql's `PgAsyncDieselConnector` runs the reads (the scalar and seed
 //! shapes, budgeted pages, and the held cursors a whole-answer read needs) and

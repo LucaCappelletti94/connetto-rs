@@ -324,11 +324,26 @@ impl ServerSchema {
     }
 
     /// The one catalog the engine classifies, the policies beside
-    /// [`engine_ddl`](Self::engine_ddl), because a folded read rule reads the
-    /// policy text the engine must hold.
-    #[must_use]
-    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
-        format!("{}\n{}", self.engine_ddl::<Id>(), self.pg_policies)
+    /// [`engine_ddl`](Self::engine_ddl) and the cap document the pair
+    /// generates, because a folded read rule reads the policy text the engine
+    /// must hold. The cap is live beside the deployment's own rules, so a
+    /// table it secures refuses a shared fold and answers through the
+    /// per-viewer reads that bind the caller the way a live read does.
+    ///
+    /// # Errors
+    ///
+    /// [`connetto_schema::SchemaError::Translate`] when either document does
+    /// not parse.
+    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(
+        &self,
+    ) -> Result<String, connetto_schema::SchemaError> {
+        let cap = connetto_schema::cap_policies::<Id>(&self.pg_ddl, &self.pg_policies)?;
+        Ok(format!(
+            "{}\n{}\n{}",
+            self.engine_ddl::<Id>(),
+            self.pg_policies,
+            cap
+        ))
     }
 }
 
@@ -1126,10 +1141,16 @@ where
             slot_lag_watch,
         )
         .await?;
-        // The engine's reads are global statistics with no RLS by construction, so they take their own connector handle.
-        let connector = PgReadConnector::with_session_setup(pool.clone());
-        let engine_connector = PgReadConnector::with_session_setup(pool.clone());
         let reader_pool_size = reader_reserve.total();
+        let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
+        // The computed reads the session and the engine run under a viewer's
+        // binding, so both take the reader role, where the viewer's policies
+        // scope the rows. Their own pool, sized at the owner pool's, keeps a
+        // re-execution hold out of the gated reader pool the reader reserve
+        // splits (R39).
+        let reexec_pool = build_pool(&database.reader_url, owner_pool_size).await?;
+        let connector = PgReadConnector::with_session_setup(reexec_pool.clone());
+        let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
         let (service, registry) = build_auth::<D>(
             &pool,
@@ -1142,10 +1163,15 @@ where
         )
         .await?;
         let authority: Arc<dyn HandshakeAuthority<D::Id>> = Arc::new(service.handshake_authority());
-
-        let reader =
-            build_reader_side::<D>(&database, reader_pool_size, &schema, &publication, content)
-                .await?;
+        let reader = build_reader_side::<D>(
+            &database,
+            reader_pool,
+            reader_pool_size,
+            &schema,
+            &publication,
+            content,
+        )
+        .await?;
         let write_side = build_write_side::<D>(
             Pools {
                 owner: pool.clone(),
@@ -1487,16 +1513,16 @@ async fn build_auth<D: ConnettoSchema>(
     Ok((service, registry))
 }
 
-/// The reader pool's three consumers, the pool itself, the file half and the
-/// snapshot source, all built from the same conninfos.
+/// The reader pool's consumers: the file half, its sweep and the snapshot
+/// source, built over the pool the call site opens from the reader conninfos.
 async fn build_reader_side<D: ConnettoSchema>(
     database: &Database,
+    pool: PgPool,
     reader_pool_size: u32,
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
 ) -> Result<ReaderSide, BuildError> {
-    let pool = build_pool(&database.reader_url, reader_pool_size).await?;
     let (signer, file_router, sweep) = content::build::<D>(
         content,
         &database.owner_url,
@@ -1682,7 +1708,8 @@ async fn build_write_side<D: ConnettoSchema>(
         build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
-    let materializer = Materializer::builder(&schema.catalog::<RegistryIds<D>>())
+    let catalog = schema.catalog::<RegistryIds<D>>()?;
+    let materializer = Materializer::builder(&catalog)
         .with_write_catalog(writable)
         .with_translator(translator)
         .with_caller(caller_mapping())
