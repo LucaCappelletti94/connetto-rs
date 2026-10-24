@@ -22,6 +22,9 @@ const BOOT_GLOBAL: &str = "connettoBoot";
 /// Storage-pool slots reserved by [`boot_db_worker`]: 4 databases plus a rollback journal each.
 const BOOT_SLOTS: u32 = 8;
 
+/// How often the generated bootstrap reports progress while the module loads.
+const PROGRESS_BEAT_MS: u64 = 5_000;
+
 /// An opaque identifier minted when a DB worker is spawned.
 ///
 /// The spawning tab announces it as `booting:<identity>` on the hello channel, and the
@@ -126,6 +129,9 @@ pub enum WorkerBootstrap {
     Glue,
     /// A separately served bootstrap script at this URL that imports the glue.
     Script(String),
+    /// A connetto-generated bootstrap blob that also awaits a custom entry-point call on the
+    /// glue module after init, such as `db_worker_photo_boot()`.
+    GeneratedCalling(String),
     /// A connetto-generated bootstrap blob for bundlers whose glue does not self-initialize.
     Generated,
 }
@@ -160,13 +166,9 @@ pub fn spawn_db_worker(
             Worker::new_with_options(&url.href(), &options)
                 .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")))?
         }
-        WorkerBootstrap::Generated => {
-            let object_url = generated_bootstrap_url(glue_url, &identity)?;
-            let worker = Worker::new_with_options(&object_url, &options)
-                .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")));
-            // The worker takes its reference to the blob during construction.
-            let _ = web_sys::Url::revoke_object_url(&object_url);
-            worker?
+        WorkerBootstrap::Generated => generated_worker(glue_url, &identity, &options, None)?,
+        WorkerBootstrap::GeneratedCalling(call) => {
+            generated_worker(glue_url, &identity, &options, Some(call))?
         }
     };
     report_worker_errors(&worker, &identity);
@@ -261,8 +263,28 @@ pub(super) fn tagged_url_against(
     Ok(tagged.href())
 }
 
-fn generated_bootstrap_url(glue_url: &str, identity: &BootIdentity) -> Result<String, BootError> {
-    let source = generated_bootstrap_source(glue_url, identity)?;
+/// Spawn a generated-bootstrap worker, optionally awaiting a custom entry-point call on the glue
+/// module after init.
+fn generated_worker(
+    glue_url: &str,
+    identity: &BootIdentity,
+    options: &WorkerOptions,
+    entry_call: Option<&str>,
+) -> Result<Worker, BootError> {
+    let object_url = generated_bootstrap_url(glue_url, identity, entry_call)?;
+    let worker = Worker::new_with_options(&object_url, options)
+        .map_err(|e| BootError::WorkerSpawn(format!("{e:?}")));
+    // The worker takes its reference to the blob during construction.
+    let _ = web_sys::Url::revoke_object_url(&object_url);
+    worker
+}
+
+fn generated_bootstrap_url(
+    glue_url: &str,
+    identity: &BootIdentity,
+    entry_call: Option<&str>,
+) -> Result<String, BootError> {
+    let source = generated_bootstrap_source(glue_url, identity, entry_call)?;
     let parts = js_sys::Array::of1(&JsValue::from_str(&source));
     let options = web_sys::BlobPropertyBag::new();
     options.set_type("text/javascript");
@@ -276,6 +298,7 @@ fn generated_bootstrap_url(glue_url: &str, identity: &BootIdentity) -> Result<St
 pub(super) fn generated_bootstrap_source(
     glue_url: &str,
     identity: &BootIdentity,
+    entry_call: Option<&str>,
 ) -> Result<String, BootError> {
     let base = current_location_href()?;
     let url = web_sys::Url::new_with_base(glue_url, &base)
@@ -292,15 +315,30 @@ pub(super) fn generated_bootstrap_source(
     // A fragment is not meaningful for a resource fetch.
     url.set_hash("");
     let wasm_url = url.href();
+    // The entry call, awaited on the glue module after init, is empty for a bare Generated spawn.
+    let entry = match entry_call {
+        Some(call) => format!("    await mod.{call};\n"),
+        None => String::new(),
+    };
     Ok(format!(
         r#"self.{param} = {id_literal};
-try {{
-  const mod = await import({glue});
-  await mod.default({{ module_or_path: {wasm} }});
-}} catch (err) {{
-  new BroadcastChannel("connetto-debug").postMessage("db worker bootstrap FAILED: " + err);
-  new BroadcastChannel("connetto-hello").postMessage("failed:{id}:" + err);
-  throw err;
+{{
+  const hello = new BroadcastChannel("connetto-hello");
+  const progress = "progress:{id}";
+  hello.postMessage(progress);
+  const beat = setInterval(() => hello.postMessage(progress), {beat_ms});
+  try {{
+    const mod = await import({glue});
+    await mod.default({{ module_or_path: {wasm} }});
+{entry}    hello.postMessage(progress);
+  }} catch (err) {{
+    new BroadcastChannel("connetto-debug").postMessage("db worker bootstrap FAILED: " + err);
+    hello.postMessage("failed:{id}:" + err);
+    throw err;
+  }} finally {{
+    clearInterval(beat);
+    hello.close();
+  }}
 }}
 "#,
         param = BOOT_GLOBAL,
@@ -308,6 +346,8 @@ try {{
         glue = js_string_literal(&resolved_glue),
         wasm = js_string_literal(&wasm_url),
         id = identity,
+        beat_ms = PROGRESS_BEAT_MS,
+        entry = entry,
     ))
 }
 
@@ -410,6 +450,17 @@ fn report_boot_failure(detail: &str) {
     }
 }
 
+/// Tells the waiting page this boot is still working, naming the boot it was spawned as.
+fn report_boot_progress() {
+    let Some(identity) = boot_identity_from_location() else {
+        return;
+    };
+    if let Ok(hello) = web_sys::BroadcastChannel::new(super::HELLO_CHANNEL) {
+        let _ = hello.post_message(&JsValue::from_str(&format!("progress:{identity}")));
+        hello.close();
+    }
+}
+
 /// The boot identity this worker was spawned with, from its own URL or from the global a
 /// generated bootstrap leaves behind.
 pub(super) fn boot_identity_from_location() -> Option<String> {
@@ -433,13 +484,17 @@ where
 {
     let crate::builder::WebBuild { core, web: config } = build;
     let (storage, key_store, was_enrolled) = services::prepare_boot_storage(&config).await?;
+    report_boot_progress();
     let resolved =
         replica::resolve_boot_sign_in::<Id>(&config, &storage, &key_store, was_enrolled).await?;
+    report_boot_progress();
     let (spec, mut worker, content_root_key) =
         replica::open_worker(core, &config, resolved, &storage, &key_store).await?;
+    report_boot_progress();
     if config.connect_gate.is_none() {
         replica::try_connect_upstream(&mut worker, config.ws_url).await?;
     }
+    report_boot_progress();
     replica::subscribe_and_boot(&mut worker, &config).await?;
     services::hold_alive_lock().await;
     let (hub, content_persistent) =

@@ -92,29 +92,16 @@ async fn fetch_bytes(url: &str) -> Vec<u8> {
     Uint8Array::new(&buffer).to_vec()
 }
 
-fn spawn_offline_photo_worker(glue_url: &str) -> web_sys::Worker {
-    let wasm_url = glue_url.strip_suffix(".js").map_or_else(
-        || format!("{glue_url}_bg.wasm"),
-        |base| format!("{base}_bg.wasm"),
-    );
-    let source = format!(
-        "const debug = new BroadcastChannel(\"connetto-debug\");\ntry {{\n  debug.postMessage(\"db worker: importing {g}\");\n  const mod = await import(\"{g}\");\n  await mod.default({{ module_or_path: \"{w}\" }});\n  debug.postMessage(\"db worker: module ready, booting the db tier\");\n  await mod.db_worker_photo_offline_boot();\n  debug.postMessage(\"db worker: serving\");\n}} catch (err) {{\n  debug.postMessage(\"db worker FAILED: \" + err);\n  throw err;\n}}\n",
-        g = glue_url,
-        w = wasm_url,
-    );
-    let parts = Array::of1(&wasm_bindgen::JsValue::from_str(&source));
-    let blob_opts = web_sys::BlobPropertyBag::new();
-    blob_opts.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &blob_opts)
-        .expect("bootstrap blob");
-    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("bootstrap url");
-    let worker_opts = web_sys::WorkerOptions::new();
-    worker_opts.set_type(web_sys::WorkerType::Module);
-    worker_opts.set_name("connetto-db-photo-offline");
-    let worker =
-        web_sys::Worker::new_with_options(&url, &worker_opts).expect("spawn offline photo worker");
-    let _ = web_sys::Url::revoke_object_url(&url);
-    worker
+fn spawn_offline_photo_worker(
+    glue_url: &str,
+) -> (web_sys::Worker, connetto_web::workers::BootIdentity) {
+    connetto_web::workers::spawn_db_worker(
+        glue_url,
+        &connetto_web::workers::WorkerBootstrap::GeneratedCalling(
+            "db_worker_photo_offline_boot()".to_owned(),
+        ),
+    )
+    .expect("spawn the offline photo worker")
 }
 
 fn open_photo_connect_gate() {
@@ -159,8 +146,10 @@ where
 async fn an_offline_photo_replays_on_connect_and_flips_available() {
     harness::relay_worker_breadcrumbs();
     common::play_the_tab();
-    let worker = spawn_offline_photo_worker(&harness::glue_url());
-    await_db_worker_ready(&[]).await.expect("db worker ready");
+    let (worker, boot) = spawn_offline_photo_worker(&harness::glue_url());
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
     harness::stage("db worker booted");
 
     let (token, identity) = common::mint_session().await;

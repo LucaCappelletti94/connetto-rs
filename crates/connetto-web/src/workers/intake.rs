@@ -14,12 +14,21 @@ use crate::frames::{MessageTransport, MessageTransportError};
 /// Deadline for all hello-channel exchanges.
 const HELLO_TIMEOUT_MS: f64 = 15_000.0;
 
+/// A boot's base allowance to report readiness, before progress can extend it.
+const BASE: f64 = 15_000.0;
+
+/// The floor every progress message pushes the deadline to. Matches the worker's own
+/// inactivity bound in `subscribe_and_boot`.
+const SILENCE: f64 = 15_000.0;
+
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
 
 enum HelloReady {
-    /// The deadline runs.
-    Counting,
+    /// The deadline runs, as an absolute time the wait expires at.
+    Counting {
+        deadline: f64,
+    },
     /// The boot waits on the user, so the deadline does not run.
     AtUser,
     Up,
@@ -43,11 +52,11 @@ pub enum IntakeError {
         /// the detail the worker sent
         detail: String,
     },
-    /// the db worker did not answer within the readiness deadline
-    #[error("db worker did not answer within {deadline_ms:.0} ms")]
+    /// the wait ran out without the db worker answering
+    #[error("db worker did not answer within {elapsed_ms:.0} ms")]
     Timeout {
-        /// the deadline that expired, in milliseconds
-        deadline_ms: f64,
+        /// how long the wait ran before expiring, in milliseconds
+        elapsed_ms: f64,
     },
 }
 
@@ -60,8 +69,7 @@ impl From<IntakeError> for JsValue {
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
-    started: &Rc<Cell<f64>>,
-    deadline_ms: f64,
+    started: f64,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
     loop {
@@ -71,9 +79,11 @@ async fn poll_hello_channel(
                 let detail = detail.clone();
                 return Err(IntakeError::BootFailed { detail });
             }
-            HelloReady::Counting => {
-                if js_sys::Date::now() - started.get() >= deadline_ms {
-                    return Err(IntakeError::Timeout { deadline_ms });
+            HelloReady::Counting { deadline } => {
+                if js_sys::Date::now() >= *deadline {
+                    return Err(IntakeError::Timeout {
+                        elapsed_ms: js_sys::Date::now() - started,
+                    });
                 }
             }
             HelloReady::AtUser => {}
@@ -292,37 +302,34 @@ pub(super) fn announce_boot_on(
 /// [`IntakeError::BootFailed`] when the worker reported a failure for a known identity, or
 /// [`IntakeError::Timeout`] when the deadline expires.
 pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Result<(), IntakeError> {
-    await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, HELLO_TIMEOUT_MS).await
+    await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, BASE, SILENCE).await
 }
 
-/// Waits for readiness on `channel_name` under `deadline_ms`, so a test proves a boundary in
-/// milliseconds rather than over the shipped deadline, on a channel of its own rather than on
-/// the one every other waiter in the context is listening to.
+/// Test-facing readiness wait on a channel of its own under a short `base_ms` and `silence_ms`.
 pub(super) async fn await_db_worker_ready_bounded(
     channel_name: &str,
     known: &[super::boot::BootIdentity],
-    deadline_ms: f64,
+    base_ms: f64,
+    silence_ms: f64,
 ) -> Result<(), IntakeError> {
+    let started = js_sys::Date::now();
     let channel = BroadcastChannel::new(channel_name).map_err(|err| IntakeError::ChannelOpen {
         operation: "hello channel",
         detail: format!("{err:?}"),
     })?;
-    let state = Rc::new(RefCell::new(HelloReady::Counting));
-    let started = Rc::new(Cell::new(js_sys::Date::now()));
+    let state = Rc::new(RefCell::new(HelloReady::Counting {
+        deadline: js_sys::Date::now() + base_ms,
+    }));
     let mut initial = known.to_vec();
     if initial.is_empty() && channel_name == super::HELLO_CHANNEL {
-        // Only a caller that named nothing falls back to this context's boot, because a caller
-        // that named one is scoped to it and a newer spawn is not what it is waiting for. A boot
-        // is remembered for the channel it was announced on and explains nothing on another.
+        // Only a caller that named nothing falls back to this context's boot.
         initial.extend(current_boot_in_flight());
     }
     let known_ids = Rc::new(RefCell::new(initial));
-    // A waiter that knows which boot it waits for has no business adopting another one, and a
-    // waiter that knows none has only the announcement to go on.
+    // A waiter that knows which boot it waits for has no business adopting another one.
     let trusts_announcements = known_ids.borrow().is_empty();
     let on_message = {
         let state = Rc::clone(&state);
-        let started = Rc::clone(&started);
         let known_ids = Rc::clone(&known_ids);
         let mut steps = UserSteps::default();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -331,25 +338,32 @@ pub(super) async fn await_db_worker_ready_bounded(
             };
             let is_known = |id: &str| known_ids.borrow().iter().any(|known| known.matches_str(id));
             let mut state = state.borrow_mut();
-            // Readiness and failure are terminal: a worker that answered this wait booted, and
-            // what it throws afterwards is not this wait's outcome.
+            // Readiness and failure are terminal and answer nothing afterwards.
             if matches!(*state, HelloReady::Up | HelloReady::Failed(_)) {
                 return;
             }
             if message == "ready" || message.starts_with("ready:") {
                 *state = HelloReady::Up;
             } else if let Some(id) = message.strip_prefix("booting:") {
-                // Only a spawn announces, so the newest announcement names the boot that will
-                // serve this waiter, and the one before it has been replaced: its failure no
-                // longer says anything about whether a worker is coming, and neither does its
-                // wait on the user.
                 if trusts_announcements && !is_known(id) {
                     *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
-                    // A new boot is a new worker, which numbers its user steps from 1 again.
+                    // A new boot numbers its user steps from 1 again.
                     steps = UserSteps::default();
                     if matches!(*state, HelloReady::AtUser) {
-                        *state = HelloReady::Counting;
-                        started.set(js_sys::Date::now());
+                        *state = HelloReady::Counting {
+                            deadline: js_sys::Date::now() + base_ms,
+                        };
+                    }
+                }
+            } else if let Some(id) = message.strip_prefix("progress:")
+                && !id.is_empty()
+                && is_known(id)
+            {
+                // Progress only extends a running deadline; the user is what an AtUser boot waits on.
+                if let HelloReady::Counting { deadline } = &mut *state {
+                    let candidate = js_sys::Date::now() + silence_ms;
+                    if candidate > *deadline {
+                        *deadline = candidate;
                     }
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
@@ -368,13 +382,14 @@ pub(super) async fn await_db_worker_ready_bounded(
                 && steps.resumed(step)
                 && matches!(*state, HelloReady::AtUser)
             {
-                *state = HelloReady::Counting;
-                started.set(js_sys::Date::now());
+                *state = HelloReady::Counting {
+                    deadline: js_sys::Date::now() + base_ms,
+                };
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let result = poll_hello_channel(&channel, &state, &started, deadline_ms).await;
+    let result = poll_hello_channel(&channel, &state, started).await;
     channel.set_onmessage(None);
     channel.close();
     result
@@ -410,7 +425,7 @@ pub async fn announce_tab(wire: &str) -> Result<(), IntakeError> {
             channel.set_onmessage(None);
             channel.close();
             return Err(IntakeError::Timeout {
-                deadline_ms: HELLO_TIMEOUT_MS,
+                elapsed_ms: js_sys::Date::now() - started,
             });
         }
         sleep_ms(10).await;
@@ -494,7 +509,9 @@ pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody,
             channel.set_onmessage(None);
             channel.close();
             drop(on_message);
-            return Err(IntakeError::Timeout { deadline_ms });
+            return Err(IntakeError::Timeout {
+                elapsed_ms: js_sys::Date::now() - started,
+            });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.
         let _ = channel.post_message(&JsValue::from_str("custody?"));

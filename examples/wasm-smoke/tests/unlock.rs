@@ -72,36 +72,14 @@ fn unsupported_msg() -> wasm_bindgen::JsValue {
 /// `db_worker_boot()`. The bootstrap is a blob module so no extra script file
 /// is needed, mirroring the `WorkerBootstrap::Generated` pattern in
 /// `connetto_web::workers`.
-fn spawn_unlock_worker(glue_url: &str) -> web_sys::Worker {
-    let wasm_url = glue_url
-        .strip_suffix(".js")
-        .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
-    // This blob carries no boot identity, so its failures reach the debug channel only.
-    let source = format!(
-        "try {{\
-         \n  const mod = await import(\"{g}\");\
-         \n  await mod.default({{ module_or_path: \"{w}\" }});\
-         \n  await mod.db_worker_unlock_boot();\
-         \n}} catch (err) {{\
-         \n  new BroadcastChannel(\"connetto-debug\").postMessage(\"db worker FAILED: \" + err);\
-         \n  throw err;\
-         \n}}\n",
-        g = glue_url,
-        w = wasm_url,
-    );
-    let parts = js_sys::Array::of1(&wasm_bindgen::JsValue::from_str(&source));
-    let blob_opts = web_sys::BlobPropertyBag::new();
-    blob_opts.set_type("text/javascript");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &blob_opts)
-        .expect("bootstrap blob");
-    let url = web_sys::Url::create_object_url_with_blob(&blob).expect("bootstrap url");
-    let worker_opts = web_sys::WorkerOptions::new();
-    worker_opts.set_type(web_sys::WorkerType::Module);
-    worker_opts.set_name("connetto-db-unlock");
-    let worker =
-        web_sys::Worker::new_with_options(&url, &worker_opts).expect("spawn unlock worker");
-    let _ = web_sys::Url::revoke_object_url(&url);
-    worker
+fn spawn_unlock_worker(glue_url: &str) -> (web_sys::Worker, connetto_web::workers::BootIdentity) {
+    connetto_web::workers::spawn_db_worker(
+        glue_url,
+        &connetto_web::workers::WorkerBootstrap::GeneratedCalling(
+            "db_worker_unlock_boot()".to_owned(),
+        ),
+    )
+    .expect("spawn the unlock worker")
 }
 
 /// Install a one-time handler on `channel` that resolves the returned future
@@ -216,7 +194,7 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
 
     // The test plays the tab for login requests and for the enrol request.
     let logins = common::play_the_tab();
-    let worker = spawn_unlock_worker(&glue_url());
+    let (worker, boot) = spawn_unlock_worker(&glue_url());
 
     // Stand-in tab handler: respond "unsupported" to the enrol request.
     {
@@ -241,7 +219,9 @@ async fn an_unsupported_enrolment_response_boots_with_ungated_custody_readable_f
     }
 
     stage("test 1: waiting for worker ready");
-    await_db_worker_ready(&[]).await.expect("db worker ready");
+    await_db_worker_ready(&[boot])
+        .await
+        .expect("db worker ready");
 
     assert!(
         logins.get() >= 1,
@@ -299,7 +279,7 @@ async fn a_declined_unlock_refuses_the_boot_and_destroys_nothing() {
     // Arm the failure detector before spawning the worker.
     let failure_rx = wait_debug_for("FAILED");
 
-    let worker = spawn_unlock_worker(&glue_url());
+    let (worker, _boot) = spawn_unlock_worker(&glue_url());
 
     // Stand-in tab handler: respond "declined" to the unlock request.
     {
