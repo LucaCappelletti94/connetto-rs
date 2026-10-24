@@ -1,8 +1,8 @@
 //! The client keepalive against scripted servers over loopback pairs. A
 //! silent upstream is noticed once the probe and answer bounds elapse and the
 //! client recovers, a busy link is never probed, a handshake that draws no
-//! answer is abandoned and redialed, and the probe still goes out while the
-//! away gate is locked.
+//! answer is abandoned and redialed, the probe still goes out while the away
+//! gate is locked, and pump steps without a frame keep the one armed sleep.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -227,6 +227,51 @@ async fn a_silent_upstream_is_dropped_and_the_client_recovers() {
         |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected)),
     )
     .await;
+}
+
+/// Pump steps that take no frame keep the keepalive sleep already armed, so
+/// the app's sleeper is not asked for a fresh timer on every step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steps_without_a_frame_keep_the_armed_keepalive_sleep() {
+    let sleeps = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&sleeps);
+    let dialer = Scripted {
+        quiet: Arc::new(AtomicBool::new(false)),
+        pings: Arc::new(AtomicU32::new(0)),
+    };
+    // The default probe bound outlasts the test, so no probe or pong moves
+    // the deadline while the steps run.
+    let (running, pump) = ClientBuilder::new(super::support::bundle(DDL), dialer)
+        .with_reconnect(ReconnectPolicy::default())
+        .with_sleeper(move |d| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(d)
+        })
+        .connect_with_pump()
+        .await
+        .expect("the first dial hands back a transport");
+    let client = running.client().clone();
+    let mut events = client.events();
+    tokio::spawn(pump);
+    next_event(
+        &mut events,
+        std::time::Instant::now() + BOUND,
+        "the connection never stood",
+        |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected)),
+    )
+    .await;
+    // A first step arms the deadline the handshake ack set.
+    client.with_conn(|_| ()).await.expect("the client serves");
+    let armed = sleeps.load(Ordering::Acquire);
+    // Every lock waiter wakes the pump into a step that takes no frame.
+    for _ in 0..50 {
+        client.with_conn(|_| ()).await.expect("the client serves");
+    }
+    let rearmed = sleeps.load(Ordering::Acquire) - armed;
+    assert!(
+        rearmed <= 1,
+        "50 frameless steps asked the sleeper for {rearmed} fresh timers"
+    );
 }
 
 /// Frames faster than the probe bound reset the clock, so a busy link never

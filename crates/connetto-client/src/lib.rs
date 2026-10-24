@@ -1490,11 +1490,14 @@ enum KeepalivePhase {
 
 /// One armed keepalive deadline, for whoever drives the pump to sleep on
 /// before calling [`ConnettoConnection::keepalive_fire`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Two timers are equal when they stand for the same armed deadline, so a
+/// pump keeps the sleep it holds until a frame or a probe re-arms it.
+#[derive(Debug, Clone, Copy)]
 pub struct KeepaliveTimer {
     /// How many deadlines were armed when this one stood.
     armed: u64,
-    /// The wait the deadline was set for.
+    /// The wait left on the deadline when the timer was read.
     wait: Duration,
 }
 
@@ -1505,6 +1508,14 @@ impl KeepaliveTimer {
         self.wait
     }
 }
+
+impl PartialEq for KeepaliveTimer {
+    fn eq(&self, other: &Self) -> bool {
+        self.armed == other.armed
+    }
+}
+
+impl Eq for KeepaliveTimer {}
 
 /// Computed declarations awaiting a correlated server-processing fence.
 #[derive(Debug, Clone)]
