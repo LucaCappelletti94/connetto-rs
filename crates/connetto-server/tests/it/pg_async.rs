@@ -792,6 +792,21 @@ async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
         Some(at[2]),
         "the window's ends are whole positions, ordinal included"
     );
+    assert_eq!(
+        positions(oplog.entries_page(at[0], at[2], 10).await.expect("page")),
+        vec![at[1], at[2]],
+        "a page starts after its first position, the rest of that transaction included"
+    );
+    assert_eq!(
+        positions(oplog.entries_page(at[0], at[2], 1).await.expect("page")),
+        vec![at[1]],
+        "a page holds at most its limit"
+    );
+    assert_eq!(
+        positions(oplog.entries_page(at[0], at[1], 10).await.expect("page")),
+        vec![at[1]],
+        "a page stops at its last position"
+    );
     oplog.forget_through(at[0]).await.expect("forget");
     assert_eq!(
         positions(

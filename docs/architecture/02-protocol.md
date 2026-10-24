@@ -180,6 +180,8 @@ The client maintains a **receive credit** budget. On connect, the server is gran
 
 The server pauses bulk delivery when credits reach zero and resumes when credits are replenished.
 
+During catch-up, `SessionConfig::with_catchup_input_budget` limits held peer input to 64 KiB by default, measured as tagged `MessagePack` encoded bytes without an encoded copy. Overflow ends only that connection through the protocol-error path, including when one otherwise-valid frame exceeds the holding budget. The bound excludes decoded-object overhead and transport buffers, and it is independent of bulk delivery credits.
+
 **Not rationed and not ordered are separate properties, and the queue carries both. Decided (R33).** `SnapshotEnd` is the one control frame that waits in the queue: it describes rows the client has not received, so releasing it early is a statement the client would act on wrongly. Everything else on the control plane bypasses the queue entirely.
 
 This is a simple stop-and-wait variant. A sliding-window variant may be needed for high-throughput scenarios.

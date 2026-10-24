@@ -18,6 +18,13 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
+#[cfg(test)]
+mod cursor_lock_tests;
+
+mod input;
+
+use input::HeldInput;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -61,7 +68,7 @@ use subql::{
     AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
     PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, Seen, SourceItem, SubscriptionId, TableLike,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -554,6 +561,8 @@ pub struct SessionConfig {
     schema_version: Option<SchemaVersion>,
     /// The total time one connection may wait on reconnect-log reads that failed transiently while resuming.
     resume_read_budget: Duration,
+    /// Tagged encoded bytes of peer input a catch-up may hold before ending its connection.
+    catchup_input_budget: usize,
     /// How long one mutation may keep retrying an apply the database failed transiently before it is answered `Indeterminate`.
     write_retry_budget: Duration,
     /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
@@ -568,6 +577,7 @@ impl Default for SessionConfig {
             initial_credits: 64,
             schema_version: None,
             resume_read_budget: Duration::from_secs(30),
+            catchup_input_budget: 64 * 1024,
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
             #[cfg(feature = "test-seams")]
@@ -601,6 +611,13 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_resume_read_budget(mut self, budget: Duration) -> Self {
         self.resume_read_budget = budget;
+        self
+    }
+
+    /// Sets the held-input byte budget during catch-up, whose overflow ends that connection.
+    #[must_use]
+    pub const fn with_catchup_input_budget(mut self, bytes: usize) -> Self {
+        self.catchup_input_budget = bytes;
         self
     }
 
@@ -894,6 +911,9 @@ pub enum SessionError {
         /// What the authorization path reported.
         reason: String,
     },
+    /// A catch-up walk shared with other resuming subscriptions failed for every subscription it served, so the detail is the walk's rather than this connection's.
+    #[error("catch-up failed: {0}")]
+    CatchupFailed(String),
 }
 
 /// Whether an authorization failure can clear by itself, which decides between holding an event and ending the change stream.
@@ -1613,6 +1633,9 @@ struct MissedReplay {
 struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
+    input: HeldInput,
+    outbound_rx: mpsc::UnboundedReceiver<Outbound>,
+    held_outbound: VecDeque<Outbound>,
     /// Row subscriptions by client label, each keeping the request that made it
     /// so the server can re-read the same set without asking the client again
     /// (R7).
@@ -1677,6 +1700,208 @@ struct ComputedSub {
     rebinds: bool,
 }
 
+/// How many log records a catch-up walk reads at once.
+const CATCHUP_PAGE: usize = 1_000;
+
+/// How many records a catch-up walk matches per hold of the materializer lock, so live dispatch waits at most one chunk behind it.
+const CATCHUP_MATCH_CHUNK: usize = 64;
+
+/// One resuming row subscription, waiting for the catch-up walk that serves it.
+struct Enrollment<Id, Key> {
+    consumer_id: u64,
+    /// The position the subscription resumes after.
+    from: PgCommitPosition,
+    /// The fence of the snapshot that issued the cursor, when one did.
+    fence: Option<Arc<ReadFence>>,
+    /// The log's position just after the route stood, past which the live path delivers.
+    ceiling: Option<PgCommitPosition>,
+    principal: Arc<Principal<Id, Key>>,
+    /// Where this subscription's deliveries go, drained by its own session under credits.
+    deliveries: mpsc::UnboundedSender<WaveMsg>,
+}
+
+/// What a catch-up walk sends one subscription.
+enum WaveMsg {
+    /// A record to deliver, as the bytes the subscription receives.
+    Patch {
+        position: PgCommitPosition,
+        payload: Vec<u8>,
+    },
+    /// The authorization service stopped answering while a record was asked about.
+    Paused,
+    /// It answered again.
+    Resumed,
+    /// The walk is over for this subscription.
+    End(WaveEnd),
+}
+
+/// How a catch-up walk ended for one subscription.
+enum WaveEnd {
+    /// Every record it missed was sent.
+    Done,
+    /// The subscription has to be replaced instead.
+    Resync(FullResyncReason),
+    /// The walk failed for it, ending its session.
+    Failed(SessionError),
+}
+
+enum CatchupWait<R> {
+    Ready(R),
+    Closed(Option<FatalError>),
+}
+
+/// Serializes catch-up waves independently of their member sessions.
+struct CatchupWalker<Id, Key> {
+    state: parking_lot::Mutex<WalkerState<Id, Key>>,
+    changed: Notify,
+}
+
+struct WalkerState<Id, Key> {
+    walking: bool,
+    waiting: Vec<Enrollment<Id, Key>>,
+}
+
+impl<Id, Key> CatchupWalker<Id, Key> {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(WalkerState {
+                walking: false,
+                waiting: Vec::new(),
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    fn enroll(&self, enrollment: Enrollment<Id, Key>) -> Option<Vec<Enrollment<Id, Key>>> {
+        let mut state = self.state.lock();
+        state.waiting.push(enrollment);
+        if state.walking {
+            return None;
+        }
+        state.walking = true;
+        Some(std::mem::take(&mut state.waiting))
+    }
+}
+
+/// Releases pending members if their worker unwinds or is canceled.
+struct CatchupGuard<Id, Key> {
+    walker: Arc<CatchupWalker<Id, Key>>,
+    held: bool,
+}
+
+impl<Id, Key> CatchupGuard<Id, Key> {
+    fn next_wave(&mut self) -> Option<Vec<Enrollment<Id, Key>>> {
+        let mut state = self.walker.state.lock();
+        state
+            .waiting
+            .retain(|member| !member.deliveries.is_closed());
+        if state.waiting.is_empty() {
+            state.walking = false;
+            self.held = false;
+            None
+        } else {
+            Some(std::mem::take(&mut state.waiting))
+        }
+    }
+}
+
+impl<Id, Key> Drop for CatchupGuard<Id, Key> {
+    fn drop(&mut self) {
+        if self.held {
+            let mut state = self.walker.state.lock();
+            state.waiting.clear();
+            state.walking = false;
+        }
+    }
+}
+
+/// Wakes the worker when this session stops receiving catch-up deliveries.
+struct CatchupReceiver<Id, Key> {
+    received: mpsc::UnboundedReceiver<WaveMsg>,
+    walker: Arc<CatchupWalker<Id, Key>>,
+}
+
+impl<Id, Key> Drop for CatchupReceiver<Id, Key> {
+    fn drop(&mut self) {
+        self.received.close();
+        self.walker.changed.notify_one();
+    }
+}
+
+/// One member of the wave being walked.
+struct Member<Id, Key> {
+    enrollment: Enrollment<Id, Key>,
+    active: bool,
+}
+
+impl<Id, Key> Member<Id, Key> {
+    fn is_open(&self) -> bool {
+        self.active && !self.enrollment.deliveries.is_closed()
+    }
+
+    /// Whether the record at `position` is one this member missed and has not seen.
+    fn wants(&self, position: PgCommitPosition) -> bool {
+        let enrollment = &self.enrollment;
+        self.is_open()
+            && position > enrollment.from
+            && enrollment
+                .ceiling
+                .is_some_and(|ceiling| position <= ceiling)
+            && enrollment
+                .fence
+                .as_ref()
+                .is_none_or(|fence| fence.seen(position) != Seen::Held)
+    }
+
+    /// Whether the record at `position` is one this member's snapshot missed below its cursor.
+    fn wants_missed(&self, position: PgCommitPosition) -> bool {
+        let enrollment = &self.enrollment;
+        self.is_open()
+            && position <= enrollment.from
+            && enrollment
+                .ceiling
+                .is_some_and(|ceiling| position <= ceiling)
+            && enrollment
+                .fence
+                .as_ref()
+                .is_some_and(|fence| fence.seen(position) == Seen::Missed)
+    }
+
+    /// Send `msg`, and stop serving a member whose session is gone.
+    fn send(&mut self, msg: WaveMsg) {
+        if self.active && self.enrollment.deliveries.send(msg).is_err() {
+            self.active = false;
+        }
+    }
+
+    /// End the walk for this member, so its session goes on without waiting for the rest of the wave.
+    fn end(&mut self, outcome: WaveEnd) {
+        if self.active {
+            let _ = self.enrollment.deliveries.send(WaveMsg::End(outcome));
+            self.active = false;
+        }
+    }
+}
+
+/// A catch-up walk that failed for every member still served, each already told why.
+struct WaveFailed;
+
+/// End the walk with `err` for every member still served.
+fn fail_wave<Id, Key>(members: &mut [Member<Id, Key>], err: &SessionError) -> WaveFailed {
+    for member in members.iter_mut() {
+        // Each member's session ends with its own copy, keeping the variants a caller tells apart.
+        let own = match err {
+            SessionError::Oplog(detail) => SessionError::Oplog(detail.clone()),
+            SessionError::ChangeStreamUnusable(table) => {
+                SessionError::ChangeStreamUnusable(table.clone())
+            }
+            other => SessionError::CatchupFailed(other.to_string()),
+        };
+        member.end(WaveEnd::Failed(own));
+    }
+    WaveFailed
+}
+
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
 /// write path against a visibility policy, the Postgres write target, and a
 /// re-execution connector for aggregate subscriptions.
@@ -1727,6 +1952,8 @@ pub struct SessionManager<
     target: PgWriteTarget<D>,
     next_session: AtomicU64,
     next_consumer: AtomicU64,
+    /// The one catch-up walk every resuming row subscription shares.
+    catchup: Arc<CatchupWalker<Id, Key>>,
     config: SessionConfig,
     /// Every counter connetto keeps about a caller, shared with the auth
     /// service so the four abuse signals are defined once each.
@@ -1862,6 +2089,7 @@ where
         target,
         next_session: AtomicU64::new(1),
         next_consumer: AtomicU64::new(1),
+        catchup: Arc::new(CatchupWalker::new()),
         config,
         guard,
         auth_retry: RetryPolicy::new(),
@@ -2110,6 +2338,7 @@ where
     /// its registration instead of registering into the drained registry.
     pub async fn shutdown(&self) -> usize {
         self.shutting_down.store(true, Ordering::Release);
+        self.catchup.changed.notify_one();
         self.close_all(FatalErrorReason::ServerShuttingDown).await
     }
 
@@ -4114,10 +4343,14 @@ where
     ///
     /// [`SessionError`] on a transport failure, a protocol violation, a
     /// snapshot failure, or a materializer error.
-    pub async fn serve<T: Transport>(
-        self: Arc<Self>,
-        mut transport: T,
-    ) -> Result<(), SessionError> {
+    pub async fn serve<T: Transport>(self: Arc<Self>, mut transport: T) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let _tally = OpenSessionTally::start(self.open_sessions.clone());
         let Some((handshake, nonce)) = self.registration_gate(&mut transport).await? else {
             return Ok(());
@@ -4134,7 +4367,14 @@ where
         self: Arc<Self>,
         mut transport: T,
         outcome: HandshakeOutcome<Id, Key>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let HandshakeOutcome {
             connection_num,
             principal,
@@ -4145,7 +4385,7 @@ where
             refused_grants,
             span: _,
             outbound_tx,
-            mut outbound_rx,
+            outbound_rx,
             key_expiry,
             cursor_subjects,
         } = outcome;
@@ -4162,6 +4402,9 @@ where
         let mut state = SessionState {
             credits: self.config.initial_credits,
             pending: VecDeque::new(),
+            input: HeldInput::default(),
+            outbound_rx,
+            held_outbound: VecDeque::new(),
             subs: HashMap::new(),
             paging: VecDeque::new(),
             reader_reservation: ReaderReservation::default(),
@@ -4205,7 +4448,7 @@ where
             // frame already sent (R58 decision 9).
             // Moving either arm onto its own task breaks that silently.
             tokio::select! {
-                incoming = transport.recv() => {
+                incoming = state.input.recv(&mut transport) => {
                     let handled = match incoming.map_err(transport_err) {
                         Err(err) => Err(err),
                         Ok(None) => break Ok(()),
@@ -4223,7 +4466,12 @@ where
                         break Err(err);
                     }
                 }
-                outbound = outbound_rx.recv() => {
+                outbound = async {
+                    match state.held_outbound.pop_front() {
+                        Some(outbound) => Some(outbound),
+                        None => state.outbound_rx.recv().await,
+                    }
+                } => {
                     let Some(outbound) = outbound else { break Ok(()) };
                     match self.handle_outbound(&mut transport, outbound, &mut state).await {
                         Ok(true) => {}
@@ -4237,18 +4485,7 @@ where
 
         // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
-        // A session that was bound to a device writer leaves the writer's live
-        // set, so a later retirement does not try to close it again (R75).
-        if let Some(row) = state
-            .writer_row
-            .as_ref()
-            .filter(|row| row.device_key.is_some())
-        {
-            let mut live = self.writer_sessions.lock().await;
-            if let Some(set) = live.get_mut(&row.writer) {
-                set.remove(&session_id);
-            }
-        }
+        self.unregister_writer_session(&state).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
         self.guard.forget_connection(session_id);
@@ -4256,6 +4493,19 @@ where
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
         ended
+    }
+
+    async fn unregister_writer_session(&self, state: &SessionState<Id, Key>) {
+        if let Some(row) = state
+            .writer_row
+            .as_ref()
+            .filter(|row| row.device_key.is_some())
+        {
+            let mut live = self.writer_sessions.lock().await;
+            if let Some(set) = live.get_mut(&row.writer) {
+                set.remove(&state.session_id);
+            }
+        }
     }
 
     /// Deliver one item the dispatch side produced for this session, answering
@@ -4922,11 +5172,18 @@ where
     }
 
     async fn handle_control<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         msg: ControlMessage,
         state: &mut SessionState<Id, Key>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
@@ -6752,11 +7009,18 @@ where
     }
 
     async fn handle_subscribe<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let tier = Tier::of(&state.principal);
         // The reader-share permit (R39) comes first and the allowance second,
         // so a subscribe the share defers has spent nothing and its retry is
@@ -6848,14 +7112,21 @@ where
     /// pre-charge for the membership subscription a term needs, the snapshot
     /// or catchup, and the membership open behind it.
     async fn serve_term_row<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         tier: Tier,
         reg: RowRegistration,
         reader_permit: ReaderPermit,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let sub_label = sub.sub_id.clone();
         let (consumer_id, sub_id) = (reg.consumer_id, reg.sub_id);
         // R27 decisions 4 and 7: the membership subscription this term needs
@@ -6908,6 +7179,9 @@ where
                 // subscription the term needs, after the term's own frames so
                 // the announce precedes the hidden subscription's snapshot.
                 for member in members.iter() {
+                    if state.closing {
+                        break;
+                    }
                     match self
                         .open_membership_subscription(
                             transport,
@@ -6942,14 +7216,21 @@ where
     /// data rather than here, so a failing read reads like any other refusal
     /// and costs the client nothing.
     async fn subscribe_row<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: RowRegistration,
         tier: Tier,
         permit: Option<ReaderPermit>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let resync = match state.resume.clone() {
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
@@ -7009,13 +7290,20 @@ where
     /// two reads are one operation and a second slot could be refused while the
     /// term's still paging read holds the first.
     async fn open_membership_subscription<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         tier: Tier,
         member: &MemberTable,
         permit: ReaderPermit,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         let label = membership_label(&member.table);
         if state.subs.contains_key(&label) {
             return Ok(());
@@ -7685,161 +7973,632 @@ where
             .map_err(transport_err)
     }
 
-    /// Catch a resuming row subscription up from the oplog.
-    ///
-    /// Registers the route first, so live events for positions past the watermark
-    /// queue behind the catchup (the run loop is blocked here until this
-    /// returns, so nothing is delivered meanwhile), then replays each retained
-    /// entry the subscription matches as a `LivePatch` carrying that entry's
-    /// cursor, in the live-path format. Entries past the pre-catchup watermark
-    /// are skipped because the live path will deliver them, so replay and live
-    /// hold locally. The two-check form runs per client, so a row this caller may
-    /// no longer see replays as the plain delete that takes it back, and a
-    /// deleted row this caller could never see replays as nothing at all (R6).
+    /// Drain this subscription's shared catch-up deliveries under its own credits.
     async fn catch_up_row<T: Transport>(
-        &self,
+        self: &Arc<Self>,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
         from: PgCommitPosition,
         fence: Option<Arc<ReadFence>>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), SessionError>
+    where
+        Snap: 'static,
+        Auth: 'static,
+        C: 'static,
+        O: 'static,
+        S: Send + Sync + 'static,
+    {
         self.attach_row_route(&sub, state, reg, fence.clone()).await;
-
-        // Watermark just after the route exists. An entry at or below it was
-        // appended before this consumer could receive live delivery, so
-        // replaying it cannot duplicate a live patch.
         let ceiling = read_log::<O, _, _>(&mut state.resume_read_budget, || {
             self.oplog.current_position()
         })
         .await?;
-        let entries = self.catchup_entries(state, from, fence.as_deref()).await?;
-        // Retention only moves forward, so a log that still reaches the cursor now reached it when the entries were read.
-        let min = read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_position())
-            .await?;
-        if matches!(
-            catchup_decision(from, min, ceiling),
-            CatchupDecision::FullResync
-        ) {
-            return self
-                .resnapshot_row(
-                    transport,
-                    state,
-                    &sub.sub_id,
-                    &FullResyncReason::CursorOutsideRetention,
-                    None,
-                )
-                .await;
+        let (deliveries, received) = mpsc::unbounded_channel();
+        let mut received = CatchupReceiver {
+            received,
+            walker: Arc::clone(&self.catchup),
+        };
+        if let Some(wave) = self.catchup.enroll(Enrollment {
+            consumer_id: reg.consumer_id,
+            from,
+            fence,
+            ceiling,
+            principal: Arc::clone(&state.principal),
+            deliveries,
+        }) {
+            let guard = CatchupGuard {
+                walker: Arc::clone(&self.catchup),
+                held: true,
+            };
+            drop(tokio::spawn(Arc::clone(self).run_catchup(wave, guard)));
         }
-        // One watcher, this session's caller, so the buffers hold one verdict
-        // each and are reused across the whole replay.
-        let watchers = [Arc::clone(&state.principal)];
-        let mut verdicts = Transitions::new();
-        for record in entries {
-            if ceiling.is_none_or(|ceiling| record.position() > ceiling) {
-                continue;
-            }
-            let matched = {
-                self.materializer
-                    .lock()
-                    .await
-                    .replay_match(record.event(), reg.consumer_id)?
-            };
-            let Some(departing) = matched else {
-                continue;
-            };
-            // The `Some` above is what says this subscription reads the truncated
-            // table. A truncate replays as a patchset with no operations, so
-            // applying it would leave the emptied table populated exactly as the
-            // live path used to (R48). Everything after it arrives again in the
-            // replacement snapshot, so the rest of this replay is abandoned
-            // rather than sent and then undone.
-            if record.event().kind() == EventKind::Truncate {
-                let reason = FullResyncReason::TableTruncated {
-                    table: self.event_table(record.event()),
-                };
-                return self
-                    .resnapshot_row(transport, state, &sub.sub_id, &reason, None)
-                    .await;
-            }
-            let Some(payload) = self
-                .replay_payload(transport, &record, departing, &watchers, &mut verdicts)
-                .await?
-            else {
-                continue;
-            };
-            let cursor = self.stamp(record.position());
-            let advanced = {
-                self.materializer.lock().await.advance_cursor(
-                    state.session_id.as_u64_key(),
-                    reg.sub_id,
-                    &cursor,
-                )
-            };
-            match advanced {
-                Ok(()) => {}
-                // A live change dispatched since the route went up already moved the cursor past this entry, and its patch queues behind the replay.
-                Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
-                    tracing::debug!(sub_id = %sub.sub_id, position = ?record.position(), "a live change already moved the cursor past this replayed entry");
+        let end = self
+            .drain_catchup(transport, state, reg, &sub.sub_id, &mut received)
+            .await?;
+        drop(received);
+        match end {
+            CatchupWait::Closed(fatal) => {
+                state.closing = true;
+                if let Some(fatal) = fatal {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(fatal))
+                        .await;
                 }
-                Err(err) => return Err(err.into()),
+                Ok(())
             }
-            let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
-            enqueue_and_flush(
+            CatchupWait::Ready(WaveEnd::Done) => enqueue_and_flush(
                 transport,
                 &mut state.credits,
                 &mut state.pending,
-                Deliverable::Rows(BulkMessage::LivePatch(live)),
+                Deliverable::SnapshotComplete(SnapshotEnd {
+                    sub_id: sub.sub_id,
+                    cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
+                }),
             )
             .await
-            .map_err(transport_err)?;
+            .map_err(transport_err),
+            CatchupWait::Ready(WaveEnd::Resync(reason)) => {
+                self.resnapshot_row(transport, state, &sub.sub_id, &reason, None)
+                    .await
+            }
+            CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
         }
-        enqueue_and_flush(
-            transport,
-            &mut state.credits,
-            &mut state.pending,
-            Deliverable::SnapshotComplete(SnapshotEnd {
-                sub_id: sub.sub_id,
-                cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
-            }),
-        )
-        .await
-        .map_err(transport_err)
     }
 
-    /// The log's records a cursor at `from` resumes with, in commit order.
-    ///
-    /// A fenced cursor was issued by a snapshot, which misses the transactions it did not see below its read and holds some above it.
-    async fn catchup_entries(
+    /// Deliver catch-up frames while observing connection termination.
+    async fn drain_catchup<T: Transport>(
         &self,
+        transport: &mut T,
         state: &mut SessionState<Id, Key>,
-        from: PgCommitPosition,
-        fence: Option<&ReadFence>,
-    ) -> Result<Vec<ChangeRecord>, SessionError> {
-        let mut entries = match fence {
-            Some(fence) => {
-                let unseen = fence.unseen();
-                read_log::<O, _, _>(&mut state.resume_read_budget, || {
-                    self.oplog.entries_of(&unseen)
-                })
+        reg: &RowRegistration,
+        label: &str,
+        received: &mut CatchupReceiver<Id, Key>,
+    ) -> Result<CatchupWait<WaveEnd>, SessionError> {
+        let session_key = state.session_id.as_u64_key();
+        loop {
+            let msg = match self
+                .wait_catchup(transport, state, received.received.recv())
                 .await?
-                .into_iter()
-                .filter(|record| {
-                    record.position() <= from && fence.seen(record.position()) == Seen::Missed
-                })
-                .collect()
+            {
+                CatchupWait::Ready(Some(msg)) => msg,
+                CatchupWait::Ready(None) => {
+                    return Err(SessionError::CatchupFailed(
+                        "the catch-up walk stopped before it finished".to_owned(),
+                    ));
+                }
+                CatchupWait::Closed(fatal) => return Ok(CatchupWait::Closed(fatal)),
+            };
+            match msg {
+                WaveMsg::Patch { position, payload } => {
+                    let cursor = self.stamp(position);
+                    let advanced = {
+                        let mut materializer = match self
+                            .wait_catchup(transport, state, self.materializer.lock())
+                            .await?
+                        {
+                            CatchupWait::Ready(materializer) => materializer,
+                            CatchupWait::Closed(fatal) => return Ok(CatchupWait::Closed(fatal)),
+                        };
+                        materializer.advance_cursor(session_key, reg.sub_id, &cursor)
+                    };
+                    match advanced {
+                        Ok(()) => {}
+                        // Queued live delivery can already have advanced this cursor.
+                        Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic {
+                            ..
+                        })) => {
+                            tracing::debug!(sub_id = %label, ?position, "a live change already moved the cursor past this replayed entry");
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    let patch = LivePatch::new(label.to_owned(), Cursor::new(cursor), payload);
+                    enqueue_and_flush(
+                        transport,
+                        &mut state.credits,
+                        &mut state.pending,
+                        Deliverable::Rows(BulkMessage::LivePatch(patch)),
+                    )
+                    .await
+                    .map_err(transport_err)?;
+                }
+                WaveMsg::Paused => {
+                    transport
+                        .send_control(ControlMessage::DeliveryPaused {
+                            cause: PauseCause::AuthServiceUnreachable,
+                        })
+                        .await
+                        .map_err(transport_err)?;
+                }
+                WaveMsg::Resumed => {
+                    transport
+                        .send_control(ControlMessage::DeliveryResumed)
+                        .await
+                        .map_err(transport_err)?;
+                }
+                WaveMsg::End(end) => return Ok(CatchupWait::Ready(end)),
             }
-            None => Vec::new(),
+        }
+    }
+
+    /// Hold ordinary frames while one catch-up operation remains pending.
+    async fn wait_catchup<T: Transport, R>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        work: impl Future<Output = R>,
+    ) -> Result<CatchupWait<R>, SessionError> {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                result = &mut work => {
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return Ok(CatchupWait::Closed(Some(FatalError::new(
+                            FatalErrorReason::ServerShuttingDown,
+                        ))));
+                    }
+                    return Ok(CatchupWait::Ready(result));
+                },
+                incoming = transport.recv() => match incoming.map_err(transport_err)? {
+                    Some(frame) => state.input.push(frame, self.config.catchup_input_budget)?,
+                    None => return Ok(CatchupWait::Closed(None)),
+                },
+                outbound = state.outbound_rx.recv() => match outbound {
+                    Some(Outbound::Fatal(fatal)) => return Ok(CatchupWait::Closed(Some(fatal))),
+                    Some(Outbound::Drop) | None => return Ok(CatchupWait::Closed(None)),
+                    Some(outbound) => state.held_outbound.push_back(outbound),
+                },
+            }
+        }
+    }
+
+    /// Own every wave until no live enrollment remains.
+    async fn run_catchup(
+        self: Arc<Self>,
+        mut wave: Vec<Enrollment<Id, Key>>,
+        mut guard: CatchupGuard<Id, Key>,
+    ) {
+        loop {
+            let mut members: Vec<Member<Id, Key>> = wave
+                .into_iter()
+                .filter(|enrollment| !enrollment.deliveries.is_closed())
+                .map(|enrollment| Member {
+                    enrollment,
+                    active: true,
+                })
+                .collect();
+            if self.walk_log(&mut members).await.is_ok() {
+                for member in &mut members {
+                    member.end(WaveEnd::Done);
+                }
+            }
+            drop(members);
+            let Some(next) = guard.next_wave() else {
+                return;
+            };
+            wave = next;
+        }
+    }
+
+    /// Cancel worker work when its recipients depart or shutdown begins.
+    async fn catchup_work<R>(
+        &self,
+        canceled: impl Fn() -> bool,
+        work: impl Future<Output = R>,
+    ) -> Option<R> {
+        let changed = async {
+            loop {
+                let notified = self.catchup.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.shutting_down.load(Ordering::Acquire) || canceled() {
+                    return;
+                }
+                notified.await;
+            }
         };
-        let since = read_log::<O, _, _>(&mut state.resume_read_budget, || {
-            self.oplog.entries_since(from)
-        })
-        .await?;
-        entries.extend(since.into_iter().filter(|record| {
-            fence.is_none_or(|fence| fence.seen(record.position()) != Seen::Held)
-        }));
-        Ok(entries)
+        tokio::select! {
+            biased;
+            () = changed => None,
+            result = work => Some(result),
+        }
+    }
+
+    /// Serve every member of one wave from one read of the log: the records
+    /// each fenced member's snapshot missed, then the gap from the lowest
+    /// cursor to the highest watermark a page at a time.
+    ///
+    async fn walk_log(&self, members: &mut [Member<Id, Key>]) -> Result<(), WaveFailed> {
+        let mut budget = self.config.resume_read_budget;
+        let index: HashMap<u64, usize> = members
+            .iter()
+            .enumerate()
+            .map(|(at, member)| (member.enrollment.consumer_id, at))
+            .collect();
+        let consumers: HashSet<u64> = index.keys().copied().collect();
+
+        let mut missed = self.catchup_missed(members, &mut budget).await?;
+
+        let upto = members
+            .iter()
+            .filter_map(|member| member.enrollment.ceiling)
+            .max();
+        let mut after = members.iter().map(|member| member.enrollment.from).min();
+        let mut first = true;
+        loop {
+            let page = match (after, upto) {
+                (Some(after), Some(upto)) if after < upto => {
+                    let Some(result) = self
+                        .catchup_work(
+                            || members.iter().all(|member| !member.is_open()),
+                            read_log::<O, _, _>(&mut budget, || {
+                                self.oplog.entries_page(after, upto, CATCHUP_PAGE)
+                            }),
+                        )
+                        .await
+                    else {
+                        return Ok(());
+                    };
+                    match result {
+                        Ok(page) => page,
+                        Err(err) => return Err(fail_wave(members, &err)),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let Some(result) = self
+                .catchup_work(
+                    || members.iter().all(|member| !member.is_open()),
+                    read_log::<O, _, _>(&mut budget, || self.oplog.min_position()),
+                )
+                .await
+            else {
+                return Ok(());
+            };
+            let min = match result {
+                Ok(min) => min,
+                Err(err) => return Err(fail_wave(members, &err)),
+            };
+            // Retention only moves forward, so a log whose oldest record is past where this page began may have dropped records the page needed before it was read.
+            for member in members.iter_mut().filter(|member| member.is_open()) {
+                let enrollment = &member.enrollment;
+                let lost = if first {
+                    matches!(
+                        catchup_decision(enrollment.from, min, enrollment.ceiling),
+                        CatchupDecision::FullResync
+                    )
+                } else {
+                    let read_from =
+                        after.map_or(enrollment.from, |after| after.max(enrollment.from));
+                    enrollment
+                        .ceiling
+                        .is_some_and(|ceiling| read_from < ceiling)
+                        && min.is_none_or(|min| read_from < min)
+                };
+                if lost {
+                    member.end(WaveEnd::Resync(FullResyncReason::CursorOutsideRetention));
+                }
+            }
+            if first {
+                first = false;
+                let missed: Vec<ChangeRecord> = std::mem::take(&mut missed).into_values().collect();
+                self.walk_records(members, &index, &consumers, &missed, true)
+                    .await?;
+            }
+            let Some(last) = page.last().map(ChangeRecord::position) else {
+                return Ok(());
+            };
+            let full = page.len() == CATCHUP_PAGE;
+            self.walk_records(members, &index, &consumers, &page, false)
+                .await?;
+            if !full || members.iter().all(|member| !member.is_open()) {
+                return Ok(());
+            }
+            after = Some(last);
+        }
+    }
+
+    /// Read and deduplicate the transactions each live member's snapshot missed.
+    async fn catchup_missed(
+        &self,
+        members: &mut [Member<Id, Key>],
+        budget: &mut Duration,
+    ) -> Result<BTreeMap<PgCommitPosition, ChangeRecord>, WaveFailed> {
+        let mut missed = BTreeMap::new();
+        let fences: Vec<(usize, Arc<ReadFence>)> = members
+            .iter()
+            .enumerate()
+            .filter_map(|(at, member)| member.enrollment.fence.clone().map(|fence| (at, fence)))
+            .collect();
+        for (at, fence) in fences {
+            let unseen = fence.unseen();
+            let Some(result) = self
+                .catchup_work(
+                    || !members[at].is_open(),
+                    read_log::<O, _, _>(budget, || self.oplog.entries_of(&unseen)),
+                )
+                .await
+            else {
+                continue;
+            };
+            match result {
+                Ok(records) => {
+                    for record in records
+                        .into_iter()
+                        .filter(|record| members[at].wants_missed(record.position()))
+                    {
+                        missed.entry(record.position()).or_insert(record);
+                    }
+                }
+                Err(err) => return Err(fail_wave(members, &err)),
+            }
+        }
+        Ok(missed)
+    }
+
+    /// Match `records` against the wave a chunk at a time under the materializer lock, then deliver each to the members it reaches.
+    ///
+    /// `missed` selects the records a fenced snapshot missed below each member's cursor rather than the gap after it.
+    async fn walk_records(
+        &self,
+        members: &mut [Member<Id, Key>],
+        index: &HashMap<u64, usize>,
+        consumers: &HashSet<u64>,
+        records: &[ChangeRecord],
+        missed: bool,
+    ) -> Result<(), WaveFailed> {
+        for chunk in records.chunks(CATCHUP_MATCH_CHUNK) {
+            let mut reached: Vec<Vec<(usize, bool)>> = Vec::with_capacity(chunk.len());
+            {
+                let Some(mut materializer) = self
+                    .catchup_work(
+                        || members.iter().all(|member| !member.is_open()),
+                        self.materializer.lock(),
+                    )
+                    .await
+                else {
+                    return Ok(());
+                };
+                for record in chunk {
+                    let position = record.position();
+                    let matched = match materializer.replay_matches(record.event(), consumers) {
+                        Ok(matched) => matched,
+                        Err(err) => {
+                            drop(materializer);
+                            return Err(fail_wave(members, &SessionError::from(err)));
+                        }
+                    };
+                    reached.push(
+                        matched
+                            .into_iter()
+                            .filter_map(|(consumer, departing)| {
+                                let at = *index.get(&consumer)?;
+                                let member = &members[at];
+                                let wanted = if missed {
+                                    member.wants_missed(position)
+                                } else {
+                                    member.wants(position)
+                                };
+                                wanted.then_some((at, departing))
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            for (record, reached) in chunk.iter().zip(reached) {
+                self.deliver_record(members, record, reached).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask the visibility question once for every member `record` reaches and send each its payload (R6, the two-check form).
+    ///
+    /// A delivered record goes out as the patch logged with it, as R44's
+    /// marked departure notice when the row left a member's window, or as the
+    /// withdrawal that takes it back, each built at most once per record.
+    async fn deliver_record(
+        &self,
+        members: &mut [Member<Id, Key>],
+        record: &ChangeRecord,
+        mut reached: Vec<(usize, bool)>,
+    ) {
+        reached.retain(|(at, _)| members[*at].is_open());
+        if reached.is_empty() || self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let event = record.event();
+        // A truncate replays as a patchset with no operations, so applying it would leave the emptied table populated (R48), and everything after it arrives again in the replacement.
+        if event.kind() == EventKind::Truncate {
+            let table = self.event_table(event);
+            for (at, _) in reached {
+                members[at].end(WaveEnd::Resync(FullResyncReason::TableTruncated {
+                    table: table.clone(),
+                }));
+            }
+            return;
+        }
+        let mut watchers: Vec<_> = reached
+            .iter()
+            .map(|(at, _)| Arc::clone(&members[*at].enrollment.principal))
+            .collect();
+        let Some(verdicts) = self
+            .walk_verdicts(members, event, &mut reached, &mut watchers)
+            .await
+        else {
+            return;
+        };
+        let _ = self
+            .catchup_work(
+                || reached.iter().any(|(at, _)| !members[*at].is_open()),
+                self.ask_second_opinion(event, &watchers, verdicts.get()),
+            )
+            .await;
+
+        let mut notice: Option<Result<Option<Vec<u8>>, String>> = None;
+        let mut withdrawal: Option<Result<Vec<u8>, String>> = None;
+        for ((at, departing), verdict) in reached.into_iter().zip(verdicts.get().iter().copied()) {
+            if !members[at].is_open() || self.shutting_down.load(Ordering::Acquire) {
+                continue;
+            }
+            let payload = match verdict {
+                Transition::Nothing => continue,
+                Transition::Deliver if departing => {
+                    if notice.is_none() {
+                        let Some(materializer) = self
+                            .catchup_work(|| !members[at].is_open(), self.materializer.lock())
+                            .await
+                        else {
+                            continue;
+                        };
+                        let built = materializer.departure_notice(event);
+                        notice = Some(built.map_err(|err| err.to_string()));
+                    }
+                    match &notice {
+                        Some(Ok(Some(bytes))) => Ok(bytes.clone()),
+                        Some(Ok(None)) | None => Ok(record.payload().to_vec()),
+                        Some(Err(detail)) => Err(detail.clone()),
+                    }
+                }
+                Transition::Deliver => Ok(record.payload().to_vec()),
+                // A delete's own patch already is the withdrawal, so only an update pays a second fold.
+                Transition::Withdraw if event.kind() == EventKind::Delete => {
+                    Ok(record.payload().to_vec())
+                }
+                Transition::Withdraw => {
+                    if withdrawal.is_none() {
+                        let Some(materializer) = self
+                            .catchup_work(|| !members[at].is_open(), self.materializer.lock())
+                            .await
+                        else {
+                            continue;
+                        };
+                        let built = materializer.withdrawal_patch(event);
+                        withdrawal = Some(match built {
+                            Ok(Some(bytes)) => Ok(bytes),
+                            Ok(None) => Err("a replayed row has to be taken back from a caller and the event folded to no operation to take it back with".to_owned()),
+                            Err(err) => Err(err.to_string()),
+                        });
+                    }
+                    match &withdrawal {
+                        Some(Ok(bytes)) => Ok(bytes.clone()),
+                        Some(Err(detail)) => Err(detail.clone()),
+                        None => Err("the withdrawal was not built".to_owned()),
+                    }
+                }
+            };
+            match payload {
+                Ok(payload) => members[at].send(WaveMsg::Patch {
+                    position: record.position(),
+                    payload,
+                }),
+                Err(detail) => {
+                    members[at].end(WaveEnd::Failed(SessionError::CatchupFailed(detail)));
+                }
+            }
+        }
+    }
+
+    /// Retry visibility only for recipients whose sessions still receive this record.
+    async fn walk_verdicts(
+        &self,
+        members: &mut [Member<Id, Key>],
+        event: &PgChangeEvent,
+        reached: &mut Vec<(usize, bool)>,
+        watchers: &mut Vec<Arc<Principal<Id, Key>>>,
+    ) -> Option<Transitions> {
+        let mut verdicts = Transitions::new();
+        let mut attempt: u32 = 0;
+        let mut paused = false;
+        loop {
+            let mut retained = 0;
+            for at in 0..reached.len() {
+                if members[reached[at].0].is_open() {
+                    if retained != at {
+                        reached[retained] = reached[at];
+                        watchers.swap(retained, at);
+                    }
+                    retained += 1;
+                }
+            }
+            reached.truncate(retained);
+            watchers.truncate(retained);
+            if reached.is_empty() || self.shutting_down.load(Ordering::Acquire) {
+                return None;
+            }
+            let Some(result) = self
+                .catchup_work(
+                    || reached.iter().any(|(at, _)| !members[*at].is_open()),
+                    transitions(
+                        &self.auth,
+                        event,
+                        self.catalog.as_ref(),
+                        watchers,
+                        &mut verdicts,
+                    ),
+                )
+                .await
+            else {
+                continue;
+            };
+            match result {
+                Ok(()) => {
+                    if paused {
+                        for &(at, _) in reached.iter() {
+                            members[at].send(WaveMsg::Resumed);
+                        }
+                    }
+                    return Some(verdicts);
+                }
+                Err(
+                    TransitionError::IncompletePreviousImage
+                    | TransitionError::UnknownTable
+                    | TransitionError::NotARowEvent,
+                ) => {
+                    let table = self.event_table(event);
+                    for &(at, _) in reached.iter() {
+                        members[at].end(WaveEnd::Failed(SessionError::ChangeStreamUnusable(
+                            table.clone(),
+                        )));
+                    }
+                    return None;
+                }
+                Err(TransitionError::Policy(err)) if !err.clears_by_itself() => {
+                    let table = self.event_table(event);
+                    let reason = err.to_string();
+                    for &(at, _) in reached.iter() {
+                        members[at].end(WaveEnd::Failed(SessionError::AuthorizationUnanswerable {
+                            table: table.clone(),
+                            reason: reason.clone(),
+                        }));
+                    }
+                    return None;
+                }
+                Err(TransitionError::Policy(err)) => {
+                    attempt = attempt.saturating_add(1);
+                    if !paused {
+                        for &(at, _) in reached.iter() {
+                            members[at].send(WaveMsg::Paused);
+                        }
+                        paused = true;
+                    }
+                    let backoff = self.auth_retry.backoff(attempt);
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %err,
+                        "auth service unreachable during a catchup walk, retrying"
+                    );
+                    let _ = self
+                        .catchup_work(
+                            || reached.iter().any(|(at, _)| !members[*at].is_open()),
+                            tokio::time::sleep(backoff),
+                        )
+                        .await;
+                }
+            }
+        }
     }
 
     /// What one replayed record delivers to this caller, or [`None`] when it

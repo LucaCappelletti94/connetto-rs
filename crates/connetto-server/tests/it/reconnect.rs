@@ -48,6 +48,7 @@ use subql::{
     SourceItem,
 };
 
+mod failures;
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
@@ -781,8 +782,14 @@ struct Script {
     /// Every read asked for since the script was armed.
     reads: Vec<&'static str>,
     armed: bool,
-    /// Holds the next entries read until the test releases it, telling the test it arrived.
-    hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// Blocks entries reads in queue order, pruning through the optional position before each hold.
+    holds: std::collections::VecDeque<(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Option<PgCommitPosition>,
+    )>,
+    current_reads: std::collections::HashMap<tokio::task::Id, usize>,
+    panic_next_page: bool,
 }
 
 /// An in-memory reconnect log that refuses scripted reads, as a database does while it is cut off.
@@ -816,6 +823,11 @@ impl ScriptedOplog {
                 return Ok(());
             }
             script.reads.push(read);
+            if read == "current_position"
+                && let Some(task) = tokio::task::try_id()
+            {
+                *script.current_reads.entry(task).or_default() += 1;
+            }
             if script.refuse.front() == Some(&read) {
                 script.refuse.pop_front();
                 (
@@ -853,11 +865,24 @@ impl Oplog for ScriptedOplog {
     }
 
     async fn entries_since(&self, after: PgCommitPosition) -> Result<Vec<ChangeRecord>, Refused> {
-        let hold = self.script.lock().expect("script").hold.take();
-        if let Some((arrived, release)) = hold {
+        let hold = self.script.lock().expect("script").holds.pop_front();
+        if let Some((arrived, release, prune)) = hold {
+            if let Some(through) = prune {
+                self.inner
+                    .forget_through(through)
+                    .await
+                    .unwrap_or_else(|never| match never {});
+            }
             arrived.notify_one();
-            release.notified().await;
+            tokio::time::timeout(Duration::from_secs(15), release.notified())
+                .await
+                .expect("held page released before deadline");
         }
+        let panic = {
+            let mut script = self.script.lock().expect("script");
+            std::mem::take(&mut script.panic_next_page)
+        };
+        assert!(!panic, "scripted catch-up walker panic");
         self.gate("entries_since").await?;
         self.inner
             .entries_since(after)
@@ -911,11 +936,20 @@ impl Oplog for ScriptedOplog {
     }
 }
 
-type ScriptedManager =
-    SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults, NoConnector, ScriptedOplog>;
+type ScriptedManager<A = RosterAuth> =
+    SessionManager<SeedSnapshot, A, ConnettoDefaults, NoConnector, ScriptedOplog>;
 
 /// Open a session on the scripted manager, printing the error it ends with, and read the ack.
 async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> LoopbackTransport {
+    open_scripted_as(manager, "client-a", resume).await
+}
+
+/// [`open_scripted`] as the caller `name`.
+async fn open_scripted_as(
+    manager: &Arc<ScriptedManager>,
+    name: &str,
+    resume: Cursor,
+) -> LoopbackTransport {
     let (server_transport, mut client) = loopback();
     let server = Arc::clone(manager);
     tokio::spawn(async move {
@@ -923,10 +957,8 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
             eprintln!("session ended with an error: {err}");
         }
     });
-    let handshake = Handshake::new(PROTOCOL_VERSION, "client-a")
-        .with_grant(connetto_core::messages::Grant::new(
-            "user:client-a".to_owned(),
-        ))
+    let handshake = Handshake::new(PROTOCOL_VERSION, name)
+        .with_grant(connetto_core::messages::Grant::new(format!("user:{name}")))
         .with_cursor(resume)
         .with_cursor_subjects(core::iter::empty::<&str>());
     client
@@ -953,16 +985,56 @@ async fn scripted(
     Vec<PgChangeEvent>,
     PgSqliteEmuSource,
 ) {
+    scripted_for(fixture, config, &["client-a"]).await
+}
+
+/// [`scripted`] granting every caller in `names`.
+async fn scripted_for(
+    fixture: &Fixture,
+    config: SessionConfig,
+    names: &[&str],
+) -> (
+    Arc<ScriptedManager>,
+    Arc<std::sync::Mutex<Script>>,
+    Vec<PgChangeEvent>,
+    PgSqliteEmuSource,
+) {
+    let roster = names[1..]
+        .iter()
+        .fold(RosterAuth::granting(names[0]), |roster, name| {
+            roster.and(*name)
+        });
+    scripted_with_auth(fixture, config, roster, PG_DDL).await
+}
+
+async fn scripted_with_auth<A>(
+    fixture: &Fixture,
+    config: SessionConfig,
+    auth: A,
+    ddl: &str,
+) -> (
+    Arc<ScriptedManager<A>>,
+    Arc<std::sync::Mutex<Script>>,
+    Vec<PgChangeEvent>,
+    PgSqliteEmuSource,
+)
+where
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::Principal>, Backend = Postgres>
+        + Send
+        + Sync
+        + 'static,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
+{
     let script = Arc::new(std::sync::Mutex::new(Script::default()));
     let manager = ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(ddl)
             .build()
             .expect("build materializer"),
         SeedSnapshot,
-        RosterAuth::granting("client-a"),
+        auth,
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), ddl)
             .expect("build write target"),
     )
     .with_oplog(ScriptedOplog {
@@ -971,7 +1043,7 @@ async fn scripted(
     })
     .with_session(config)
     .build();
-    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut source = PgSqliteEmuSource::open_in_memory(ddl).expect("open emu source");
     let mut events = Vec::new();
     for id in 1..=3 {
         let sql = format!(
@@ -1140,7 +1212,11 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
     );
-    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
     subscribe(&mut client).await;
 
     // The route stands and the ceiling is read by the time the replay asks for its entries.
@@ -1168,6 +1244,118 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
     };
     assert_eq!(patch.cursor, cursor_of(&live[0]));
     expect_idle(&mut client).await;
+}
+
+async fn expect_catchup_end<T: Transport>(client: &mut T, sub_id: &str) {
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(end.sub_id, sub_id);
+}
+
+/// Read the live patches `client` receives for `expected`, in order.
+async fn expect_patches(client: &mut LoopbackTransport, expected: &[PgChangeEvent]) {
+    for event in expected {
+        let BulkMessage::LivePatch(patch) = next_bulk(client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(patch.cursor, cursor_of(event));
+    }
+    expect_catchup_end(client, "orders").await;
+    expect_idle(client).await;
+}
+
+/// Resumes that arrive while a catchup walks the log wait for that walk to end and then share one walk of the log, each receiving exactly what it missed, and one of them closing meanwhile leaves the others served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resumes_arriving_during_a_walk_share_the_next_one() {
+    let fixture = Fixture::acquire().await;
+    let names = ["client-a", "client-b", "client-c", "client-d"];
+    let (manager, script, events, _source) =
+        scripted_for(&fixture, SessionConfig::default(), &names).await;
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    arm(&script, &[], true, None);
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
+
+    let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[0])).await;
+    subscribe(&mut a).await;
+    failures::page_arrived(&arrived).await;
+
+    let mut b = failures::wave_client(&manager, &script, "client-b", cursor_of(&events[0])).await;
+    b.subscribe(QUERY).await;
+    let mut c = failures::wave_client(&manager, &script, "client-c", cursor_of(&events[1])).await;
+    c.subscribe(QUERY).await;
+    let mut d = failures::wave_client(&manager, &script, "client-d", cursor_of(&events[0])).await;
+    d.subscribe(QUERY).await;
+    d.close().await;
+    release.notify_one();
+
+    expect_patches(&mut a, &events[1..]).await;
+    expect_patches(&mut b.transport, &events[1..]).await;
+    expect_patches(&mut c.transport, &events[2..]).await;
+    let walks = {
+        let script = script.lock().expect("script");
+        script
+            .reads
+            .iter()
+            .filter(|read| **read == "entries_since")
+            .count()
+    };
+    assert_eq!(
+        walks, 2,
+        "the first resume's walk, then one walk shared by the three that arrived during it"
+    );
+}
+
+/// Retention passing one resume's cursor while it waits for a walk replaces that subscription alone, and the resume sharing its walk still catches up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_walk_resyncs_only_the_resume_retention_passed() {
+    let fixture = Fixture::acquire().await;
+    let names = ["client-a", "client-b", "client-c"];
+    let (manager, script, mut events, mut source) =
+        scripted_for(&fixture, SessionConfig::default(), &names).await;
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "INSERT INTO orders (id, price, quantity, status) VALUES (4, 1.0, 4, 'row')",
+        )
+        .await,
+    );
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    // The held walk's read is refused once, and the log is pruned through the second change meanwhile.
+    let second = events[1].checkpoint().expect("a checkpoint");
+    arm(&script, &["entries_since"], true, Some(second));
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
+
+    let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[2])).await;
+    subscribe(&mut a).await;
+    failures::page_arrived(&arrived).await;
+    let mut b = failures::wave_client(&manager, &script, "client-b", cursor_of(&events[0])).await;
+    b.subscribe(QUERY).await;
+    let mut c = failures::wave_client(&manager, &script, "client-c", cursor_of(&events[2])).await;
+    c.subscribe(QUERY).await;
+    release.notify_one();
+
+    expect_patches(&mut a, &events[3..]).await;
+    let ControlMessage::FullResyncRequired(resync) = next_control(&mut b.transport).await else {
+        panic!("expected the resume whose changes were pruned to be replaced");
+    };
+    assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
+    expect_patches(&mut c.transport, &events[3..]).await;
 }
 
 /// Its own log table, shared by the manager before the restart and the one after it.

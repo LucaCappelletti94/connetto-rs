@@ -253,14 +253,10 @@ impl FromSql<ChangeOpSql, Pg> for ChangeOp {
     }
 }
 
-/// A retention-bounded, commit-ordered log of [`ChangeRecord`]s.
-///
-/// The seam the session layer appends to on every dispatched event and reads
-/// from on reconnect. Shaped like [`SnapshotSource`](crate::session::SnapshotSource):
-/// async, `Send + Sync`, one associated error.
+/// A retention-bounded, commit-ordered log whose catch-up read futures are `Send`.
 #[expect(
     async_fn_in_trait,
-    reason = "the futures are bound by MaybeSend, which is Send on native, so the auto trait warning does not apply"
+    reason = "only reads used by the shared catch-up worker require `Send` futures"
 )]
 pub trait Oplog: Send + Sync {
     /// Oplog-source error.
@@ -290,24 +286,53 @@ pub trait Oplog: Send + Sync {
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn entries_since(
+    fn entries_since(
         &self,
         after: PgCommitPosition,
-    ) -> Result<Vec<ChangeRecord>, Self::Error>;
+    ) -> impl Future<Output = Result<Vec<ChangeRecord>, Self::Error>> + Send;
+
+    /// At most `limit` records strictly after `after` and at or below `upto`, in commit order.
+    ///
+    /// The catch-up walk reads the gap a page at a time, so a wave holds one
+    /// page in memory rather than the whole gap. The default serves the page
+    /// from [`entries_since`](Self::entries_since), and a backend that can
+    /// bound the read itself overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    fn entries_page(
+        &self,
+        after: PgCommitPosition,
+        upto: PgCommitPosition,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<ChangeRecord>, Self::Error>> + Send {
+        async move {
+            let mut records = self.entries_since(after).await?;
+            records.retain(|record| record.position() <= upto);
+            records.truncate(limit);
+            Ok(records)
+        }
+    }
 
     /// Records of the transactions `unseen` names, in commit order, for the changes a snapshot missed.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, Self::Error>;
+    fn entries_of(
+        &self,
+        unseen: &Unseen,
+    ) -> impl Future<Output = Result<Vec<ChangeRecord>, Self::Error>> + Send;
 
     /// The earliest retained position, or `None` when the log holds no entries.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn min_position(&self) -> Result<Option<PgCommitPosition>, Self::Error>;
+    fn min_position(
+        &self,
+    ) -> impl Future<Output = Result<Option<PgCommitPosition>, Self::Error>> + Send;
 
     /// The server's current watermark: the latest position ever appended. It
     /// does not decrease when the window prunes, so it names the server's live
@@ -511,6 +536,29 @@ impl Oplog for InMemoryOplog {
             .entries
             .iter()
             .filter(|entry| entry.record.position() > after)
+            .map(|entry| entry.record.clone())
+            .collect())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn entries_page(
+        &self,
+        after: PgCommitPosition,
+        upto: PgCommitPosition,
+        limit: usize,
+    ) -> Result<Vec<ChangeRecord>, Infallible> {
+        let inner = self.inner.lock();
+        let start = inner
+            .entries
+            .partition_point(|entry| entry.record.position() <= after);
+        Ok(inner
+            .entries
+            .range(start..)
+            .take_while(|entry| entry.record.position() <= upto)
+            .take(limit)
             .map(|entry| entry.record.clone())
             .collect())
     }
@@ -895,6 +943,36 @@ mod pg {
             rows.into_iter().map(Self::record).collect()
         }
 
+        async fn entries_page(
+            &self,
+            after: PgCommitPosition,
+            upto: PgCommitPosition,
+            limit: usize,
+        ) -> Result<Vec<ChangeRecord>, PgOplogError> {
+            let (commit_lsn, xid, ordinal) = position_to_i64(after)?;
+            let (upto_lsn, upto_xid, upto_ordinal) = position_to_i64(upto)?;
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let sql = format!(
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
+                 WHERE (commit_lsn, xid, ordinal) > ($1, $2, $3) \
+                 AND (commit_lsn, xid, ordinal) <= ($4, $5, $6) \
+                 ORDER BY commit_lsn, xid, ordinal LIMIT $7",
+                table = quote_ident(&self.table),
+            );
+            let rows: Vec<OplogRow> = sql_query(sql)
+                .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(xid)
+                .bind::<BigInt, _>(ordinal)
+                .bind::<BigInt, _>(upto_lsn)
+                .bind::<BigInt, _>(upto_xid)
+                .bind::<BigInt, _>(upto_ordinal)
+                .bind::<BigInt, _>(limit)
+                .load(&mut *conn)
+                .await?;
+            rows.into_iter().map(Self::record).collect()
+        }
+
         async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, PgOplogError> {
             const IDS: i64 = 1 << 32;
             let running: Vec<i64> = unseen.running.iter().map(|xid| i64::from(xid.0)).collect();
@@ -1094,6 +1172,20 @@ mod tests {
         )
     }
 
+    async fn page_positions(
+        log: &InMemoryOplog,
+        after: PgCommitPosition,
+        upto: PgCommitPosition,
+        limit: usize,
+    ) -> Vec<PgCommitPosition> {
+        log.entries_page(after, upto, limit)
+            .await
+            .expect("read")
+            .iter()
+            .map(ChangeRecord::position)
+            .collect()
+    }
+
     /// Two rows of one transaction share its commit LSN, so a client holding the first still catches up the second.
     #[tokio::test]
     async fn a_cursor_at_a_transactions_first_row_replays_its_second() {
@@ -1146,5 +1238,91 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// A page holds the records after its start and at or below its end, in commit order, at most the limit of them.
+    #[tokio::test]
+    async fn a_page_is_bounded_on_both_ends_and_by_its_limit() {
+        let log = InMemoryOplog::default();
+        let at: Vec<PgCommitPosition> = (1..=5)
+            .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
+            .collect();
+        for (id, position) in (1..).zip(&at) {
+            log.append(row(id, *position)).await.expect("append");
+        }
+        assert_eq!(
+            page_positions(&log, at[0], at[3], 10).await,
+            vec![at[1], at[2], at[3]]
+        );
+        assert_eq!(
+            page_positions(&log, at[0], at[4], 2).await,
+            vec![at[1], at[2]]
+        );
+        assert_eq!(
+            page_positions(&log, at[2], at[4], 2).await,
+            vec![at[3], at[4]]
+        );
+        assert_eq!(page_positions(&log, at[4], at[4], 2).await, Vec::new());
+    }
+
+    /// A cursor before the earliest retained entry pages from that entry, since the window holds nothing earlier to page.
+    #[tokio::test]
+    async fn a_cursor_before_the_retained_front_pages_from_the_front() {
+        let log = InMemoryOplog::new(OplogConfig::default().with_max_entries(5));
+        let at: Vec<PgCommitPosition> = (1..=10)
+            .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
+            .collect();
+        for (id, position) in (1..).zip(&at) {
+            log.append(row(id, *position)).await.expect("append");
+        }
+        // Positions 1..=5 are pruned, so a cursor at one of them is before the retained front.
+        assert_eq!(
+            page_positions(&log, at[4], at[7], 10).await,
+            vec![at[5], at[6], at[7]]
+        );
+        assert_eq!(
+            page_positions(&log, at[0], at[9], 3).await,
+            vec![at[5], at[6], at[7]]
+        );
+        assert_eq!(
+            page_positions(&log, at[4], at[9], 3).await,
+            vec![at[5], at[6], at[7]]
+        );
+    }
+
+    /// A cursor at a transaction's first row pages the rest of that transaction, ordered by ordinal.
+    #[tokio::test]
+    async fn a_cursor_at_a_transactions_first_row_pages_the_rest_of_the_transaction() {
+        let log = InMemoryOplog::default();
+        let first = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
+        let second = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 2);
+        let after_commit = PgCommitPosition::new(PgLsn(0x200), PgXid(1), 1);
+        log.append(row(1, first)).await.expect("append");
+        log.append(row(2, second)).await.expect("append");
+        log.append(row(3, after_commit)).await.expect("append");
+        assert_eq!(page_positions(&log, first, first, 10).await, Vec::new());
+        assert_eq!(
+            page_positions(&log, first, after_commit, 10).await,
+            vec![second, after_commit]
+        );
+        assert_eq!(
+            page_positions(&log, second, after_commit, 10).await,
+            vec![after_commit]
+        );
+    }
+
+    /// A cursor past the watermark and a zero limit each find an empty page.
+    #[tokio::test]
+    async fn a_page_past_the_watermark_or_at_zero_limit_is_empty() {
+        let log = InMemoryOplog::default();
+        let at: Vec<PgCommitPosition> = (1..=5)
+            .map(|n| PgCommitPosition::new(PgLsn(0x100 * n), PgXid(1), 1))
+            .collect();
+        for (id, position) in (1..).zip(&at) {
+            log.append(row(id, *position)).await.expect("append");
+        }
+        let future = PgCommitPosition::new(PgLsn(0x100 * 6), PgXid(1), 1);
+        assert_eq!(page_positions(&log, future, future, 10).await, Vec::new());
+        assert_eq!(page_positions(&log, at[0], at[4], 0).await, Vec::new());
     }
 }
