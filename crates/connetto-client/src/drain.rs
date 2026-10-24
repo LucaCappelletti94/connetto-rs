@@ -929,6 +929,10 @@ where
     /// # Errors
     ///
     /// A failure to update the queued rows.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match routes the drain's correlated protocol frames"
+    )]
     pub(crate) async fn handle_drain_frame(
         &mut self,
         frame: Option<IncomingFrame>,

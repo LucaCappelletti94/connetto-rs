@@ -6492,11 +6492,7 @@ where
         }
     }
 
-    /// Like [`pump_one`](Self::pump_one), but abandons the idle wait when
-    /// `cancel` resolves first, returning `None`. The underlying receive is
-    /// cancel-safe, so an abandoned wait loses no frame. This is the pump step
-    /// a shared driver uses so it never parks on the transport while holding
-    /// the connection lock.
+    /// Reads one cancel-safe protocol step, returning `None` on cancellation or a frame without a client event.
     ///
     /// # Errors
     ///

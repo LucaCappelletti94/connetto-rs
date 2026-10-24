@@ -763,7 +763,12 @@ async fn held_writer_after_key_expiry(
 async fn a_key_expiring_during_the_drain_handshake_holds_its_write_until_replacement() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, mut old) = held_writer_after_key_expiry(&dir, 0).await;
-    assert!(!conn.unsynced().is_empty());
+    assert!(
+        conn.unsynced()
+            .iter()
+            .map(|write| (write.seq, write.major))
+            .eq([(1, Some(one()))])
+    );
     conn.pump_one_or(async {})
         .await
         .expect("replace the expired key");
@@ -795,7 +800,7 @@ async fn a_key_expiring_during_the_drain_handshake_holds_its_write_until_replace
     .await
     .expect("settle the released held write");
     let events = pump_until(&mut conn, drained).await;
-    assert!(conn.unsynced().is_empty());
+    assert_eq!(conn.unsynced(), [] as [connetto_client::UnsyncedWrite; 0]);
     assert!(events.contains(&ClientEvent::Held(HeldWork::Applied {
         major: one(),
         write: HeldWrite {
@@ -809,7 +814,7 @@ async fn a_key_expiring_during_the_drain_handshake_holds_its_write_until_replace
 async fn an_expired_key_does_not_hold_a_batch_its_handshake_frontier_settled() {
     let dir = tempdir().expect("temp dir");
     let (mut conn, _old) = held_writer_after_key_expiry(&dir, 1).await;
-    assert!(conn.unsynced().is_empty());
+    assert_eq!(conn.unsynced(), [] as [connetto_client::UnsyncedWrite; 0]);
     assert_eq!(conn.draining_major(), None);
     let events = pump_until(&mut conn, drained).await;
     assert!(

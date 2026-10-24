@@ -666,7 +666,7 @@ async fn a_throttled_drain_replacement_waits_for_its_floor_and_uses_the_latest_k
         .await
         .expect("retry the latest set");
     let latest = replacement(&mut server).await;
-    assert!(latest.keys.is_empty());
+    assert_eq!(latest.keys, [] as [Grant; 0]);
     accept_keys(&mut conn, &mut server, latest.request_id).await;
     assert_eq!(conn.held_files_ready(), Some(one()));
     assert_eq!(conn.drain_timer(), None);
@@ -767,7 +767,7 @@ async fn a_held_file_waits_for_the_drain_to_remove_an_expired_key() {
         .await
         .expect("replace the expired key");
     let latest = replacement(&mut server).await;
-    assert!(latest.keys.is_empty());
+    assert_eq!(latest.keys, [] as [Grant; 0]);
     accept_keys(&mut conn, &mut server, latest.request_id).await;
     assert_eq!(conn.drain_timer(), None);
     upload_authorized_file(&dir, &mut conn, &mut server).await;

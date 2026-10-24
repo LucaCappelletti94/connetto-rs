@@ -103,6 +103,8 @@ struct SwapLog {
     swap_at: RefCell<Vec<f64>>,
     request_at: RefCell<Vec<f64>>,
     replaced_acks: RefCell<Vec<String>>,
+    major: Cell<Option<connetto_core::Major>>,
+    hold_handshake: Cell<bool>,
 }
 
 impl SwapLog {
@@ -132,6 +134,7 @@ struct Upstream {
     handshakes: Rc<Cell<u32>>,
     incoming: mpsc::UnboundedReceiver<IncomingFrame>,
     answers: mpsc::UnboundedSender<IncomingFrame>,
+    held_protocol: bool,
 }
 
 impl Upstream {
@@ -171,6 +174,7 @@ impl Upstream {
                 handshakes: Rc::new(Cell::new(0)),
                 incoming,
                 answers: answers.clone(),
+                held_protocol: false,
             },
             answers,
         )
@@ -225,7 +229,30 @@ impl Transport for Upstream {
                         .expect("queue the ticket grant");
                 }
             },
-            ControlMessage::Handshake(_) => {
+            ControlMessage::Handshake(handshake) => {
+                self.log.major.set(handshake.schema_major);
+                if self.held_protocol {
+                    self.incoming.try_recv().expect("replace the initial ack");
+                    let old = handshake.schema_major == connetto_core::Major::new(1);
+                    self.answers
+                        .unbounded_send(IncomingFrame::Control(ControlMessage::HandshakeAck(
+                            HandshakeAck {
+                                connection_id: "held-upstream".to_owned(),
+                                session_token: "held-upstream".to_owned(),
+                                resume_token: "held-upstream".to_owned(),
+                                current_cursor: Cursor::new(Vec::new()),
+                                schema_version: Some(
+                                    held_schema(if old { 1 } else { 2 }).version(),
+                                ),
+                                initial_credits: 64,
+                                writer: (!old).then_some(WriterGrant {
+                                    number: 1,
+                                    frontier: 0,
+                                }),
+                            },
+                        )))
+                        .expect("queue the major's ack");
+                }
                 self.handshakes.set(self.handshakes.get() + 1);
             }
             _ => {}
@@ -235,7 +262,19 @@ impl Transport for Upstream {
             self.subs.set(self.subs.get() + 1);
         }
         let slow = Rc::clone(&self.slow_subs);
+        let held_handshake = self.held_protocol
+            && matches!(&message, ControlMessage::Handshake(handshake)
+                if handshake.schema_major == connetto_core::Major::new(1));
+        let log = Rc::clone(&self.log);
         async move {
+            let deadline = monotonic_ms() + 15_000.0;
+            while held_handshake && log.hold_handshake.get() {
+                assert!(
+                    monotonic_ms() < deadline,
+                    "the drain handshake hold elapsed"
+                );
+                timeout_ms(10).await;
+            }
             if is_subscribe {
                 while slow.get() {
                     timeout_ms(200).await;
@@ -1576,4 +1615,264 @@ async fn a_held_upload_still_reads_the_swap_answer() {
         d = dials.get()
     );
     serial.release();
+}
+
+fn held_schema(major: u32) -> SyncSchema {
+    SyncSchema::new(
+        SchemaBundle::new(
+            format!("-- connetto:major {major}"),
+            "",
+            PHOTOS_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares its major"),
+    )
+}
+
+#[derive(Clone)]
+struct HeldPeer {
+    log: Rc<SwapLog>,
+    tickets: Rc<RefCell<Vec<String>>>,
+    answers: mpsc::UnboundedSender<IncomingFrame>,
+}
+
+fn held_peer(peers: &RefCell<Vec<HeldPeer>>, hold_attach: bool) -> Upstream {
+    let log = Rc::new(SwapLog::default());
+    log.hold_handshake.set(hold_attach);
+    let tickets = Rc::new(RefCell::new(Vec::new()));
+    let (mut upstream, answers) =
+        Upstream::live(Rc::clone(&log), Tickets::Held(Rc::clone(&tickets)));
+    upstream.held_protocol = true;
+    peers.borrow_mut().push(HeldPeer {
+        log,
+        tickets,
+        answers,
+    });
+    upstream
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps both replica majors and the hub lifetime in one scope"
+)]
+async fn held_major_file_after_expiry(hold_attach: bool) {
+    let serial = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let name = if hold_attach {
+        "skd-held-attach"
+    } else {
+        "skd-held-ticket"
+    };
+    let scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .expect("dedicated worker");
+    let store = BrowserStore::install(&scope, name)
+        .await
+        .expect("content store");
+    let archive = ContentArchive::new(store, [17; 32]);
+    let credential = HeldCredential::new(Grant::new("user:skd"), "skd").expect("a string identity");
+    let replica_key = ReplicaKey::from_bytes([0x73; ReplicaKey::LEN]);
+    let mut old = ClientBuilder::new(held_schema(1), || ready(Err::<Upstream, _>("offline")))
+        .signed_in(credential.clone())
+        .durable(
+            At {
+                url: name.to_owned(),
+                exists: false,
+            },
+            Holding(replica_key.clone()),
+            connetto_client::MemoryRefreshStore::default(),
+        )
+        .with_gate(Gate::off())
+        .open_driven()
+        .await
+        .expect("open major 1 offline");
+    archive.install(&mut old).expect("content bookkeeping");
+    let photo: &[u8] = b"an older major's file whose ticket survives share-key expiry";
+    let manifest = archive
+        .chunk_file(photo, MimeClass::Jpeg)
+        .await
+        .expect("stage the bytes");
+    archive
+        .commit_staged(&mut old, &manifest, |_, _| Ok(()))
+        .expect("commit the queued file");
+    let file_id = manifest.file_id();
+    drop(old);
+
+    let peers = Rc::new(RefCell::new(Vec::new()));
+    let factory = {
+        let peers = Rc::clone(&peers);
+        move || ready(Ok::<_, Infallible>(held_peer(&peers, hold_attach)))
+    };
+    let expires = seconds_now() + 8;
+    let worker = ClientBuilder::new(held_schema(2), factory.clone())
+        .with_held_content(connetto_file_client::held_content())
+        .with_share_keys(vec![(
+            mint(expires),
+            CapabilitySubject::<String>::new(SKD_SUBJECT),
+        )])
+        .signed_in(credential)
+        .durable(
+            At {
+                url: name.to_owned(),
+                exists: true,
+            },
+            Holding(replica_key),
+            connetto_client::MemoryRefreshStore::default(),
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
+        .await
+        .expect("reopen at major 2");
+    let uploaded = Rc::new(RefCell::new(Vec::new()));
+    let _http = install_content_transport(&uploaded);
+    let (hub, pump, _notices) = RelayHub::with_reconnect_and_content(
+        worker,
+        name,
+        HubReconnect {
+            factory,
+            sleeper: real_sleeper,
+            policy: ReconnectPolicy::new().with_max_attempts(Some(3)),
+            upstream: Vec::new(),
+        },
+        archive,
+        BrowserHttp::new(),
+    )
+    .expect("content relay");
+    let (mut hub_err, guard) = spawn_hub(pump);
+    let channel = web_sys::MessageChannel::new().expect("message channel");
+    hub.attach(MessageTransport::<MessagePort>::new(channel.port1()));
+    let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "skd-held-major-tab")
+            .with_major(connetto_core::Major::new(2).expect("major 2")),
+    ))
+    .await
+    .expect("post handshake");
+    if hold_attach {
+        let deadline = monotonic_ms() + 12_000.0;
+        loop {
+            if let Some(drain) = peers
+                .borrow()
+                .iter()
+                .find(|peer| peer.log.major.get() == connetto_core::Major::new(1))
+                && seconds_now() >= expires
+            {
+                drain.log.hold_handshake.set(false);
+                break;
+            }
+            assert!(
+                monotonic_ms() < deadline,
+                "the drain handshake never started"
+            );
+            timeout_ms(10).await;
+        }
+    }
+    let ack = tokio::select! {
+        frame = tab.recv() => frame.expect("transport").expect("open"),
+        () = timeout_ms(2_000) => panic!("the hub never answered the handshake"),
+    };
+    assert!(matches!(
+        ack,
+        IncomingFrame::Control(ControlMessage::HandshakeAck(_))
+    ));
+    let requested = wait_until(
+        async || {
+            peers.borrow().iter().any(|peer| {
+                peer.log.major.get() == connetto_core::Major::new(1)
+                    && !peer.tickets.borrow().is_empty()
+            })
+        },
+        200,
+        10,
+    )
+    .await;
+    let ticket_before_expiry = seconds_now() < expires;
+    let drain = peers
+        .borrow()
+        .iter()
+        .find(|peer| peer.log.major.get() == connetto_core::Major::new(1))
+        .expect("major 1 drain")
+        .clone();
+    let request_id = drain.tickets.borrow().first().cloned();
+    let ack_deadline = monotonic_ms() + 12_000.0;
+    let acked = loop {
+        if peers.borrow().iter().all(|peer| {
+            peer.log
+                .replacements
+                .borrow()
+                .first()
+                .is_some_and(|request| {
+                    peer.log
+                        .replaced_acks
+                        .borrow()
+                        .contains(&request.request_id)
+                })
+        }) {
+            break true;
+        }
+        if monotonic_ms() >= ack_deadline {
+            break false;
+        }
+        timeout_ms(10).await;
+    };
+    let granted = request_id.as_ref().is_some_and(|request_id| {
+        drain
+            .answers
+            .unbounded_send(IncomingFrame::Control(ControlMessage::ContentTicketGrant(
+                ContentTicketGrant {
+                    request_id: request_id.clone(),
+                    url: format!("https://content.invalid/files/{file_id}/intent?t={request_id}"),
+                },
+            )))
+            .is_ok()
+    });
+    let drained = tokio::select! {
+        result = async {
+            while let Ok(Some(frame)) = tab.recv().await {
+                if matches!(
+                    frame,
+                    IncomingFrame::Control(ControlMessage::HeldWork(
+                        connetto_core::messages::HeldWork::Drained { major }
+                    )) if Some(major) == connetto_core::Major::new(1)
+                ) {
+                    return true;
+                }
+            }
+            false
+        } => result,
+        () = timeout_ms(5_000) => false,
+    };
+    let ended = hub_err.try_recv();
+    drop(guard);
+    let stopped = wait_until(async || hub_err.try_recv().is_ok(), 200, 10).await || ended.is_ok();
+    serial.release();
+    assert!(requested, "the drain requests its held file");
+    assert_eq!(ticket_before_expiry, !hold_attach);
+    assert!(acked, "both correlated replacements reached the worker");
+    assert!(
+        granted,
+        "the original drain still receives its ticket answer"
+    );
+    assert!(
+        drained,
+        "the file settles under major 1, hub ended {ended:?}"
+    );
+    assert_eq!(uploaded.borrow().as_slice(), &[photo.to_vec()]);
+    assert_eq!(drain.tickets.borrow().as_slice(), request_id.as_slice());
+    assert_eq!(peers.borrow().len(), 2, "one primary and one drain");
+    assert!(
+        stopped,
+        "the hub stopped before the HTTP globals leave scope"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_held_major_ticket_survives_its_keys_expiring() {
+    held_major_file_after_expiry(false).await;
+}
+
+#[wasm_bindgen_test]
+async fn a_held_file_starts_after_expiry_during_drain_attachment() {
+    held_major_file_after_expiry(true).await;
 }
