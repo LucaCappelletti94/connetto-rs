@@ -3059,6 +3059,23 @@ struct Wire<T> {
     /// The connection's challenge nonce, the device bind signs it.
     #[cfg(feature = "device-identity")]
     challenge: Option<[u8; 32]>,
+    /// Which of the connection's handshakes attached this wire.
+    #[cfg(feature = "device-identity")]
+    number: ConnectionNumber,
+}
+
+/// Which handshake of a [`ConnettoConnection`] a wire came from, counted from
+/// one, so no two wires of the same connection share a number.
+#[cfg(feature = "device-identity")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionNumber(u64);
+
+#[cfg(all(test, feature = "device-identity"))]
+impl ConnectionNumber {
+    /// The number `n`, for a fake link standing on its own connections.
+    pub(crate) const fn new(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 /// The bind or retirement a connection sent and has not been answered for.
@@ -3152,6 +3169,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// State changes waiting to be handed to the application, drained ahead of
     /// the transport so an offline connection can still report itself.
     notices: VecDeque<ClientEvent>,
+    /// How many handshakes this connection has completed.
+    #[cfg(feature = "device-identity")]
+    handshakes: u64,
     // `session` is declared before `db` so it drops first: it holds a raw
     // pointer into the connection's SQLite handle and must not outlive it.
     session: Session,
@@ -3510,6 +3530,8 @@ where
             run: None,
             attach_replay: AttachReplay::Idle,
             notices: VecDeque::new(),
+            #[cfg(feature = "device-identity")]
+            handshakes: 0,
             session,
             db,
             last_cursor: resume,
@@ -3729,11 +3751,17 @@ where
             resume_token: ack.resume_token,
             schema_version: ack.schema_version,
         });
+        #[cfg(feature = "device-identity")]
+        {
+            self.handshakes += 1;
+        }
         self.wire = Some(Wire {
             transport,
             connection_id: ack.connection_id,
             #[cfg(feature = "device-identity")]
             challenge: ack.challenge,
+            #[cfg(feature = "device-identity")]
+            number: ConnectionNumber(self.handshakes),
         });
         self.history_cleared = false;
         self.bound_writer = bound;
@@ -5093,6 +5121,13 @@ where
     #[must_use]
     pub fn connection_id(&self) -> Option<&str> {
         self.wire.as_ref().map(|wire| wire.connection_id.as_str())
+    }
+
+    /// The number of the handshake that attached the live wire, or `None`
+    /// while no server is reachable.
+    #[cfg(feature = "device-identity")]
+    pub(crate) fn connection_number(&self) -> Option<ConnectionNumber> {
+        self.wire.as_ref().map(|wire| wire.number)
     }
 
     /// The durable session handle from the handshake ack, or `None` while no
