@@ -14,6 +14,7 @@ use connetto_client::{
     ArchiveAttachment, ClientBuilder, ClientError, ConnettoConnection, DataDir, ExportScope,
     ImportChoices, Keep, MemoryRefreshStore, SyncSchema,
 };
+use connetto_core::Major;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -71,11 +72,16 @@ struct Device {
 }
 
 async fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
+    device_at(SOURCE, synced_ddl, tier_ddl, account).await
+}
+
+/// One device whose schema source declares the major in `source`.
+async fn device_at(source: &str, synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
     let dir = tempfile::tempdir().expect("temporary directory");
     let credential = super::support::held(account);
     let store = super::support::key_store(&credential).await;
     let bundle = SchemaBundle::new(
-        SOURCE,
+        source,
         "",
         synced_ddl,
         Vec::<(String, String)>::new(),
@@ -373,6 +379,29 @@ async fn a_mismatched_schema_is_refused_by_name() {
             "the refusal names the schema: {message}"
         ),
         other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// An archive made at another application schema major is refused by naming
+/// both majors, ahead of the schema check, because the two builds' schemas
+/// would differ too and only the majors tell the person which side to update.
+#[tokio::test]
+async fn an_archive_from_another_major_is_refused_by_name() {
+    let mut source = device_at("-- connetto:major 1", SYNCED_DDL, TIER_DDL, "alice").await;
+    let archive = source
+        .conn
+        .export_local_data(ExportScope::Everything, Vec::new())
+        .expect("export");
+    let mut target = device_at("-- connetto:major 2", WIDER_SYNCED_DDL, TIER_DDL, "alice").await;
+    match target
+        .conn
+        .import_local_data(std::io::Cursor::new(&archive))
+    {
+        Err(ClientError::ArchiveMajor { archive, build }) => {
+            assert_eq!(archive.map(Major::get), Some(1));
+            assert_eq!(build.map(Major::get), Some(2));
+        }
+        other => panic!("expected the major refusal, got {other:?}"),
     }
 }
 
