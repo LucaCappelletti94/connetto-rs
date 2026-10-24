@@ -1058,7 +1058,7 @@ dependencies = [
 [[package]]
 name = "diesel-sqlite-session"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/diesel-sqlite-session#4bc74da66fdf7d5fcdda38335030c9d9aacebc74"
+source = "git+https://github.com/connetto-rs/diesel-sqlite-session#19d9a6ce344cbd77059f98427b0585837d9d9856"
 dependencies = [
  "diesel",
  "libsqlite3-sys",
@@ -1656,7 +1656,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3166,7 +3166,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ed881482991a52b21836afb895c0975a0670b0b7"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#0bc240d253512d591ec4bcd0119b9d7058da274e"
 dependencies = [
  "git2",
  "sql-traits",
@@ -3389,7 +3389,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3643,7 +3643,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bfccfc190bcf62c9a8fdb8ef2b3572816e73a8d7"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#2c95d65b4fb27f28e9d9b0fd320c5b3fd425fb6e"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -3656,7 +3656,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/rls2fga?branch=main#bfccfc190bcf62c9a8fdb8ef2b3572816e73a8d7"
+source = "git+https://github.com/connetto-rs/rls2fga?branch=main#2c95d65b4fb27f28e9d9b0fd320c5b3fd425fb6e"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3761,7 +3761,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3818,7 +3818,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4195,7 +4195,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#13a012e778cbda0ebc5dcf62e76a84f45ecc3696"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#332c1f179da65d55a092a5358b6acf2d89bc88e2"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -4250,7 +4250,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#28e9868659167f3e03be2bbb9fd7f7e0b630540c"
 dependencies = [
  "log",
  "recursive",
@@ -4261,7 +4261,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#869bb2ccc7d441b0b4bfaecae341cc705201783c"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#1d50eb6b93e0d3c630e8e9fcea18c4e2fc18e7a7"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -4271,7 +4271,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#aab619465b7edaae99b647015df82f2b76764c58"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#8ba43e6a9dee5b24bfbd918d93b50d596fa451b5"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.20",
@@ -4280,7 +4280,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#28e9868659167f3e03be2bbb9fd7f7e0b630540c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4321,7 +4321,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/subql?branch=main#a7708357761bb7da3500e469ecf0b26bb64ef80d"
+source = "git+https://github.com/connetto-rs/subql?branch=main#66dd151f4feca6e8302437f1a03e76bc3abaf90c"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -4439,10 +4439,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5182,7 +5182,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
