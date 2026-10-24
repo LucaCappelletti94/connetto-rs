@@ -499,8 +499,8 @@ async fn a_resume_under_other_keys_resends_instead_of_catching_up() {
     let frames = subscribe_and_settle(&mut same).await;
     assert_eq!(
         kinds(&frames),
-        ["pong"],
-        "the same keys catch up from the log"
+        ["end", "pong"],
+        "the same keys catch up from the log, and the empty catchup still completes"
     );
     assert_eq!(snapshot.reads(), reads);
 }

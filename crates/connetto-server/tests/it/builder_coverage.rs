@@ -1548,10 +1548,10 @@ async fn a_restored_cluster_revokes_every_login_session_at_boot() {
     // The second boot meets the restore: it revokes every login session and
     // records the cluster it now serves.
     let (builder2, _idp2, _keys2) = builder_over(&fixture, port).await;
-    let (outcome, capture) = with_capture(
+    let (outcome, capture) = Box::pin(with_capture(
         "a_restored_cluster_revokes_every_login_session_at_boot",
         |capture| async move { (builder2.build().await.map(|parts| parts.handle), capture) },
-    )
+    ))
     .await;
     let handle = outcome.expect("the second boot assembles");
     let lines = capture.lines();
@@ -1661,10 +1661,10 @@ async fn a_slot_recreated_past_the_log_trims_the_log_at_boot() {
     .await;
 
     let (builder2, _idp2, _keys2) = builder_over(&fixture, port).await;
-    let (outcome, capture) = with_capture(
+    let (outcome, capture) = Box::pin(with_capture(
         "a_slot_recreated_past_the_log_trims_the_log_at_boot",
         |capture| async move { (builder2.build().await.map(|parts| parts.handle), capture) },
-    )
+    ))
     .await;
     let handle = outcome.expect("the second boot assembles");
     let lines = capture.lines();
@@ -1741,10 +1741,10 @@ async fn a_second_boot_reconciles_the_installed_model() {
         OWNED_POLICIES,
         "owned",
     );
-    let (outcome, capture) = with_capture(
+    let (outcome, capture) = Box::pin(with_capture(
         "a_second_boot_reconciles_the_installed_model",
         |capture| async move { (first.build().await.map(|parts| parts.handle), capture) },
-    )
+    ))
     .await;
     let handle = outcome.expect("the first boot assembles");
     let lines = capture.lines();
@@ -1765,10 +1765,10 @@ async fn a_second_boot_reconciles_the_installed_model() {
         OWNED_POLICIES,
         "owned",
     );
-    let (outcome, capture) = with_capture(
+    let (outcome, capture) = Box::pin(with_capture(
         "a_second_boot_reconciles_the_installed_model",
         |capture| async move { (second.build().await, capture) },
-    )
+    ))
     .await;
     let parts = outcome.expect("the second boot assembles");
     let lines = capture.lines();
@@ -2710,10 +2710,10 @@ async fn a_content_sweep_and_reconcile_say_what_they_do() {
         "orders",
     )
     .content(Some(settings(StoreSpec::Fs(dir1.path().to_path_buf()))));
-    let (outcome, capture) = with_capture(
+    let (outcome, capture) = Box::pin(with_capture(
         "a_content_sweep_and_reconcile_say_what_they_do",
         |capture| async move { (first.build().await.map(|parts| parts.handle), capture) },
-    )
+    ))
     .await;
     let handle = outcome.expect("the deployment builds");
     let lines = capture.lines();

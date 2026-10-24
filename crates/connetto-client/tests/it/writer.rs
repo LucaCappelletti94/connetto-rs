@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, ExportScope,
-    ImportChoices, SyncSchema, UnsyncedWrite,
+    ImportChoices, MemoryRefreshStore, SyncSchema, UnsyncedWrite,
 };
 use connetto_core::Cursor;
 use connetto_core::chain::{GENESIS, entry_hash};
@@ -300,7 +300,11 @@ async fn open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
         super::support::NeverDial::<Wire>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server")
@@ -1186,7 +1190,11 @@ async fn split_open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
     let store = super::support::key_store(&credential).await;
     ClientBuilder::new(split_bundle(), super::support::NeverDial::<Wire>::default())
         .signed_in(credential)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await
         .expect("open with no server")

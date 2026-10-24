@@ -27,7 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
-use connetto_core::messages::{BindValue, SubscriptionSpec};
+use connetto_core::auth::{CapabilityKey, CapabilitySubject};
+use connetto_core::messages::{BindValue, Grant, SubscriptionSpec};
 use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::associations::{HasTable, Identifiable};
@@ -50,7 +51,7 @@ use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment};
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
-use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer};
+use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer, ShareKeyTimer};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
 /// the bind values the placeholders stand for, in placeholder order.
@@ -2368,6 +2369,55 @@ where
         Ok(out)
     }
 
+    /// Commit a share key to the desired set and refresh local visibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the client is closed, locked, or cannot persist the change.
+    pub async fn add_share_key<K: CapabilityKey>(
+        &self,
+        grant: &Grant,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        self.allow_share_key_change()?;
+        state.conn.add_share_key(grant, subject).await?;
+        refresh_changed(&mut state, &self.shared.events);
+        drop(state);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    /// Remove every grant for a subject and refresh local visibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if the client is closed, locked, or cannot persist the change.
+    pub async fn remove_share_key<K: CapabilityKey>(
+        &self,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        self.allow_share_key_change()?;
+        state.conn.remove_share_key(subject).await?;
+        refresh_changed(&mut state, &self.shared.events);
+        drop(state);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+
+    fn allow_share_key_change(&self) -> Result<(), ClientError> {
+        if self.shared.close_requested.load(Ordering::Acquire)
+            || self.shared.pump_done.done.load(Ordering::Acquire)
+        {
+            return Err(ClientError::Stopped("the client is closed".to_owned()));
+        }
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        Ok(())
+    }
+
     /// Turn on the away/return re-check.
     ///
     /// From now on a return re-asks the mechanism when the time away exceeds
@@ -2733,6 +2783,39 @@ where
     Ok(())
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type KeySleep = core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+type KeySleep = core::pin::Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+fn arm_share_key_timer<S: Sleeper + 'static>(
+    timer: Option<ShareKeyTimer>,
+    armed: &mut Option<(ShareKeyTimer, KeySleep)>,
+    sleeper: Option<&mut S>,
+) {
+    if timer == armed.as_ref().map(|(timer, _)| *timer) {
+        return;
+    }
+    *armed = None;
+    let Some(timer) = timer else {
+        return;
+    };
+    let sleep = sleeper.map(|sleeper| Box::pin(sleeper.sleep(timer.wait())) as KeySleep);
+    #[cfg(feature = "native-transport")]
+    let sleep = sleep.or_else(|| Some(Box::pin(tokio::time::sleep(timer.wait())) as KeySleep));
+    *armed = sleep.map(|sleep| (timer, sleep));
+}
+
+async fn wait_timer<D, F: Future<Output = ()> + ?Sized>(
+    timer: &mut Option<(D, core::pin::Pin<Box<F>>)>,
+) {
+    if let Some((_, sleep)) = timer {
+        sleep.as_mut().await;
+    } else {
+        core::future::pending::<()>().await;
+    }
+}
+
 /// The background pump: drains queued unsubscribes, flushes local writes,
 /// takes one cancellable pump step, then refreshes every live query whose
 /// tables changed. When the last [`ConnettoClient`] clone drops, the pump
@@ -2755,6 +2838,7 @@ async fn pump<T, F, S>(
     let mut needs_recovery = false;
     // The sleep for the armed resend, kept across steps so arriving frames do not restart it.
     let mut resend = None;
+    let mut key_timer = None;
     loop {
         if alive.upgrade().is_none() {
             pump_exit(&shared).await;
@@ -2772,7 +2856,7 @@ async fn pump<T, F, S>(
         // the state lock, so watch and with_conn callers are only blocked
         // during the brief resume itself, never during backoff sleeps.
         if needs_recovery {
-            match drive_recovery(&shared, &mut reconnect).await {
+            match drive_recovery(&shared, &mut reconnect, &alive, &mut key_timer).await {
                 Recovered::Live => needs_recovery = false,
                 // The top of the loop ends the pump through the close path.
                 Recovered::Closing => continue,
@@ -2784,6 +2868,10 @@ async fn pump<T, F, S>(
                     }
                     let _ = shared.events.send(event);
                     pump_finished(&shared);
+                    return;
+                }
+                Recovered::Failed(err) => {
+                    pump_fail(&shared, err).await;
                     return;
                 }
             }
@@ -2815,6 +2903,11 @@ async fn pump<T, F, S>(
                 .zip(reconnect.as_mut())
                 .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
         }
+        arm_share_key_timer(
+            state.conn.share_key_timer(),
+            &mut key_timer,
+            reconnect.as_mut().map(|driver| &mut driver.sleeper),
+        );
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
@@ -2822,6 +2915,7 @@ async fn pump<T, F, S>(
             &mut state.conn,
             &shared.wake,
             &mut resend,
+            &mut key_timer,
             &mut ask,
             &mut ask_outcome,
         )
@@ -3084,12 +3178,15 @@ enum Recovered {
     Closing,
     /// Recovery cannot proceed, and this terminal event says why.
     Ended(ClientEvent),
+    Failed(ClientError),
 }
 
 /// Recover a lost transport, outside the state lock.
 async fn drive_recovery<T, F, S>(
     shared: &Arc<Shared<T>>,
     reconnect: &mut Option<ReconnectDriver<F, S>>,
+    alive: &Weak<ClientToken>,
+    key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
 ) -> Recovered
 where
     T: Transport + MaybeSend + 'static,
@@ -3098,7 +3195,7 @@ where
     S: Sleeper + MaybeSend + 'static,
 {
     let outcome = match reconnect.as_mut() {
-        Some(driver) => recover(shared, driver).await,
+        Some(driver) => recover(shared, driver, alive, key_timer).await,
         None => Recovery::Exhausted,
     };
     match outcome {
@@ -3106,6 +3203,7 @@ where
         Recovery::Closing => Recovered::Closing,
         Recovery::ReauthRequired => Recovered::Ended(ClientEvent::AuthenticationRequired),
         Recovery::Exhausted => Recovered::Ended(ClientEvent::Closed),
+        Recovery::Failed(err) => Recovered::Failed(err),
     }
 }
 
@@ -3120,6 +3218,24 @@ where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
+    match state
+        .conn
+        .process_share_keys(!shared.gate.is_locked())
+        .await
+    {
+        Ok(true) if !shared.gate.is_locked() => refresh_changed(state, &shared.events),
+        Ok(_) => {}
+        Err(err) => {
+            if !shared.gate.is_locked() {
+                refresh_changed(state, &shared.events);
+            }
+            return if is_disconnect(&err) {
+                Drained::Recover
+            } else {
+                Drained::Fail(err)
+            };
+        }
+    }
     // Unsubscribes queued by dropped handles. A send failure only marks the
     // transport for recovery, because the server-side subscription dies with
     // the session either way, and the entry is already out of the registry, so
@@ -3258,6 +3374,7 @@ async fn step_or_resend<T, F>(
     conn: &mut ConnettoConnection<T>,
     wake: &Notify,
     resend: &mut Option<(ResendTimer, core::pin::Pin<Box<F>>)>,
+    key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
     ask: &mut Option<GateAskFuture>,
     ask_outcome: &mut Option<GateAskOutcome>,
 ) -> Result<Option<ClientEvent>, ClientError>
@@ -3267,28 +3384,25 @@ where
     F: Future<Output = ()>,
 {
     let due = AtomicBool::new(false);
+    let key_due = AtomicBool::new(false);
     let cancel = async {
-        match (resend.as_mut(), ask.as_mut()) {
-            (Some((_, sleep)), Some(ask_f)) => tokio::select! {
-                biased;
-                () = wake.notified() => {}
-                () = sleep.as_mut() => due.store(true, Ordering::Relaxed),
-                outcome = ask_f => *ask_outcome = Some(outcome),
-            },
-            (Some((_, sleep)), None) => tokio::select! {
-                biased;
-                () = wake.notified() => {}
-                () = sleep.as_mut() => due.store(true, Ordering::Relaxed),
-            },
-            (None, Some(ask_f)) => tokio::select! {
-                biased;
-                () = wake.notified() => {}
-                outcome = ask_f => *ask_outcome = Some(outcome),
-            },
-            (None, None) => wake.notified().await,
+        tokio::select! {
+            biased;
+            () = wake.notified() => {}
+            () = wait_timer(resend) => due.store(true, Ordering::Relaxed),
+            () = wait_timer(key_timer) => key_due.store(true, Ordering::Relaxed),
+            outcome = async {
+                match ask.as_mut() {
+                    Some(ask) => ask.as_mut().await,
+                    None => core::future::pending().await,
+                }
+            } => *ask_outcome = Some(outcome),
         }
     };
     let stepped = conn.pump_one_or(cancel).await;
+    if key_due.load(Ordering::Relaxed) {
+        *key_timer = None;
+    }
     if due.load(Ordering::Relaxed)
         && let Some((timer, _)) = resend.take()
     {
@@ -3422,67 +3536,80 @@ enum Recovery {
     ReauthRequired,
     /// A close was asked for during a backoff.
     Closing,
+    Failed(ClientError),
 }
 
-/// How a backoff wait ended.
+/// How an offline wait ended.
 #[derive(Debug, PartialEq, Eq)]
-enum Offline {
-    /// The backoff ran out, so the next dial is due.
-    Due,
+enum Offline<O> {
+    /// The awaited backoff or dial completed.
+    Due(O),
     /// A close was asked for.
     Closing,
 }
 
-/// Wait out one reconnect backoff while serving what needs no server.
-///
-/// A local write wakes the wait, is queued durably, and refreshes the live
-/// queries its tables feed unless the gate holds refreshes, and a pending
-/// gate prompt is driven and applied, so an offline client stays usable
-/// between dials. A close ends the wait at once.
-async fn serve_offline<T, F>(shared: &Shared<T>, sleep: F) -> Offline
+/// Keep local work, key deadlines and the gate running during a backoff or dial.
+async fn serve_offline<T, F, S>(
+    shared: &Shared<T>,
+    pending: F,
+    sleeper: &mut S,
+    alive: &Weak<ClientToken>,
+    key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
+) -> Result<Offline<F::Output>, ClientError>
 where
-    T: Transport,
-    F: Future<Output = ()>,
+    T: Transport + MaybeSend + 'static,
+    F: Future,
+    S: Sleeper + 'static,
 {
-    let mut sleep = core::pin::pin!(sleep);
+    let mut pending = core::pin::pin!(pending);
     loop {
-        if shared.close_requested.load(Ordering::Acquire) {
-            return Offline::Closing;
-        }
-        let mut ask = shared.gate.take_ask();
-        let mut outcome = None;
-        let due = if let Some(ask_f) = ask.as_mut() {
-            tokio::select! {
-                biased;
-                () = shared.wake.notified() => false,
-                resolved = ask_f => {
-                    outcome = Some(resolved);
-                    false
-                }
-                () = sleep.as_mut() => true,
-            }
-        } else {
-            tokio::select! {
-                biased;
-                () = shared.wake.notified() => false,
-                () = sleep.as_mut() => true,
-            }
-        };
-        shared.gate.apply_outcome(&mut ask, outcome);
-        if let Some(ask) = ask {
-            shared.gate.restore_ask(ask);
+        if shared.close_requested.load(Ordering::Acquire) || alive.strong_count() == 0 {
+            return Ok(Offline::Closing);
         }
         let mut state = shared.state.lock().await;
-        // A write made offline is queued durably now, not at the next attach.
+        state
+            .conn
+            .process_share_keys(!shared.gate.is_locked())
+            .await?;
         if let Err(err) = state.conn.flush().await {
             tracing::warn!(error = %err, "queueing an offline write failed");
         }
         if !shared.gate.is_locked() {
             refresh_changed(&mut state, &shared.events);
         }
+        arm_share_key_timer(state.conn.share_key_timer(), key_timer, Some(sleeper));
         drop(state);
-        if due {
-            return Offline::Due;
+
+        let mut ask = shared.gate.take_ask();
+        let mut outcome = None;
+        let mut key_due = false;
+        let ready = tokio::select! {
+            biased;
+            () = shared.wake.notified() => None,
+            () = wait_timer(key_timer) => {
+                key_due = true;
+                None
+            },
+            resolved = async {
+                match ask.as_mut() {
+                    Some(ask) => ask.as_mut().await,
+                    None => core::future::pending().await,
+                }
+            } => {
+                outcome = Some(resolved);
+                None
+            },
+            result = pending.as_mut() => Some(result),
+        };
+        if key_due {
+            *key_timer = None;
+        }
+        shared.gate.apply_outcome(&mut ask, outcome);
+        if let Some(ask) = ask {
+            shared.gate.restore_ask(ask);
+        }
+        if let Some(result) = ready {
+            return Ok(Offline::Due(result));
         }
     }
 }
@@ -3493,12 +3620,17 @@ where
 /// Sleeps and connect attempts run WITHOUT the state lock. Only the resume
 /// handshake and the re-subscribes hold it, so application reads and writes
 /// against the replica proceed during an outage.
-async fn recover<T, F, S>(shared: &Shared<T>, driver: &mut ReconnectDriver<F, S>) -> Recovery
+async fn recover<T, F, S>(
+    shared: &Shared<T>,
+    driver: &mut ReconnectDriver<F, S>,
+    alive: &Weak<ClientToken>,
+    key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
+) -> Recovery
 where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
     F: TransportFactory<Transport = T>,
-    S: Sleeper,
+    S: Sleeper + 'static,
 {
     let mut episode = driver.policy.start();
     loop {
@@ -3508,13 +3640,21 @@ where
         let _ = shared.events.send(ClientEvent::Reconnecting {
             attempt: episode.attempt(),
         });
-        if serve_offline(shared, driver.sleeper.sleep(wait)).await == Offline::Closing {
-            return Recovery::Closing;
+        let sleep = driver.sleeper.sleep(wait);
+        match serve_offline(shared, sleep, &mut driver.sleeper, alive, key_timer).await {
+            Ok(Offline::Due(())) => {}
+            Ok(Offline::Closing) => return Recovery::Closing,
+            Err(err) => return Recovery::Failed(err),
         }
 
-        let Ok(transport) = driver.factory.connect().await else {
-            continue;
-        };
+        let dial = driver.factory.connect();
+        let transport =
+            match serve_offline(shared, dial, &mut driver.sleeper, alive, key_timer).await {
+                Ok(Offline::Due(Ok(transport))) => transport,
+                Ok(Offline::Due(Err(_))) => continue,
+                Ok(Offline::Closing) => return Recovery::Closing,
+                Err(err) => return Recovery::Failed(err),
+            };
         let mut state = shared.state.lock().await;
         match state.conn.attach(transport).await {
             Ok(()) => {}

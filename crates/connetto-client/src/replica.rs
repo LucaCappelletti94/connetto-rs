@@ -421,6 +421,10 @@ pub(crate) const PENDING_LOGIN_RECORD: &str = "connetto-pending-login";
 /// id and no reserved name is valid JSON.
 #[must_use]
 pub fn is_reserved_record(name: &str) -> bool {
+    is_ungated_record(name) || crate::share_keys::is_share_key_record(name)
+}
+
+pub(crate) fn is_ungated_record(name: &str) -> bool {
     name == IDENTITY_RECORD
         || name == ACCOUNTS_RECORD
         || name == PENDING_LOGIN_RECORD
@@ -494,6 +498,14 @@ mod tests {
         assert!(is_reserved_record(&device_key_record(&alice)));
         assert_ne!(device_key_record(&alice), device_key_record(&bob));
         assert!(!is_reserved_record(&alice));
+    }
+
+    #[test]
+    fn share_key_records_are_reserved_without_reserving_account_ids() {
+        let account = encode_identity(&"alice").expect("encode identity");
+        let record = crate::share_keys::share_key_record(&account);
+        assert!(is_reserved_record(&record));
+        assert!(!is_reserved_record(&account));
     }
 
     #[test]

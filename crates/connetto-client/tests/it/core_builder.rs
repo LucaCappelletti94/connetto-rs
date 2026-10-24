@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, FirstThen, Grant, LiveQuery, ReconnectPolicy, SyncSchema,
-    SyncStatus, SyncTuning, TransportFactory,
+    ClientBuilder, ClientEvent, FirstThen, Grant, LiveQuery, MemoryRefreshStore, ReconnectPolicy,
+    SyncSchema, SyncStatus, SyncTuning, TransportFactory,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
@@ -378,7 +378,11 @@ async fn signed_in_build_names_the_key_record_from_the_identity_itself() {
     );
     let (client, pump) = builder
         .signed_in(credential)
-        .durable(connetto_client::DataDir::new(dir.path()), store.clone())
+        .durable(
+            connetto_client::DataDir::new(dir.path()),
+            store.clone(),
+            MemoryRefreshStore::default(),
+        )
         .connect_with_pump()
         .await
         .expect("connect durable");
@@ -572,7 +576,11 @@ async fn a_durable_build_takes_freshness_from_the_file_and_never_rekeys() {
     let open = |store: RecordingKeyStore| {
         ClientBuilder::new(bundle(), OneShot { transport: None })
             .signed_in(credential.clone())
-            .durable(connetto_client::DataDir::new(dir.path()), store)
+            .durable(
+                connetto_client::DataDir::new(dir.path()),
+                store,
+                MemoryRefreshStore::default(),
+            )
             .open_driven()
     };
 
@@ -661,7 +669,11 @@ async fn a_replica_whose_key_the_platform_lost_is_wiped_and_started_fresh() {
     let open = |keys: LostKeys| {
         ClientBuilder::new(bundle(), OneShot { transport: None })
             .signed_in(credential.clone())
-            .durable(connetto_client::DataDir::new(dir.path()), keys)
+            .durable(
+                connetto_client::DataDir::new(dir.path()),
+                keys,
+                MemoryRefreshStore::default(),
+            )
             .open_driven()
     };
     let intact = LostKeys {

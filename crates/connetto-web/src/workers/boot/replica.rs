@@ -246,6 +246,7 @@ pub(super) async fn open_worker<Id>(
         .durable(
             place,
             crate::auth::BuilderKeyStore::new(Rc::clone(key_store)),
+            crate::auth::BuilderKeyStore::new(Rc::clone(key_store)),
         )
         .open_driven()
         .await

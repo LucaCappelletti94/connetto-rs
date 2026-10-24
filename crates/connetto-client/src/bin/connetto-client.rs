@@ -40,7 +40,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_client::auth::KeyringKeyStore;
+use connetto_client::auth::{KeyringKeyStore, KeyringStore};
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, ContentPlace, Gate, Grant,
     HeldCredential, Located, NativeTransport, ReplicaPlace, SyncSchema,
@@ -109,9 +109,10 @@ async fn connect(
                 .context("set CONNETTO_USER to the user id CONNETTO_TOKEN stands for")?;
             let db_path = std::env::var("CONNETTO_DB")
                 .context("set CONNETTO_DB to the replica file of a signed-in client")?;
+            let (keys, shares) = secret_stores()?;
             builder
                 .signed_in(HeldCredential::new(Grant::new(token), &user)?)
-                .durable(DbPath(PathBuf::from(db_path)), key_store()?)
+                .durable(DbPath(PathBuf::from(db_path)), keys, shares)
                 .with_gate(Gate::off())
                 .connect_driven()
                 .await
@@ -239,18 +240,24 @@ async fn run() -> Result<()> {
     }
 }
 
-/// The replica-key store `CONNETTO_KEY_STORE` names, or the detected one.
-fn key_store() -> anyhow::Result<KeyringKeyStore> {
-    key_store_named(std::env::var("CONNETTO_KEY_STORE").ok().as_deref())
+/// The replica and share-key stores selected by `CONNETTO_KEY_STORE`.
+fn secret_stores() -> anyhow::Result<(KeyringKeyStore, KeyringStore)> {
+    secret_stores_named(std::env::var("CONNETTO_KEY_STORE").ok().as_deref())
 }
 
-fn key_store_named(name: Option<&str>) -> anyhow::Result<KeyringKeyStore> {
+fn secret_stores_named(name: Option<&str>) -> anyhow::Result<(KeyringKeyStore, KeyringStore)> {
     match name {
-        None => Ok(KeyringKeyStore::new(KEYRING_SERVICE)),
+        None => Ok((
+            KeyringKeyStore::new(KEYRING_SERVICE),
+            KeyringStore::new(KEYRING_SERVICE),
+        )),
         #[cfg(target_os = "linux")]
-        Some("keyutils") => Ok(KeyringKeyStore::with_linux_store(
-            KEYRING_SERVICE,
-            connetto_client::LinuxStore::Keyutils,
+        Some("keyutils") => Ok((
+            KeyringKeyStore::with_linux_store(
+                KEYRING_SERVICE,
+                connetto_client::LinuxStore::Keyutils,
+            ),
+            KeyringStore::with_linux_store(KEYRING_SERVICE, connetto_client::LinuxStore::Keyutils),
         )),
         Some(other) => Err(anyhow!(
             "CONNETTO_KEY_STORE={other} names no store this platform has"
@@ -260,11 +267,11 @@ fn key_store_named(name: Option<&str>) -> anyhow::Result<KeyringKeyStore> {
 
 #[cfg(test)]
 mod tests {
-    use super::key_store_named;
+    use super::secret_stores_named;
 
     #[test]
     fn an_unknown_store_name_is_refused_naming_it() {
-        let err = key_store_named(Some("secret-service"))
+        let err = secret_stores_named(Some("secret-service"))
             .err()
             .expect("refused");
         assert!(
@@ -277,13 +284,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn keyutils_and_detection_are_the_two_choices() {
-        let keyutils = key_store_named(Some("keyutils")).expect("keyutils");
+        let (keyutils, _) = secret_stores_named(Some("keyutils")).expect("keyutils");
         assert_eq!(
             keyutils.backend().await.expect("opens"),
             connetto_client::Backend::Keyutils
         );
         assert!(
-            key_store_named(None).is_ok(),
+            secret_stores_named(None).is_ok(),
             "unset means the detected store"
         );
     }

@@ -29,7 +29,9 @@ use connetto_core::{
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 use pg2sqlite::manifest::WrapperKind;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{
+    Pg2Sqlite, Pg2SqliteOptions, Script, SessionVariableMapping, UuidRepresentation,
+};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, CreateTable, CreateView, ObjectNamePart, Statement,
 };
@@ -196,7 +198,7 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     let report = translator
         .translate_with_report(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
-    let ddl = statements_to_ddl(&report.statements);
+    let ddl = statements_to_ddl(&report.script);
     validate(&ddl, "replica")?;
     let manifest = translator
         .translation_manifest(&options)
@@ -211,7 +213,7 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
         policies_sql,
         ddl,
         pairs,
-        view_names(&report.statements),
+        view_names(&report.script),
         None::<&str>,
     ))
 }
@@ -262,7 +264,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
         let report = tier
             .translate_with_report(&options)
             .map_err(|err| SchemaError::Translate(err.to_string()))?;
-        let ddl = statements_to_ddl(&report.statements);
+        let ddl = statements_to_ddl(&report.script);
         validate(&ddl, "local tier")?;
         bundle = bundle.with_local_tier(ddl);
     }
@@ -380,9 +382,9 @@ fn cap_statement(table: &str, verb: &str) -> String {
 }
 
 /// Join the translated statements the way the artifacts do: `;` between and
-/// a `;` after the last.
-fn statements_to_ddl(statements: &[Statement]) -> String {
-    let mut ddl = statements
+/// a `;` after the last, connection setup first.
+fn statements_to_ddl(script: &Script) -> String {
+    let mut ddl = script
         .iter()
         .map(Statement::to_string)
         .collect::<Vec<_>>()
@@ -409,8 +411,8 @@ fn validate(ddl: &str, tier: &'static str) -> Result<(), SchemaError> {
 
 /// The views a translation creates, read off the `CREATE VIEW` statements it
 /// emits, so a server without SQLite can compute them.
-fn view_names(statements: &[Statement]) -> Vec<String> {
-    statements
+fn view_names(script: &Script) -> Vec<String> {
+    script
         .iter()
         .filter_map(|statement| match statement {
             Statement::CreateView(CreateView { name, .. }) => name
@@ -669,8 +671,8 @@ mod tests {
         let report = translator
             .translate_with_report(&options)
             .expect("translate the deployment");
-        let ddl = statements_to_ddl(&report.statements);
-        let derived = view_names(&report.statements);
+        let ddl = statements_to_ddl(&report.script);
+        let derived = view_names(&report.script);
         let built = sqlite_views(&ddl);
         assert!(!derived.is_empty(), "the deployment's policies build views");
         assert_eq!(

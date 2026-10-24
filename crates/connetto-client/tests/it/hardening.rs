@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use connetto_client::harden::{AttachPermits, attach_in_window};
 use connetto_client::{
-    ClientBuilder, ConnettoConnection, DataDir, HeldCredential, SqlFunctions, SyncSchema,
+    ClientBuilder, ConnettoConnection, DataDir, HeldCredential, MemoryRefreshStore, SqlFunctions,
+    SyncSchema,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -79,7 +80,11 @@ async fn open_plain(dir: &TempDir) -> ConnettoConnection<FakeTransport> {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open")
@@ -185,7 +190,11 @@ async fn a_tier_rests_at_one_attached_database_and_stays_writable() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open");
@@ -268,7 +277,11 @@ async fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
             super::support::NeverDial::<FakeTransport>::default(),
         )
         .signed_in(credential)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default()
+        )
         .open_driven()
         .await
         .is_err(),
@@ -333,7 +346,11 @@ async fn a_column_default_may_only_call_an_innocuous_function() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(first)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("registering it and creating the table both succeed");
@@ -360,7 +377,11 @@ async fn a_column_default_may_only_call_an_innocuous_function() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(second)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open");
@@ -399,7 +420,11 @@ async fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(first)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open");
@@ -421,7 +446,11 @@ async fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(reopened)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen with no DDL");
@@ -455,7 +484,11 @@ async fn a_tier_script_may_lead_with_a_pragma() {
         super::support::NeverDial::<FakeTransport>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("a pragma in the tier script is not a refusal");

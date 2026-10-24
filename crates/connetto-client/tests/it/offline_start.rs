@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncStatus, UnsyncedWrite,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, MemoryRefreshStore,
+    SyncStatus, UnsyncedWrite,
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
@@ -137,7 +138,11 @@ async fn open_offline(dir: &TempDir) -> ConnettoConnection<Recorder> {
         super::support::NeverDial::<Recorder>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server")

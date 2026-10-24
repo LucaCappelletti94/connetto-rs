@@ -170,7 +170,7 @@ fn translation_for(pg_ddl: &str) -> (String, Vec<(String, String)>, Vec<String>)
         .expect("parse the Postgres document")
         .translate_to_sql(&options())
         .expect("translate to SQLite");
-    let mut ddl = statements.join(";\n");
+    let mut ddl = statements.into_vec().join(";\n");
     ddl.push(';');
 
     let manifest = Pg2Sqlite::default()

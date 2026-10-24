@@ -1,8 +1,8 @@
 # connetto-peer-apple
 
-[![Tests](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/connetto-rs/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
-[![Coverage](https://codecov.io/gh/LucaCappelletti94/connetto-rs/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/connetto-rs)
+[![Tests](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/LICENSE)
+[![Coverage](https://codecov.io/gh/connetto-rs/connetto-rs/graph/badge.svg)](https://codecov.io/gh/connetto-rs/connetto-rs)
 
 The Apple platform bridge for connetto's peer link (R76). `bluetooth` is the host's GATT service and its beacon advertisement, over one process-wide `CBPeripheralManager` on its one serial dispatch queue. On iOS and iPadOS the host serves the exchange, and on the Mac the manager stands the Bluetooth readiness alone, since the Mac never hosts (R76 decision 1). `hotspot` is the joiner's join of the offered network, the Network Extension's on iOS and `CoreWLAN`'s on the Mac by a directed scan and its association, and its read of the network the device joined. `device_name` and `device_idiom` read `UIDevice` off the app's main queue on iOS and iPadOS, and the Mac's hostname and `Other` on the Mac. This is the workspace's second unsafe crate, and every `unsafe` block sits in its platform module.
 

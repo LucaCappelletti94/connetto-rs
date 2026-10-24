@@ -1,9 +1,9 @@
 # connetto-test-harness
 
-[![Tests](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/connetto-rs/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
-[![Coverage](https://codecov.io/gh/LucaCappelletti94/connetto-rs/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/connetto-rs)
-[![Publish](https://img.shields.io/badge/publish-workspace%20only-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/crates/connetto-test-harness/Cargo.toml)
+[![Tests](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/LICENSE)
+[![Coverage](https://codecov.io/gh/connetto-rs/connetto-rs/graph/badge.svg)](https://codecov.io/gh/connetto-rs/connetto-rs)
+[![Publish](https://img.shields.io/badge/publish-workspace%20only-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/crates/connetto-test-harness/Cargo.toml)
 
 In-process integration fixtures that drive the production PostgreSQL write, snapshot, CDC and aggregate-read paths. `HarnessAuth` selects roster, RLS or `OpenFGA` authorization.
 
