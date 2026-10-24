@@ -94,7 +94,7 @@ use super::{
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
-    share_keys::{ReplaceShareKeys, ShareKeysReplaced},
+    share_keys::{ReplaceShareKeys, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
     writer::{BindDevice, RetireWriter, WriterAnswer},
 };
@@ -212,6 +212,11 @@ pub enum ControlMessage {
     /// real server, which answers the caller's identity through the rows it
     /// serves.
     TabIdentity(TabIdentity),
+    /// A relay tab asks its worker to change the worker's share keys. Never
+    /// sent to a real server, which ignores it.
+    TabShareKeyChange(TabShareKeyChange),
+    /// A relay answers a tab's share-key change. Never sent by a real server.
+    TabShareKeyAnswer(TabShareKeyAnswer),
     /// Session-terminating error.
     FatalError(FatalError),
     /// Server reports that live delivery is temporarily paused.

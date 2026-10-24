@@ -44,7 +44,10 @@ pub use registration::{
     BOT_REGISTRATION_DOMAIN, BotListEntry, BotRegistered, Challenge, RegisterBot,
     bot_registration_message,
 };
-pub use share_keys::{ReplaceShareKeys, ShareKeysReplaced};
+pub use share_keys::{
+    ReplaceShareKeys, ShareKeyChange, ShareKeysReplaced, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome,
+};
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
     SubscriptionSpec, Unsubscribe,

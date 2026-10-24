@@ -7,24 +7,22 @@
 //! rate-limited replacement arms the server's delay without losing the
 //! accepted set.
 
-use std::collections::VecDeque;
-use std::future::{Future, ready};
+use std::future::ready;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, Grant, SyncSchema};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, Grant};
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, Handshake,
-    HandshakeAck, Pong, RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin,
-    SnapshotEnd, WriterGrant,
+    AggregateUpdate, ControlMessage, FullResyncReason, FullResyncRequired, Handshake, Pong,
+    RateLimited, ReplaceShareKeys, ShareKeysReplaced, SnapshotBegin, SnapshotEnd,
 };
-use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::traits::{IncomingFrame, Transport as _};
 use diesel::prelude::*;
-use parking_lot::Mutex;
-use thiserror::Error;
+
+use super::support::{Script, handshake_ack as ack, key_gated_notes as schema};
 
 /// The resume cursor the scripted snapshots stamp.
 const CURSOR: [u8; 8] = [0, 0, 0, 0, 0, 0, 1, 7];
@@ -37,93 +35,20 @@ diesel::table! {
     }
 }
 
-/// A scripted transport that records what the client sends and serves the
-/// frames a test queues, idling while none are queued.
-#[derive(Clone, Default)]
-struct Script {
-    frames: Arc<Mutex<VecDeque<IncomingFrame>>>,
-    handshakes: Arc<Mutex<Vec<Handshake>>>,
-    replacements: Arc<Mutex<Vec<ReplaceShareKeys>>>,
-    pings: Arc<Mutex<Vec<u64>>>,
-    closed: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Error)]
-enum Gone {
-    #[error("the scripted socket is gone")]
-    Closed,
-}
-
 impl Script {
-    fn say(&self, frame: IncomingFrame) {
-        self.frames.lock().push_back(frame);
-    }
-}
-
-impl Transport for Script {
-    type Error = Gone;
-
-    fn send_control(
-        &mut self,
-        message: ControlMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        match &message {
-            ControlMessage::Handshake(handshake) => self.handshakes.lock().push(handshake.clone()),
-            ControlMessage::ReplaceShareKeys(replacement) => {
-                self.replacements.lock().push(replacement.clone());
-            }
-            ControlMessage::Ping(ping) => self.pings.lock().push(ping.nonce),
-            _ => {}
-        }
-        if self.closed.load(Ordering::Acquire) {
-            ready(Err(Gone::Closed))
-        } else {
-            ready(Ok(()))
-        }
+    fn handshakes(&self) -> Vec<Handshake> {
+        self.sent(|message| match message {
+            ControlMessage::Handshake(handshake) => Some(handshake.clone()),
+            _ => None,
+        })
     }
 
-    fn send_bulk(
-        &mut self,
-        _message: BulkMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
+    fn pings(&self) -> Vec<u64> {
+        self.sent(|message| match message {
+            ControlMessage::Ping(ping) => Some(ping.nonce),
+            _ => None,
+        })
     }
-
-    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
-        let frames = Arc::clone(&self.frames);
-        let closed = Arc::clone(&self.closed);
-        async move {
-            loop {
-                if closed.load(Ordering::Acquire) {
-                    return Ok(None);
-                }
-                if let Some(frame) = frames.lock().pop_front() {
-                    return Ok(Some(frame));
-                }
-                tokio::task::yield_now().await;
-            }
-        }
-    }
-
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
-        self.closed.store(true, Ordering::Release);
-        ready(Ok(()))
-    }
-}
-
-fn ack() -> IncomingFrame {
-    IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "script".to_owned(),
-        session_token: "script".to_owned(),
-        resume_token: "script".to_owned(),
-        current_cursor: Cursor::from(Vec::new()),
-        schema_version: None,
-        initial_credits: 64,
-        writer: Some(WriterGrant {
-            number: 1,
-            frontier: 0,
-        }),
-    }))
 }
 
 fn pong(nonce: u64) -> IncomingFrame {
@@ -149,20 +74,6 @@ fn snapshot_end(sub_id: &str) -> IncomingFrame {
         sub_id: sub_id.to_owned(),
         cursor: Cursor::from(CURSOR.to_vec()),
     }))
-}
-
-fn schema() -> SyncSchema {
-    SyncSchema::new(connetto_core::SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
-         CREATE VIEW visible AS SELECT * FROM notes \
-         WHERE owner = current_app_user() \
-            OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
 }
 
 /// base64url without padding, for minting the JWT-shaped grants this suite holds.
@@ -265,8 +176,7 @@ async fn step_or_idle(conn: &mut ConnettoConnection<Script>) {
 /// The last replacement this script was sent, and its keys' order.
 fn replacement(script: &Script) -> ReplaceShareKeys {
     script
-        .replacements
-        .lock()
+        .replacements()
         .last()
         .cloned()
         .expect("a replacement was sent")
@@ -362,12 +272,7 @@ async fn a_lost_connection_resends_the_unsettled_set() {
     conn.attach(second.clone())
         .await
         .expect("the redial handshakes");
-    let handshake = second
-        .handshakes
-        .lock()
-        .last()
-        .cloned()
-        .expect("handshake sent");
+    let handshake = second.handshakes().last().cloned().expect("handshake sent");
     let mut expected = first.keys;
     expected.insert(0, Grant::new("user:tester"));
     assert_eq!(handshake.grants, expected);
@@ -412,7 +317,7 @@ async fn a_rate_limited_replacement_arms_its_delay_and_keeps_its_set() {
         "the timer holds the server's delay, got {:?}",
         timer.wait()
     );
-    assert_eq!(script.replacements.lock().len(), 1, "nothing retries early");
+    assert_eq!(script.replacements().len(), 1, "nothing retries early");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     step_or_idle(&mut conn).await;
@@ -454,8 +359,7 @@ async fn a_known_empty_checkpoint_is_presented_on_the_next_handshake() {
         .await
         .expect("the redial handshakes");
     let handshake = second
-        .handshakes
-        .lock()
+        .handshakes()
         .last()
         .cloned()
         .expect("the handshake was sent");
@@ -565,12 +469,7 @@ async fn a_computed_declaration_is_fenced_before_publication() {
         },
     )));
     pump(&mut conn, Duration::from_secs(5)).await;
-    let nonce = script
-        .pings
-        .lock()
-        .first()
-        .copied()
-        .expect("the fence is sent");
+    let nonce = script.pings().first().copied().expect("the fence is sent");
     assert!(matches!(
         conn.ping(nonce).await,
         Err(connetto_client::ClientError::Protocol(_))
@@ -579,7 +478,7 @@ async fn a_computed_declaration_is_fenced_before_publication() {
     conn.ping(application_nonce)
         .await
         .expect("send an application ping");
-    assert_eq!(*script.pings.lock(), vec![nonce, application_nonce]);
+    assert_eq!(script.pings(), vec![nonce, application_nonce]);
     script.say(pong(application_nonce));
     pump(&mut conn, Duration::from_secs(5)).await;
     assert_eq!(
@@ -728,7 +627,7 @@ async fn a_rejected_secret_write_sends_no_replacement_and_preserves_local_access
     ));
     step_or_idle(&mut conn).await;
     assert!(
-        script.replacements.lock().is_empty(),
+        script.replacements().is_empty(),
         "a rejected change sends no replacement"
     );
 
@@ -858,12 +757,7 @@ async fn offline_changes_present_only_the_accepted_set_on_the_next_handshake() {
         .await
         .expect("bounded handshake")
         .expect("attach");
-    let handshake = next
-        .handshakes
-        .lock()
-        .last()
-        .cloned()
-        .expect("handshake sent");
+    let handshake = next.handshakes().last().cloned().expect("handshake sent");
     assert_eq!(handshake.grants, vec![Grant::new("user:tester"), retained]);
     assert_eq!(handshake.last_cursor, Some(Cursor::from(CURSOR.to_vec())));
     assert_eq!(handshake.cursor_subjects, None);
@@ -899,7 +793,7 @@ async fn a_replacement_answer_does_not_settle_a_later_computed_declaration() {
         .await
         .expect("subscribe computed");
     step_or_idle(&mut conn).await;
-    let nonce = *script.pings.lock().last().expect("declaration fence sent");
+    let nonce = *script.pings().last().expect("declaration fence sent");
     script.say(IncomingFrame::Control(ControlMessage::ShareKeysReplaced(
         ShareKeysReplaced { request_id },
     )));
@@ -935,7 +829,7 @@ async fn refused_computed_declarations_keep_coverage_unknown_until_retired() {
             .expect("subscribe computed");
         script.say(IncomingFrame::Control(response));
         pump(&mut conn, Duration::from_secs(5)).await;
-        let nonce = *script.pings.lock().last().expect("declaration fence sent");
+        let nonce = *script.pings().last().expect("declaration fence sent");
         script.say(pong(nonce));
         pump(&mut conn, Duration::from_secs(5)).await;
         assert_eq!(coverage(&mut conn), None);
@@ -971,7 +865,7 @@ async fn an_elapsed_retry_waits_for_the_declaration_fence_without_spinning() {
         .expect("subscribe computed");
     script.say(aggregate_bootstrap());
     pump(&mut conn, Duration::from_secs(5)).await;
-    let nonce = *script.pings.lock().last().expect("declaration fence");
+    let nonce = *script.pings().last().expect("declaration fence");
     tokio::time::sleep(
         conn.share_key_timer().expect("retry timer").wait() + Duration::from_millis(20),
     )
@@ -983,14 +877,14 @@ async fn an_elapsed_retry_waits_for_the_declaration_fence_without_spinning() {
         conn.share_key_timer().expect("fence deadline").wait() >= Duration::from_secs(20),
         "an elapsed retry must wait for the outstanding fence"
     );
-    assert_eq!(script.replacements.lock().len(), 1);
+    assert_eq!(script.replacements().len(), 1);
     script.say(pong(nonce));
     pump(&mut conn, Duration::from_secs(5)).await;
     step_or_idle(&mut conn).await;
     let retried = replacement(&script);
     assert_ne!(retried.request_id, first.request_id);
     assert_eq!(retried.keys, first.keys);
-    assert_eq!(script.replacements.lock().len(), 2);
+    assert_eq!(script.replacements().len(), 2);
 }
 
 #[tokio::test]
@@ -1061,7 +955,7 @@ async fn unrelated_replacement_answers_cannot_settle_the_current_generation() {
     }
     settle(&mut conn, &script).await;
     assert_eq!(coverage(&mut conn), Some(known(&["a", "b"])));
-    assert_eq!(script.replacements.lock().len(), 1);
+    assert_eq!(script.replacements().len(), 1);
 }
 
 #[tokio::test]
@@ -1079,7 +973,7 @@ async fn identical_additions_and_absent_removals_preserve_completed_coverage() {
         .await
         .expect("remove an absent subject");
     step_or_idle(&mut conn).await;
-    assert!(script.replacements.lock().is_empty());
+    assert_eq!(script.replacements(), Vec::new());
     assert_eq!(coverage(&mut conn), Some(known(&["a"])));
 }
 
@@ -1121,8 +1015,7 @@ async fn unanswered_request_disconnects(computed: bool) {
         .expect("bounded reattach")
         .expect("reattach after timeout");
     assert_eq!(
-        next.handshakes
-            .lock()
+        next.handshakes()
             .last()
             .expect("resume handshake")
             .cursor_subjects,
@@ -1179,7 +1072,7 @@ async fn expiry_preempts_a_rate_limit_without_retrying_the_replacement_early() {
         Some("b".to_owned()),
     );
     step_or_idle(&mut conn).await;
-    assert_eq!(script.replacements.lock().len(), 1);
+    assert_eq!(script.replacements().len(), 1);
     let retry = conn.share_key_timer().expect("remaining retry delay");
     tokio::time::sleep(retry.wait() + Duration::from_millis(20)).await;
     conn.process_share_keys(true)
@@ -1187,5 +1080,5 @@ async fn expiry_preempts_a_rate_limit_without_retrying_the_replacement_early() {
         .expect("process retry deadline");
     step_or_idle(&mut conn).await;
     assert_eq!(replacement(&script).keys, vec![retained]);
-    assert_eq!(script.replacements.lock().len(), 2);
+    assert_eq!(script.replacements().len(), 2);
 }

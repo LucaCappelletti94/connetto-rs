@@ -380,6 +380,7 @@ pub(crate) fn build_config(
         .with_tuning(*tuning)
         .with_custody(custody)
         .with_storage_schema(schema)
+        .with_relay_mirror(schema.is_relay_mirror())
 }
 
 /// The share keys the build folds into the base config after it, applied on

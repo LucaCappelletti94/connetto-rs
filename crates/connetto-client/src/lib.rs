@@ -21,7 +21,8 @@ use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
     MutationReject, MutationRejectReason, Ping, Provenance, ReplaceShareKeys, RetireWriter,
-    Subscribe, SubscriptionSpec, TabIdentity, Unsubscribe, WriterAnswer,
+    ShareKeyChange, Subscribe, SubscriptionSpec, TabIdentity, TabShareKeyAnswer, TabShareKeyChange,
+    TabShareKeyOutcome, Unsubscribe, WriterAnswer,
 };
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
@@ -849,6 +850,9 @@ pub(crate) struct ClientConfig {
     shared_layout: Option<Arc<connetto_core::schema::SharedLayout>>,
     shared_tables: HashSet<String>,
     connection_ddl: Option<Arc<str>>,
+    /// Whether this connection mirrors a relay's worker, which holds the share
+    /// keys, so a key change travels to the relay instead of committing here.
+    relay_mirror: bool,
 }
 
 impl ClientConfig {
@@ -870,6 +874,7 @@ impl ClientConfig {
             shared_layout: None,
             shared_tables: HashSet::new(),
             connection_ddl: None,
+            relay_mirror: false,
         }
     }
 
@@ -943,6 +948,13 @@ impl ClientConfig {
             function: SUBJECTS_FUNCTION.to_owned(),
             set: ShareKeySet::rendered(separator, keys),
         });
+        self
+    }
+
+    /// Mark the connection as a relay tab's mirror (R95 decision 17).
+    #[must_use]
+    pub(crate) fn with_relay_mirror(mut self, relay_mirror: bool) -> Self {
+        self.relay_mirror = relay_mirror;
         self
     }
 
@@ -1472,6 +1484,15 @@ struct ShareKeyRequest {
     request_id: String,
     /// The generation the swap carried.
     generation: u64,
+    /// The instant the answer bound expires.
+    deadline: Duration,
+}
+
+/// A tab's share-key change awaiting its relay's answer.
+#[derive(Debug)]
+struct RelayShareKeyWait {
+    /// Where the outcome goes.
+    answer: tokio::sync::oneshot::Sender<Result<(), ClientError>>,
     /// The instant the answer bound expires.
     deadline: Duration,
 }
@@ -3307,6 +3328,8 @@ pub struct ConnettoConnection<T: Transport> {
     share_key_persistence: Option<ShareKeyPersistence>,
     /// A changed share-key set still owed its save to the store.
     share_key_save_pending: bool,
+    /// A relay mirror's share-key changes awaiting their answers, by request id.
+    relay_share_key_waits: HashMap<String, RelayShareKeyWait>,
     /// The earliest parsed expiry of a held key, refreshed at every set
     /// change, so an unrelated frame never parses a grant.
     share_key_expiry: Option<i64>,
@@ -3646,6 +3669,7 @@ where
             share_key_retry_at: None,
             share_key_persistence: None,
             share_key_save_pending: false,
+            relay_share_key_waits: HashMap::new(),
             share_key_expiry: None,
             share_key_deadline: None,
             share_key_armed: 0,
@@ -4705,6 +4729,8 @@ where
         }
         #[cfg(feature = "device-identity")]
         self.enrol_waiters.clear();
+        // A relay answer can no longer arrive, so each waiting tab call fails now.
+        self.relay_share_key_waits.clear();
         // Desired keys and durable coverage survive a transport failure.
         self.share_key_request = None;
         self.declaration_fence = None;
@@ -4830,25 +4856,52 @@ where
                 None => Some(fence.deadline),
             };
         }
+        if let Some(relay) = self
+            .relay_share_key_waits
+            .values()
+            .map(|wait| wait.deadline)
+            .min()
+        {
+            deadline = Some(deadline.map_or(relay, |armed| armed.min(relay)));
+        }
         if deadline != self.share_key_deadline {
             self.share_key_deadline = deadline;
             self.share_key_armed += 1;
         }
     }
 
-    /// Drop the connection when a share-key answer overran its bound.
+    /// Drop the connection when a share-key answer overran its bound, and end
+    /// every relay wait past its own bound with an unknown outcome.
     fn check_share_key_deadlines(&mut self) {
+        let now = crate::away::SystemClock.monotonic();
+        let overdue: Vec<String> = self
+            .relay_share_key_waits
+            .iter()
+            .filter(|(_, wait)| now >= wait.deadline)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let expired = !overdue.is_empty();
+        for id in overdue {
+            if let Some(wait) = self.relay_share_key_waits.remove(&id) {
+                let _ = wait.answer.send(Err(ClientError::Transport(
+                    "the relay did not answer the share-key change in time, so its outcome is unknown"
+                        .to_owned(),
+                )));
+            }
+        }
         if self
             .share_key_request
             .as_ref()
-            .is_some_and(|request| crate::away::SystemClock.monotonic() >= request.deadline)
+            .is_some_and(|request| now >= request.deadline)
             || self
                 .declaration_fence
                 .as_ref()
-                .is_some_and(|fence| crate::away::SystemClock.monotonic() >= fence.deadline)
+                .is_some_and(|fence| now >= fence.deadline)
         {
             tracing::warn!("a share-key answer overran its bound, dropping the connection");
             self.disconnected();
+        } else if expired {
+            self.recompute_share_key_deadline();
         }
     }
 
@@ -4974,15 +5027,82 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica rejects the write and
-    /// [`ClientError::Auth`] when the store refuses the save. A failed change
-    /// leaves the held set unchanged.
+    /// [`ClientError::Session`] when the replica rejects the write or this
+    /// connection is a relay tab's mirror, which changes keys through
+    /// [`ConnettoClient`], and [`ClientError::Auth`]
+    /// when the store refuses the save. A failed change leaves the held set
+    /// unchanged.
     pub async fn add_share_key<K: CapabilityKey>(
         &mut self,
         grant: &Grant,
         subject: &CapabilitySubject<K>,
     ) -> Result<(), ClientError> {
-        let rendered = subject.key().to_string();
+        self.refuse_relay_mirror_change()?;
+        self.add_rendered_share_key(grant, subject.key().to_string())
+            .await
+            .map(drop)
+    }
+
+    /// Drop every key `subject` renders as from the durable share-key set.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_share_key`](Self::add_share_key).
+    pub async fn remove_share_key<K: CapabilityKey>(
+        &mut self,
+        subject: &CapabilitySubject<K>,
+    ) -> Result<(), ClientError> {
+        self.refuse_relay_mirror_change()?;
+        self.remove_rendered_share_key(&subject.key().to_string())
+            .await
+            .map(drop)
+    }
+
+    /// Apply a relay tab's change to the keys this worker holds, reporting
+    /// whether the subjects its replica answers moved.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_share_key`](Self::add_share_key).
+    pub async fn apply_relay_share_key_change(
+        &mut self,
+        change: &ShareKeyChange,
+    ) -> Result<bool, ClientError> {
+        self.refuse_relay_mirror_change()?;
+        match change {
+            ShareKeyChange::Add { grant, subject } => {
+                self.add_rendered_share_key(grant, subject.clone()).await
+            }
+            ShareKeyChange::Remove { subject } => self.remove_rendered_share_key(subject).await,
+        }
+    }
+
+    /// A count that moves whenever the held share-key set changes, so a relay
+    /// restates its identity to its tabs only after it moved.
+    #[must_use]
+    pub fn share_key_generation(&self) -> u64 {
+        self.share_key_generation
+    }
+
+    /// Whether this connection mirrors a relay's worker.
+    pub(crate) fn is_relay_mirror(&self) -> bool {
+        self.config.relay_mirror
+    }
+
+    fn refuse_relay_mirror_change(&self) -> Result<(), ClientError> {
+        if self.config.relay_mirror {
+            return Err(ClientError::Session(
+                "a relay tab changes share keys through its ConnettoClient".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn add_rendered_share_key(
+        &mut self,
+        grant: &Grant,
+        rendered: String,
+    ) -> Result<bool, ClientError> {
         let changed = match &mut self.config.subjects {
             Some(source) => {
                 if source
@@ -5000,7 +5120,7 @@ where
             None => false,
         };
         if !changed {
-            return Ok(());
+            return Ok(false);
         }
         if let Err(error) = self.commit_share_key_change().await {
             if let Some(source) = &mut self.config.subjects {
@@ -5008,31 +5128,20 @@ where
             }
             return Err(error);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Drop every key `subject` renders as from the durable share-key set.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Session`] when the replica rejects the write and
-    /// [`ClientError::Auth`] when the store refuses the save. A failed change
-    /// leaves the held set unchanged.
-    pub async fn remove_share_key<K: CapabilityKey>(
-        &mut self,
-        subject: &CapabilitySubject<K>,
-    ) -> Result<(), ClientError> {
-        let rendered = subject.key().to_string();
+    async fn remove_rendered_share_key(&mut self, rendered: &str) -> Result<bool, ClientError> {
         let removed: Vec<(Grant, String)> = match &mut self.config.subjects {
             Some(source) => source
                 .set
                 .keys
-                .extract_if(.., |(_, subject_held)| *subject_held == rendered)
+                .extract_if(.., |(_, subject_held)| subject_held == rendered)
                 .collect(),
             None => Vec::new(),
         };
         if removed.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if let Err(error) = self.commit_share_key_change().await {
             if let Some(source) = &mut self.config.subjects {
@@ -5040,7 +5149,53 @@ where
             }
             return Err(error);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Send a relay tab's change to its worker and the receiver its outcome
+    /// arrives on, within [`SHARE_KEY_REQUEST_WAIT`].
+    ///
+    /// The receiver fails at once when the connection drops.
+    pub(crate) async fn ask_relay_share_key(
+        &mut self,
+        change: ShareKeyChange,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), ClientError>>, ClientError> {
+        let request_id = share_key_request_id();
+        self.wire()?
+            .transport
+            .send_control(ControlMessage::TabShareKeyChange(TabShareKeyChange {
+                request_id: request_id.clone(),
+                change,
+            }))
+            .await
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let (answer, receiver) = tokio::sync::oneshot::channel();
+        self.relay_share_key_waits.insert(
+            request_id,
+            RelayShareKeyWait {
+                answer,
+                deadline: crate::away::SystemClock.monotonic() + SHARE_KEY_REQUEST_WAIT,
+            },
+        );
+        self.recompute_share_key_deadline();
+        Ok(receiver)
+    }
+
+    /// Hand a relay's answer to the change waiting on it. An answer nobody
+    /// waits for arrived after its wait ended, and is dropped.
+    fn settle_relay_share_key(&mut self, answer: TabShareKeyAnswer) {
+        let Some(wait) = self.relay_share_key_waits.remove(&answer.request_id) else {
+            tracing::debug!(request_id = %answer.request_id, "a share-key answer arrived after its wait");
+            return;
+        };
+        let outcome = match answer.outcome {
+            TabShareKeyOutcome::Changed => Ok(()),
+            TabShareKeyOutcome::Locked => Err(ClientError::Locked),
+            TabShareKeyOutcome::StoreRefused(detail) => Err(ClientError::Auth(detail)),
+            TabShareKeyOutcome::ReplicaRefused(detail) => Err(ClientError::Session(detail)),
+        };
+        let _ = wait.answer.send(outcome);
+        self.recompute_share_key_deadline();
     }
 
     /// Send the swap carrying every live held key, one in flight at a time.
@@ -6152,6 +6307,10 @@ where
                 self.push_revocations(update.lists);
                 #[cfg(not(feature = "device-identity"))]
                 drop(update);
+                return Ok(None);
+            }
+            Some(IncomingFrame::Control(ControlMessage::TabShareKeyAnswer(answer))) => {
+                self.settle_relay_share_key(answer);
                 return Ok(None);
             }
             Some(IncomingFrame::Control(msg)) => {
