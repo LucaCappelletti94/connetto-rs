@@ -155,7 +155,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R87~~ | Storage quotas and deployment ceilings |
 | done | ~~R71~~ | Linux key custody across a reboot, which R74's device key shares on Linux |
 | any | R70 | Backup and restore. Step 2's frontier leg waits on R75, whose frontier is what it demonstrates against |
-| any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
+| done | ~~R72~~ | Clock discipline, which absorbs the certificate clock rule R74 states |
 | any | R74 | Device identity and certificates, first of the peer phases. Needs nothing since R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step |
 | any | R75 | The per-device applied frontier. Needs R74 |
 | any | R76 | The peer link. Needs R74 |
@@ -270,7 +270,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R69 files in every demo | **DONE** (A through G complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
 | R70 backup and restore story | STARTED 2026-09-22, nineteen decisions taken, steps 1 and 2's pre-R75 legs written into chapter 20, the chunk-store fix built (boot reconcile, `lost`, healing on native and browser, one content retention rule and pin API on both, heal entries in the outbox) | R75 for step 2's frontier leg. Decision 6 is built (2026-10-06, merged 2026-10-18 as #131), every adopted boot reconciling the whole store through subql's `OpenFgaPolicy::reconcile_store`. Decisions 4, 5, 8, 10, 18 and 19 are built, so every restore method resyncs its clients and revokes every session. Chapter 20 is shared with R73 | no |
 | R71 Linux key custody survives reboot | **DONE** (2026-09-29) | nothing. Sixteen decisions in the section. KDE Wallet loses a write made in the 5 s before `ksecretd` is stopped, `upstream/kwallet-sigterm-loses-recent-writes.md`, pursued upstream on `upstream/ksecretd-sigterm-flush` (2026-09-29) | no, R71 holds without it |
-| R72 clock discipline (X6) | NOT STARTED | nothing | no |
+| R72 clock discipline (X6) | **DONE** (2026-10-24) | nothing. Merged as #211, #212, #214 and #215, chapter 21 states the rule per timer class and X6 is closed | no |
 | R74 device identity and certificates | IN PROGRESS, merged (2026-10-06, #130) with the follow-ups #139 (2026-10-12), #138 (2026-10-14), #146 (2026-10-15), #161 (2026-10-16) and #132 (2026-10-18), and step 7's peer half with proofs 3, 4 and 6's peer half built by R76's slices 1 and 2 (2026-10-07, merged 2026-10-14 as #134 and #135) | proof 5's Windows and Linux `unproven` records, which R76's home run produces | no |
 | R75 the per-device applied frontier | IN PROGRESS, every step built, slices 1 to 5 merged as #196, #197, #199, #200 and #206 (2026-10-20) | R74. Touches the R2 watermark contract and the R56 import. The Done when's three proofs stand in the `writer_frontier` and `courier_frontier` suites with their audit records, for a device writer and a number writer, the courier replay the one a device author alone signs, and the section's closing record is what remains | no |
 | R76 the peer link | IN PROGRESS, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first. Slices 1 to 4 merged 2026-10-14 as #134, #135, #136 and #137, slices 5 to 8 merged 2026-10-15 as #140, #141, #142 and #143, slice 9a, iPhone hosting and iPad joining, merged 2026-10-16 as #148, slice 9b, Linux, and slice 9c, macOS, merged 2026-10-18 as #162 and #163, slice 9f, three handhelds over one hotspot with the Bonjour discovery on iOS, merged 2026-10-20 as #204, with the duplicate close's keep across a reset as #158 (2026-10-15) | nothing. Slice 9d (Windows) is not started, and 9e's home run needs every local machine in one place | no |
@@ -370,7 +370,7 @@ graph TD
   R70[R70 backup and restore story]
   R65 -.->|content backup split| R70
   R71[R71 Linux key custody survives reboot]
-  R72[R72 clock discipline]
+  R72[R72 clock discipline, DONE]
   R73[R73 failover verification]
   R58 -.->|the bound it extends| R81[R81 aggregate read time bound]
   R30 --> R82[R82 grouped and re-executed delivery]
@@ -5116,11 +5116,26 @@ A fresh Linux session reopens the replica and the device tier without re-minting
 
 ## R72: clock discipline
 
-**Status.** NOT STARTED. X6 given an owner 2026-08-21 by the full review.
+**Status.** DONE 2026-10-24. X6 given an owner 2026-08-21 by the full review. Started 2026-10-20, held at the maintainer's word until R75 and R76's slice 9f merged so the inventory covers their timers. Every timer falls in one of eight classes with its rule stated in chapter 21, the code matches the rule wherever the inventory found a disagreement, and X6 is closed. The four slices merged on 2026-10-24 as #211, #212, #214 and #215.
 
-**Blocked on nothing.**
+**Blocked on nothing.** Two decisions were taken with the maintainer on 2026-10-20 and one on 2026-10-24, listed below.
 
-**Changes state.** Client tables: the revocation list in the enrolment store (step 6), which every identity on the device prunes on a `RevocationUpdate` and which decides whether a peer's device key is used. Server tables: the `connetto_device_certificates` and `connetto_device_enrolments` schema, built with the step 7 inventory. Wire messages: the `RevocationUpdate` carrying the list hash and a reason, which every connected client receives. Archive format: none.
+### Decisions
+
+1. **A wall deadline signed on one machine and checked on another allows a skew sized to the clocks involved** (2026-10-20). `connetto_core::clock::DEVICE_SKEW`, five minutes, wherever a device or peer clock is on either side (R74 step 7's tolerance), and `SERVER_SKEW`, 60 seconds, for a token or content ticket deployment servers both sign and check. Rejected: one five-minute tolerance everywhere, which keeps a stolen access token or ticket usable five minutes past its `exp` against servers that run NTP.
+2. **The rules go into a new chapter, `21-clocks.md`** (2026-10-20), which owns the per-class table, and chapters 11, 14, 15, 18 and 19 cite it where they meet a timer.
+3. **The browser worker's deadlines read `connetto_client::SystemClock.monotonic()`** (2026-10-24), the `performance.now()` reading the away gate already takes in a worker, so the page reads one monotonic clock. Rejected: a helper of its own in `connetto-web` reading the same clock.
+
+The evidence settled the other classes without a question, each recorded in chapter 21 with its sources. A deadline Postgres stores is decided by the database clock, the rule `audit.rs` already states for `auth_events`.
+
+### Slices
+
+One pull request each, stacked in this order.
+
+1. **The shared skew constants and the client side.** `connetto_core::clock`, the peer link and the client's enrolment on `DEVICE_SKEW`, the watch grace re-anchored when the wall clock steps back, the browser worker's deadlines on `performance.now()`, and the `away.rs` and `clock.rs` doc corrections.
+2. **The server's skew and sweeps.** Token leeway and ticket expiry on `SERVER_SKEW`, revoked serials kept until expiry plus `DEVICE_SKEW`, certificate liveness and the file server's stored times on the database clock, and the writer and content sweeps on `MissedTickBehavior::Delay`.
+3. **The server's stored deadlines on the database clock.** The auth store's session deadlines, bans, retained provider tokens and a registration code's `used_at`, each written and compared on Postgres `now()`, the in-memory stores keeping the process clock, and a registration code's device-written expiry judged with `DEVICE_SKEW`.
+4. **The record.** Chapter 21, its citations in chapters 11, 14, 15, 18 and 19, X6 closed, and this section and the status table brought to DONE.
 
 ### Purpose
 

@@ -93,12 +93,12 @@
       <text x="230" y="46" text-anchor="middle" font-size="8.5" fill="#C62828">R70: step 2's frontier leg, which waits on R75</text>
     </g>
 
-    <!-- ===== Clock discipline (R72) ===== -->
+    <!-- ===== Clock discipline (R72, built) ===== -->
     <g transform="translate(35, 796)">
-      <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="50" rx="1" fill="#EF5350" />
-      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Clock discipline (open question X6)</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R72</text>
+      <rect width="460" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="50" rx="1" fill="#4CAF50" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">Clock discipline</text>
+      <text x="230" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: one clock rule per timer class, the device and server skews (chapter 21)</text>
     </g>
 
     <!-- ===== connetto-file-server ===== -->
