@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
-use connetto_core::messages::{BindValue, FatalErrorReason, Grant, SubscriptionSpec};
-use connetto_core::quote_ident;
+use connetto_core::messages::{BindValue, ContentVerb, FatalErrorReason, Grant, SubscriptionSpec};
 use connetto_core::traits::{MaybeSend, Transport};
+use connetto_core::{Major, quote_ident};
 use diesel::associations::{HasTable, Identifiable};
 use diesel::dsl::Find;
 use diesel::query_builder::{
@@ -51,7 +51,7 @@ use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment};
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
-use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer, ShareKeyTimer};
+use crate::{ClientError, ClientEvent, ConnettoConnection, DrainTimer, ResendTimer, ShareKeyTimer};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
 /// the bind values the placeholders stand for, in placeholder order.
@@ -2345,6 +2345,92 @@ where
         Ok(state.conn.unsynced())
     }
 
+    /// Whether the drain wire is up and its held writes have settled (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked.
+    pub async fn held_files_ready(&self) -> Result<Option<Major>, ClientError> {
+        let state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        Ok(state.conn.held_files_ready())
+    }
+
+    /// Whether the draining major still holds files, whatever the wire state
+    /// (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and a failure to
+    /// read the held rows.
+    pub async fn held_files_pending(&self) -> Result<bool, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.held_files_pending()
+    }
+
+    /// Ask the held major's server for a content ticket over the drain wire
+    /// (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::NotConnected`] without a drain wire, [`ClientError::ShareKeysPending`] while its authority is pending, or [`ClientError::Transport`] when sending fails.
+    pub async fn request_held_ticket(
+        &self,
+        request_id: String,
+        file_id: [u8; 32],
+        verb: ContentVerb,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state
+            .conn
+            .request_held_ticket(request_id, file_id, verb)
+            .await
+    }
+
+    /// A held file settled, so the batch may now be done (R31).
+    ///
+    /// # Errors
+    ///
+    /// A failure to read or forget the held rows.
+    pub async fn held_file_settled(&self) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.held_file_settled().await
+    }
+
+    /// A held file was given up for good, after its held rows were deleted
+    /// (R31).
+    ///
+    /// # Errors
+    ///
+    /// A failure to read or forget the held rows.
+    pub async fn held_file_lost(&self, major: Major) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.held_file_lost(major).await
+    }
+
+    /// The local work a deletion would lose, content fields left to the content layer (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] queueing the writes surfaces.
+    pub async fn pending_work(&self) -> Result<crate::PendingWork, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.flush().await?;
+        Ok(crate::PendingWork {
+            unsynced: state.conn.unsynced(),
+            ..crate::PendingWork::default()
+        })
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
@@ -2846,6 +2932,8 @@ async fn pump<T, F, S>(
     // The sleep for the armed resend, kept across steps so arriving frames do not restart it.
     let mut resend = None;
     let mut key_timer = None;
+    // The drain's owed dial retains its sleep across pump steps.
+    let mut drain = None;
     loop {
         if alive.upgrade().is_none() {
             pump_exit(&shared).await;
@@ -2923,14 +3011,21 @@ async fn pump<T, F, S>(
             &mut key_timer,
             reconnect.as_mut().map(|driver| &mut driver.sleeper),
         );
+        let owed = state.conn.drain_timer();
+        if owed != drain.as_ref().map(|(timer, _)| *timer) {
+            drain = owed
+                .zip(reconnect.as_mut())
+                .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
+        }
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
-        let stepped = step_or_resend(
+        let (stepped, drain_due) = step_or_resend(
             &mut state.conn,
             &shared.wake,
             &mut resend,
             &mut key_timer,
+            &mut drain,
             &mut ask,
             &mut ask_outcome,
         )
@@ -2977,6 +3072,43 @@ async fn pump<T, F, S>(
         // open refresh drains them, waking each affected handle once.
         if !shared.gate.is_locked() {
             refresh_changed(&mut state, &shared.events);
+        }
+
+        // The drain's dial fell due. Dialed outside the state lock, like a
+        // reconnect, and handed over under it.
+        if drain_due && let Some((timer, _)) = drain.take() {
+            drop(state);
+            dial_drain_owed(&shared, &mut reconnect, timer).await;
+        }
+    }
+}
+
+/// Dials the drain wire its dial has fallen due, attaching the held major
+/// over the fresh transport (R31).
+async fn dial_drain_owed<T, F, S>(
+    shared: &Shared<T>,
+    reconnect: &mut Option<ReconnectDriver<F, S>>,
+    timer: DrainTimer,
+) where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+    F: TransportFactory<Transport = T> + MaybeSend + 'static,
+    S: Sleeper + MaybeSend + 'static,
+{
+    let Some(driver) = reconnect.as_mut() else {
+        return;
+    };
+    let dialed = driver.factory.connect().await;
+    let mut state = shared.state.lock().await;
+    match dialed {
+        Ok(transport) => {
+            if let Err(err) = state.conn.attach_drain(timer, transport).await {
+                tracing::warn!(error = %err, "attaching the drain failed");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "dialing the drain failed, backing off");
+            state.conn.drain_dial_failed(timer);
         }
     }
 }
@@ -3390,33 +3522,39 @@ fn pump_finished<T: Transport>(shared: &Shared<T>) {
     shared.pump_done.wake.notify_waiters();
 }
 
-/// One cancellable pump step that also ends when the armed resend is due or
-/// the gate's prompt resolves, and then sends the deferred writes again.
+/// One cancellable pump step that also ends when the armed resend is due, the
+/// drain's dial is due, or the gate's prompt resolves, and then sends the
+/// deferred writes again.
 ///
 /// A due resend means the cancel won, so the step took no frame and an error
-/// from the resend loses none. A resolved prompt is captured in `ask_outcome`
-/// for the caller to apply under the state lock.
-async fn step_or_resend<T, F>(
+/// from the resend loses none. A due drain dial is returned for the caller to
+/// dial outside the state lock (R31). A resolved prompt is captured in
+/// `ask_outcome` for the caller to apply under the state lock.
+async fn step_or_resend<T, F, G>(
     conn: &mut ConnettoConnection<T>,
     wake: &Notify,
     resend: &mut Option<(ResendTimer, core::pin::Pin<Box<F>>)>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
+    drain: &mut Option<(DrainTimer, core::pin::Pin<Box<G>>)>,
     ask: &mut Option<GateAskFuture>,
     ask_outcome: &mut Option<GateAskOutcome>,
-) -> Result<Option<ClientEvent>, ClientError>
+) -> (Result<Option<ClientEvent>, ClientError>, bool)
 where
     T: Transport,
     T::Error: core::fmt::Display,
     F: Future<Output = ()>,
+    G: Future<Output = ()>,
 {
-    let due = AtomicBool::new(false);
+    let resend_due = AtomicBool::new(false);
     let key_due = AtomicBool::new(false);
+    let drain_due = AtomicBool::new(false);
     let cancel = async {
         tokio::select! {
             biased;
             () = wake.notified() => {}
-            () = wait_timer(resend) => due.store(true, Ordering::Relaxed),
+            () = wait_timer(resend) => resend_due.store(true, Ordering::Relaxed),
             () = wait_timer(key_timer) => key_due.store(true, Ordering::Relaxed),
+            () = wait_timer(drain) => drain_due.store(true, Ordering::Relaxed),
             outcome = async {
                 match ask.as_mut() {
                     Some(ask) => ask.as_mut().await,
@@ -3429,12 +3567,13 @@ where
     if key_due.load(Ordering::Relaxed) {
         *key_timer = None;
     }
-    if due.load(Ordering::Relaxed)
+    if resend_due.load(Ordering::Relaxed)
         && let Some((timer, _)) = resend.take()
+        && let Err(err) = conn.resend_deferred(timer).await
     {
-        conn.resend_deferred(timer).await?;
+        return (Err(err), false);
     }
-    stepped
+    (stepped, drain_due.load(Ordering::Relaxed))
 }
 
 /// Fan out the aggregate pushes a lock held, then re-run every live query

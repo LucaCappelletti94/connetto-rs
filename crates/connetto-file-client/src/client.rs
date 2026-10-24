@@ -6,7 +6,11 @@ use std::io::{Read, Seek};
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper};
-use connetto_client::{ClientEvent, ExportScope, ImportChoices, ImportOutcome, SyncStatus};
+use connetto_client::{
+    ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome, PendingWork,
+    SyncStatus,
+};
+use connetto_core::Major;
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
@@ -152,6 +156,7 @@ where
         client
             .with_conn(|conn| {
                 conn.batch_execute(db::CONTENT_DDL)?;
+                conn.batch_execute(db::HELD_CONTENT_DDL)?;
                 db::add_outbox_columns(conn.conn())
             })
             .await??;
@@ -553,6 +558,81 @@ where
         upload::upload(&self.http, &url, &manifest, &store).await
     }
 
+    /// Drains every file held from `major` over the drain wire (R31),
+    /// returning how many landed.
+    ///
+    /// A settled file's rows are deleted before the connection is told, so
+    /// the batch may close only when none is left. A permanent refusal or a
+    /// loss forgets the file and reports it. A retryable failure keeps the
+    /// rows and stops the walk, and the next walk retries it.
+    async fn flush_held_outbox(&self, major: Major) -> Result<usize, ContentError> {
+        let waiting = self
+            .client
+            .with_conn(move |conn| db::held_files(conn.conn(), major))
+            .await??;
+        let mut sent = 0;
+        for file_id in waiting {
+            // The walk runs while the drain wire is up for this major, and a
+            // settled file may have closed it.
+            if self.client.held_files_ready().await? != Some(major) {
+                break;
+            }
+            match self.upload_held_one(major, file_id).await {
+                Ok(()) => {
+                    self.forget_held(major, file_id).await?;
+                    self.client.held_file_settled().await?;
+                    sent += 1;
+                    let _ = self.events.send(ContentEvent::Uploaded { file_id });
+                }
+                Err(err) => {
+                    if err.outcome() == AttemptOutcome::Retry {
+                        let _ = self.events.send(ContentEvent::UploadDeferred {
+                            file_id,
+                            detail: err.to_string(),
+                        });
+                        break;
+                    }
+                    self.forget_held(major, file_id).await?;
+                    self.client.held_file_lost(major).await?;
+                    let _ = self.events.send(ContentEvent::UploadRefused {
+                        file_id,
+                        detail: err.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    /// One held file: a write ticket on the drain wire, then the whole
+    /// negotiation under it.
+    async fn upload_held_one(&self, major: Major, file_id: FileId) -> Result<(), ContentError> {
+        let manifest = self
+            .client
+            .with_conn(move |conn| db::load_held_manifest(conn.conn(), major, file_id))
+            .await??
+            .ok_or(ContentError::NoManifest { file_id })?;
+        let declared_len: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        let url = ticket::request_held(&self.client, file_id, ContentVerb::Write { declared_len })
+            .await?;
+        let store = self.store_for(FETCHED_CLASS);
+        upload::upload(&self.http, &url, &manifest, &store).await
+    }
+
+    /// Deletes one settled or abandoned held file's rows, under suspended capture (R31).
+    async fn forget_held(&self, major: Major, file_id: FileId) -> Result<(), ContentError> {
+        self.client
+            .with_conn(move |conn| {
+                conn.transact_with_bookkeeping(
+                    |c| db::forget_held_file(c, major, file_id),
+                    |_| Ok::<(), diesel::result::Error>(()),
+                )
+                .map(|_| ())
+            })
+            .await?
+            .map_err(ContentError::Replica)
+    }
+
     /// Where this file's bytes are to be had, for display.
     ///
     /// Unsent content answers from the chunk store or not at all: the server
@@ -831,6 +911,16 @@ where
             if self.flush_outbox().await.is_ok_and(|sent| sent > 0) {
                 let _ = self.tidy_content().await;
             }
+            // Files a rebuild held from an older major drain over the drain
+            // wire (R31), walked while that wire is ready for the major.
+            let held_left = match self.client.held_files_ready().await {
+                Ok(Some(major)) => match self.flush_held_outbox(major).await {
+                    Ok(_) => self.client.held_files_pending().await.unwrap_or(false),
+                    Err(_) => true,
+                },
+                Ok(None) => self.client.held_files_pending().await.unwrap_or(false),
+                Err(_) => false,
+            };
             let queued = self
                 .client
                 .with_conn(|conn| db::sendable(conn.conn()))
@@ -838,7 +928,7 @@ where
                 .ok()
                 .and_then(Result::ok)
                 .is_some_and(|waiting| !waiting.is_empty());
-            if queued {
+            if queued || held_left {
                 attempt = attempt.saturating_add(1);
                 sleeper.sleep(policy.backoff(attempt)).await;
                 continue;
@@ -851,7 +941,8 @@ where
                         Ok(
                             ClientEvent::Reconnected
                             | ClientEvent::SyncStatus(SyncStatus::Connected)
-                            | ClientEvent::MutationApplied { .. },
+                            | ClientEvent::MutationApplied { .. }
+                            | ClientEvent::Held(_),
                         ) => break,
                         // A `lost` flip arrives as an ordinary row change.
                         Ok(
@@ -867,6 +958,33 @@ where
                 }
             }
         }
+    }
+
+    /// The local work a deletion would lose (R31), the sync part from the
+    /// connection and the content part from this client's outbox, retired
+    /// files and held files.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] when the connection or the bookkeeping reads fail.
+    pub async fn pending_work(&self) -> Result<PendingWork, ContentError> {
+        let mut pending = self.client.pending_work().await?;
+        pending.content_files = self
+            .client
+            .with_conn(|conn| db::outbox_count(conn.conn()))
+            .await??;
+        pending.retired_files = self
+            .client
+            .with_conn(|conn| db::retired(conn.conn()))
+            .await??
+            .iter()
+            .map(FileId::to_string)
+            .collect();
+        pending.held_files = self
+            .client
+            .with_conn(ConnettoConnection::held_files_total)
+            .await??;
+        Ok(pending)
     }
 
     /// Reclaims the disk every byte nothing wants is holding.

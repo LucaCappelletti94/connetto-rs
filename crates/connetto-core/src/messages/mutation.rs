@@ -13,7 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::writer::Provenance;
+use super::writer::{Provenance, WriterRef};
+use crate::schema::Major;
 
 /// Control-plane header announcing a mutation upload.
 ///
@@ -162,6 +163,69 @@ pub struct MutationConflict {
     /// against a row somebody else deleted conflicts with nothing to send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_row: Option<ConflictRow>,
+}
+
+/// One write an older application schema major captured, named by its writer
+/// and the sequence it is the writer's (R31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldWrite {
+    /// The writer the write is queued under.
+    pub writer: WriterRef,
+    /// Its sequence in that writer's queue.
+    pub seq: u64,
+}
+
+/// How work an older application schema major captured settled while it
+/// drained to that major's server (R31).
+///
+/// A native client reports it as an event. A browser relay hub, whose worker
+/// owns the drain, tells every tab through
+/// [`ControlMessage::HeldWork`](crate::messages::ControlMessage::HeldWork),
+/// so the application reads it wherever it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeldWork {
+    /// A held write was applied by its major's server.
+    Applied {
+        /// The major it was captured under.
+        major: Major,
+        /// The write.
+        write: HeldWrite,
+    },
+    /// A held write was refused by its major's server. Nothing is rolled
+    /// back, because the rebuild already replaced the rows it touched with the
+    /// newer major's snapshot.
+    Rejected {
+        /// The major it was captured under.
+        major: Major,
+        /// The write.
+        write: HeldWrite,
+        /// Why the server refused it, `None` when it collided with a newer
+        /// version of a row instead.
+        reason: Option<MutationRejectReason>,
+    },
+    /// The held work of a major can never be applied, because that major's
+    /// server is gone or serves another schema, so it was dropped and every
+    /// writer it was queued under retired.
+    Lost {
+        /// The major it was captured under.
+        major: Major,
+        /// The writes dropped.
+        writes: Vec<HeldWrite>,
+        /// How many unsent files were dropped.
+        files: u64,
+    },
+    /// Every write and file held from a major is settled.
+    Drained {
+        /// The major whose held work is done.
+        major: Major,
+    },
+    /// The drain wire the held work rides is gone and a redial is owed, so a
+    /// content ticket asked on it settles as abandoned and is reissued on
+    /// the fresh wire.
+    WireLost {
+        /// The major whose held work is draining.
+        major: Major,
+    },
 }
 
 #[cfg(test)]

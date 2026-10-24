@@ -18,6 +18,7 @@ use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
 use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
 use crate::GateMechanism;
+use crate::HeldContent;
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::TransportFactory;
@@ -161,6 +162,7 @@ impl NativeClientBuilder<NativeTransport> {
                 dialer: BoxedDialer::server(server.into()),
                 sleeper: None,
                 client_id: None,
+                held_content: None,
             },
         }
     }

@@ -7,6 +7,7 @@ use connetto_core::Transport;
 use connetto_core::traits::MaybeSend;
 
 use crate::ClientError;
+use crate::HeldContent;
 use crate::live::ConnettoClient;
 
 /// Where the content store sits, the builder's answer for a build.
@@ -37,4 +38,9 @@ pub trait AttachContent<T: Transport> {
         root_key: [u8; 32],
         place: ContentPlace,
     ) -> impl Future<Output = Result<Self::Handle, ClientError>> + MaybeSend;
+
+    /// What a rebuild holds of an older major's unsent files (R31).
+    fn held_content() -> HeldContent {
+        HeldContent::NONE
+    }
 }

@@ -57,6 +57,7 @@ pub mod peer_devices;
 pub mod peer_proof;
 pub mod relay;
 pub mod roster;
+pub mod router;
 pub mod stack;
 pub mod standby;
 pub mod star;

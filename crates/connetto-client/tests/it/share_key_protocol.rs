@@ -198,7 +198,7 @@ fn b64(text: &str) -> String {
 }
 
 /// A grant with the `exp` claim in seconds, or none to read at all.
-fn mint(exp: Option<i64>) -> Grant {
+pub(super) fn mint(exp: Option<i64>) -> Grant {
     let payload = match exp {
         Some(exp) => format!("{{\"exp\":{exp}}}"),
         None => "{}".to_owned(),

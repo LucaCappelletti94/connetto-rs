@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_client::ClientError;
 use connetto_client::share_keys::{ShareKeyFuture, ShareKeySet, ShareKeyStore, share_key_record};
-use connetto_client::{ClientError, UnsyncedWrite};
 use connetto_core::ReplicaKey;
 use connetto_core::custody::Custody;
 use connetto_core::percent::percent_encode;
@@ -298,39 +298,7 @@ pub enum LoginMessage {
     },
 }
 
-/// Local work that would become unrecoverable if this device's data were deleted.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingWork {
-    /// Writes captured locally that the server has not confirmed durable yet,
-    /// each named by the writer and the sequence it is that writer's.
-    pub unsynced: Vec<UnsyncedWrite>,
-    /// Content files still waiting in the upload outbox.
-    pub content_files: u64,
-    /// Content files whose unsent bytes were lost, as hex identities.
-    ///
-    /// These are not pending: the bytes are gone, and the application rows
-    /// naming them are the application's to delete or to ask for again. The
-    /// record survives restarts until
-    /// [`forget_retired_content`] acknowledges it.
-    #[serde(default)]
-    pub retired_files: Vec<String>,
-}
-
-impl PendingWork {
-    /// Whether deleting local data would discard nothing pending.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.unsynced.is_empty() && self.content_files == 0
-    }
-
-    /// The number of pending writes and content files.
-    #[must_use]
-    pub fn len(&self) -> u64 {
-        u64::try_from(self.unsynced.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(self.content_files)
-    }
-}
+pub use connetto_client::PendingWork;
 
 /// A logout message on [`LOGOUT_CHANNEL`], tokenless for the same reason
 /// [`LoginMessage`] is: no variant can carry a credential, so a tab still cannot

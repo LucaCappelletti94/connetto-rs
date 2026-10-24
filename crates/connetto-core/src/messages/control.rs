@@ -91,7 +91,7 @@ use super::{
     error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
-    mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
+    mutation::{HeldWork, MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
     share_keys::{ReplaceShareKeys, ShareKeysReplaced},
@@ -212,6 +212,10 @@ pub enum ControlMessage {
     /// real server, which answers the caller's identity through the rows it
     /// serves.
     TabIdentity(TabIdentity),
+    /// A relay tells a tab how work held from an older application schema
+    /// major settled, since the worker owns the drain (R31). Never sent by a
+    /// real server.
+    HeldWork(HeldWork),
     /// Session-terminating error.
     FatalError(FatalError),
     /// Server reports that live delivery is temporarily paused.

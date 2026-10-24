@@ -242,6 +242,7 @@ pub(super) async fn open_worker<Id>(
     };
     let content_root_key = key.as_ref().map(|key| *key.as_bytes());
     let worker = core
+        .with_held_content(connetto_file_client::held_content())
         .signed_in(resolved.credential)
         .durable(
             place,
