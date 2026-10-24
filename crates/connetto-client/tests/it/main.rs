@@ -92,6 +92,8 @@ mod rls_sync_path;
 mod schema_detection;
 mod schema_handshake;
 
+mod schema_majors;
+
 #[cfg(feature = "native-auth")]
 mod secret_stores;
 

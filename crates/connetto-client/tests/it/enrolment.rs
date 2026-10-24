@@ -2590,7 +2590,8 @@ async fn wd_retiring() {
         carried,
         vec![connetto_client::UnsyncedWrite {
             writer: WriterRef::Device(*new_key.as_bytes()),
-            seq: 1
+            seq: 1,
+            major: connetto_core::Major::new(1),
         }],
         "the tail re-queues under the fresh key at sequence one"
     );

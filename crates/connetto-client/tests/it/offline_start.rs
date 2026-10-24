@@ -22,12 +22,12 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, MemoryRefreshStore,
     SyncStatus, UnsyncedWrite,
 };
-use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, MutationApplied, SubscriptionSpec, WriterGrant,
     WriterRef,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Cursor, Major};
 use diesel::prelude::*;
 use tempfile::{TempDir, tempdir};
 
@@ -186,6 +186,7 @@ async fn a_connection_opens_and_serves_reads_with_no_server() {
         vec![UnsyncedWrite {
             writer: WriterRef::Number(0),
             seq,
+            major: Major::new(1),
         }],
         "the write is queued and visibly unsent"
     );
@@ -213,6 +214,7 @@ async fn no_waiting_write_is_evicted_however_many_queue() {
         .map(|seq| UnsyncedWrite {
             writer: WriterRef::Number(0),
             seq: *seq,
+            major: Major::new(1),
         })
         .collect::<Vec<_>>();
     assert_eq!(

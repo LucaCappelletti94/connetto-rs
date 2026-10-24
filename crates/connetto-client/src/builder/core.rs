@@ -1324,7 +1324,7 @@ where
     let mut conn = if fresh {
         ConnettoConnection::open(replica, schema.replica_ddl(), config, None)
     } else {
-        ConnettoConnection::open_existing(replica, config, None)
+        ConnettoConnection::open_existing(replica, schema.replica_ddl(), config, None)
     }?;
     // The durable share keys load before the first dial, so a build that
     // starts offline already carries the durable set when its first query
@@ -1372,7 +1372,7 @@ where
     let mut conn = if fresh {
         ConnettoConnection::open(replica, schema.replica_ddl(), config, None)
     } else {
-        ConnettoConnection::open_existing(replica, config, None)
+        ConnettoConnection::open_existing(replica, schema.replica_ddl(), config, None)
     }?;
     if let Some(store) = share_key_store {
         conn.initialize_share_key_store(store);

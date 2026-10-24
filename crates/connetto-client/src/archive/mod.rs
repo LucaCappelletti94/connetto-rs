@@ -5,6 +5,8 @@
 pub(crate) mod rows;
 pub(crate) mod zip;
 
+use connetto_core::Major;
+
 use crate::ClientError;
 
 /// How much of the device an export carries.
@@ -34,8 +36,10 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 4 carries each queued write's writer, sequence and chain hash.
-const VERSION: u32 = 4;
+/// Version 5 carries each queued write's writer, sequence, chain hash and the
+/// application schema major it was captured under, beside the major the
+/// archive was made under (R31).
+const VERSION: u32 = 5;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
@@ -102,6 +106,9 @@ pub(crate) struct Archive<'a> {
     pub(crate) scope: ExportScope,
     /// The schema it was made under.
     pub(crate) fingerprint: String,
+    /// The application schema major it was made under, absent for a build
+    /// declaring none.
+    pub(crate) major: Option<Major>,
     /// The account it was made under, absent when the deployment names no
     /// caller.
     pub(crate) account: Option<String>,
@@ -125,6 +132,8 @@ pub(crate) struct ArchivedEntry {
     pub(crate) seq: u64,
     /// The write's chain hash.
     pub(crate) hash: [u8; 32],
+    /// The application schema major the write was captured under (R31).
+    pub(crate) major: Option<Major>,
     /// The captured changeset.
     pub(crate) changeset: Vec<u8>,
     /// The writer and sequence the write was first made under, present when
@@ -145,6 +154,8 @@ pub(crate) struct Incoming {
     pub(crate) scope: ExportScope,
     /// The schema it was made under.
     pub(crate) fingerprint: String,
+    /// The application schema major it was made under.
+    pub(crate) major: Option<Major>,
     /// The account it was made under.
     pub(crate) account: Option<String>,
     /// Whether it carries the synced replica's rows at all.
