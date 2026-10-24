@@ -139,6 +139,12 @@ async fn a_withdrawn_grant_takes_the_row_off_the_device() {
                     }
                 }
             }
+            Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(resync))) => {
+                panic!(
+                    "the move suppresses the replacement the withdrawal would \
+                     otherwise cause, got {resync:?}"
+                )
+            }
             Some(IncomingFrame::Bulk(_) | IncomingFrame::Control(_)) => {}
             other => panic!("expected a live patch from the move, got {other:?}"),
         }
