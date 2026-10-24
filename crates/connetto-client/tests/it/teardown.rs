@@ -578,13 +578,19 @@ async fn a_wipe_failing_after_the_close_reports_an_incomplete_forget() {
         "the message names the failed part and its cause, got {message:?}"
     );
     assert!(
-        ["releasing", "credential", "revoking", "device key"]
-            .iter()
-            .all(|part| !message.contains(part)),
+        [
+            "releasing",
+            "credential",
+            "revoking",
+            "share keys",
+            "device key"
+        ]
+        .iter()
+        .all(|part| !message.contains(part)),
         "and no part that succeeded, got {message:?}"
     );
     let ForgetError::Incomplete(report) = error else {
-        unreachable!("matched above");
+        unreachable!("the let else above binds error only as ForgetError::Incomplete");
     };
     assert!(
         matches!(report.wipe, Some(PurgeError::KeyStore(_))),

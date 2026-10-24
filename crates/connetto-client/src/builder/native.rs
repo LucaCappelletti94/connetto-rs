@@ -1771,11 +1771,7 @@ where
             .await;
             // Local secret cleanup is required even when revocation cannot be confirmed.
             if report.wipe.is_none() {
-                report.share_keys = self
-                    .share_key_store
-                    .clear(&self.share_record)
-                    .await
-                    .err();
+                report.share_keys = self.share_key_store.clear(&self.share_record).await.err();
             }
         })
     }

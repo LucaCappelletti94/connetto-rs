@@ -256,8 +256,9 @@ pub enum ForgetRefusal {
 /// had nothing to do, and `share_keys` and `device_key` are also `None` when
 /// a failed wipe kept them.
 #[cfg(feature = "native-auth")]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, thiserror::Error)]
 #[non_exhaustive]
+#[error("the client is closed, but{}", FailedParts(self))]
 pub struct ForgetIncomplete {
     /// Releasing the replica's file handles failed, so a platform that refuses
     /// to delete an open file keeps the replica.
@@ -288,31 +289,37 @@ impl ForgetIncomplete {
     }
 }
 
+/// The failed parts of a forget, joined for the one-line report.
 #[cfg(feature = "native-auth")]
-impl core::fmt::Display for ForgetIncomplete {
+struct FailedParts<'a>(&'a ForgetIncomplete);
+
+#[cfg(feature = "native-auth")]
+impl core::fmt::Display for FailedParts<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("the client is closed, but")?;
         let parts: [(&str, Option<&dyn core::fmt::Display>); 6] = [
             (
                 "releasing the replica",
-                self.release.as_ref().map(|err| err as _),
+                self.0.release.as_ref().map(|err| err as _),
             ),
             (
                 "clearing the stored credential",
-                self.credential.as_ref().map(|err| err as _),
+                self.0.credential.as_ref().map(|err| err as _),
             ),
             (
                 "revoking the session",
-                self.revoke.as_ref().map(|err| err as _),
+                self.0.revoke.as_ref().map(|err| err as _),
             ),
-            ("wiping the replica", self.wipe.as_ref().map(|err| err as _)),
+            (
+                "wiping the replica",
+                self.0.wipe.as_ref().map(|err| err as _),
+            ),
             (
                 "clearing the share keys",
-                self.share_keys.as_ref().map(|err| err as _),
+                self.0.share_keys.as_ref().map(|err| err as _),
             ),
             (
                 "deleting the device key",
-                self.device_key.as_ref().map(|err| err as _),
+                self.0.device_key.as_ref().map(|err| err as _),
             ),
         ];
         let mut first = true;
@@ -326,9 +333,6 @@ impl core::fmt::Display for ForgetIncomplete {
         Ok(())
     }
 }
-
-#[cfg(feature = "native-auth")]
-impl std::error::Error for ForgetIncomplete {}
 
 /// Revoke and clear the credential, then destroy the key and delete the
 /// replica, filling in the parts of `report` that fail. Both run even when the
