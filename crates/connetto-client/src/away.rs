@@ -133,11 +133,15 @@ fn instant_monotonic() -> Duration {
 }
 
 /// The sleep-counting monotonic reading on the browser, in milliseconds since
-/// the page's time origin.
+/// the time origin of the window or worker it runs in.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn monotonic() -> Duration {
-    let millis = web_sys::window()
-        .and_then(|w| w.performance())
+    use js_sys::wasm_bindgen::JsCast;
+    // A worker has no window, so `performance` is read off the global scope,
+    // which carries it in a window and in every kind of worker.
+    let millis = js_sys::Reflect::get(&js_sys::global(), &"performance".into())
+        .ok()
+        .and_then(|performance| performance.dyn_into::<web_sys::Performance>().ok())
         .map_or(0.0, |p| p.now());
     // Millis since the time origin, a non-negative integer-valued float within
     // u64, so the truncating cast loses nothing.
