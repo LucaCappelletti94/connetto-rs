@@ -40,16 +40,22 @@ diesel::table! {
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
+/// The schema source the bundle declares, which names its major.
+const SOURCE: &str = "-- connetto:major 1";
+
 /// The client schema over [`DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A dialer handing out `transport` once and nothing after.

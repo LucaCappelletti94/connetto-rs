@@ -1208,6 +1208,9 @@ mod tests {
 
     use super::{FileId, next_after};
 
+    /// The major line the test schema source declares.
+    const SOURCE: &str = "-- connetto:major 1";
+
     /// An anonymous connection over `ddl`, opened offline the way a build with
     /// no server yet opens it.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1215,14 +1218,17 @@ mod tests {
         ddl: &str,
     ) -> connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport> {
         connetto_client::ClientBuilder::new(
-            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
-                "",
-                "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
-                None::<&str>,
-            )),
+            connetto_client::SyncSchema::new(
+                connetto_core::schema::SchemaBundle::new(
+                    SOURCE,
+                    "",
+                    ddl,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    None::<&str>,
+                )
+                .expect("the source declares major 1"),
+            ),
             || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
         )
         .open_driven()

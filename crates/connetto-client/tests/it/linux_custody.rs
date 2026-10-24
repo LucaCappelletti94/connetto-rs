@@ -31,6 +31,8 @@ const ACCOUNT: &str = "\"alice\"";
 const TOKEN: &str = "alice-refresh";
 const NOTE: &str = "connetto-r71-tier-note";
 const TIER_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// A device-local tier table.
@@ -91,14 +93,17 @@ async fn open(url: &str, fresh: bool) -> ConnettoConnection<FakeTransport> {
     let transport = FakeTransport::accepting();
     let mut once = Some(transport);
     ClientBuilder::new(
-        SyncSchema::new(SchemaBundle::new(
-            "",
-            "",
-            "",
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            Some(TIER_DDL),
-        )),
+        SyncSchema::new(
+            SchemaBundle::new(
+                SOURCE,
+                "",
+                "",
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                Some(TIER_DDL),
+            )
+            .expect("the source declares major 1"),
+        ),
         move || core::future::ready(once.take().ok_or("spent")),
     )
     .signed_in(

@@ -15,7 +15,8 @@ use connetto_test_harness::{
     Fixture, HarnessAuth, ServerConfig, pool_for, spawn_server, with_user,
 };
 
-const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, owner TEXT, body TEXT);";
+const PG_DDL: &str = "-- connetto:major 1
+CREATE TABLE orders (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const POLICIES: &str = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
      CREATE POLICY orders_p ON orders \
      USING (owner = current_setting('app.user_id', true)) \
@@ -92,7 +93,8 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
         Vec::<(String, String)>::new(),
         Vec::<String>::new(),
         None::<&str>,
-    );
+    )
+    .expect("the source declares major 1");
     let stale = stale_bundle.version();
     assert_ne!(
         stale,

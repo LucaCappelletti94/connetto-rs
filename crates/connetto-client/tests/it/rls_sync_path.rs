@@ -33,7 +33,7 @@ use sqlite_diff_rs::{DiffOps, Insert, ParsedDiffSet, PatchSet, SimpleTable, Valu
 
 /// The Postgres source document, shaped like the demo's: one policy-bearing
 /// table whose policy names the caller.
-const PG_DDL: &str = "
+const PG_DDL: &str = "-- connetto:major 1
 CREATE TABLE orders (
     id BIGINT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -48,7 +48,7 @@ CREATE POLICY orders_p ON orders
 ";
 
 /// Alice may read every order but may insert only her own.
-const SHARED_READ_DDL: &str = "
+const SHARED_READ_DDL: &str = "-- connetto:major 1
 CREATE TABLE orders (
     id BIGINT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -67,7 +67,7 @@ CREATE POLICY orders_insert ON orders
 ";
 
 /// Alice reads through an ownership row but only Bob may create the order.
-const NESTED_OWNERSHIP_DDL: &str = "
+const NESTED_OWNERSHIP_DDL: &str = "-- connetto:major 1
 CREATE TABLE order_ownership (
     order_id BIGINT PRIMARY KEY,
     reader_id TEXT NOT NULL,
@@ -208,14 +208,10 @@ fn translation() -> SyncSchema {
 /// The schema the sync path tests build, translated from `pg_ddl`.
 fn schema_for(pg_ddl: &str) -> SyncSchema {
     let (ddl, pairs, views) = translation_for(pg_ddl);
-    SyncSchema::new(SchemaBundle::new(
-        pg_ddl,
-        "",
-        ddl,
-        pairs,
-        views,
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(pg_ddl, "", ddl, pairs, views, None::<&str>)
+            .expect("the source declares major 1"),
+    )
 }
 
 diesel::table! {
@@ -682,14 +678,17 @@ async fn a_resync_clears_hidden_rows_and_spares_a_sibling() {
 fn an_unaccounted_policy_view_refuses_to_open() {
     let (ddl, _, _) = translation_for(PG_DDL);
     let refused = ClientBuilder::new(
-        SyncSchema::new(SchemaBundle::new(
-            PG_DDL,
-            "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        )),
+        SyncSchema::new(
+            SchemaBundle::new(
+                PG_DDL,
+                "",
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        ),
         super::support::NeverDial::<LoopbackTransport>::default(),
     )
     .signed_in(super::support::held("alice"))

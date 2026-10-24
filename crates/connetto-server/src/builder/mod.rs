@@ -48,7 +48,7 @@ use crate::writer_schema::ConnettoWriterSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
-use connetto_core::{CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaVersion};
+use connetto_core::{CALLER_FUNCTION, Major, SUBJECTS_FUNCTION, SchemaVersion};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -1205,7 +1205,11 @@ where
         )
         .with_oplog(oplog)
         .with_guard(Arc::clone(&guard))
-        .with_session(session_config.with_schema_version(Some(write_side.version)))
+        .with_session(
+            session_config
+                .with_schema_version(Some(write_side.version))
+                .with_schema_major(Some(write_side.major)),
+        )
         .with_upkeep(write_side.upkeep)
         .with_signer(reader.signer)
         .with_withdrawal_source(withdrawals)
@@ -1730,18 +1734,18 @@ async fn build_write_side<D: ConnettoSchema>(
     let upkeep = auth.upkeep(reach, upkeep_translator, pools.reader.clone());
     let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<RegistryIds<D>>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let version = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+    let bundle = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
         &schema.pg_ddl,
         &schema.pg_policies,
-    )?
-    .version();
+    )?;
     Ok(WriteSide {
         auth,
         materializer,
         second,
         upkeep,
         write,
-        version,
+        version: bundle.version(),
+        major: bundle.major(),
     })
 }
 
@@ -1897,6 +1901,7 @@ struct WriteSide<D: ConnettoSchema> {
     upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
     write: PgWriteTarget<D>,
     version: SchemaVersion,
+    major: Major,
 }
 
 /// The change-stream future, one reconnecting ingestion that closes every
@@ -2077,8 +2082,8 @@ mod tests {
 
     /// The deployment's tables in the order a deployment writes them, where
     /// connetto's registry tables sort ahead of `items` in a catalog.
-    const NUMBERED: &str = "CREATE TABLE items (id INT PRIMARY KEY, team INT); \
-                            CREATE TABLE team_members (team INT, member TEXT);";
+    const NUMBERED: &str = "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, \
+                            team INT); CREATE TABLE team_members (team INT, member TEXT);";
 
     /// The model's catalog read from the composed document and the server's
     /// read from the same text number every table alike, so startup goes on.
@@ -2234,7 +2239,10 @@ mod tests {
         };
         let builder = ServerBuilder::new(
             database,
-            ServerSchema::new("CREATE TABLE t (id INT PRIMARY KEY);", ""),
+            ServerSchema::new(
+                "-- connetto:major 1\nCREATE TABLE t (id INT PRIMARY KEY);",
+                "",
+            ),
             keys,
             OpenFga::new("http://127.0.0.1:1", "store"),
         )

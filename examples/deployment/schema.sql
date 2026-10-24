@@ -14,6 +14,8 @@
 -- the caller. It has no default: pg2sqlite maps current_setting only inside a
 -- policy expression, so a default naming the caller would translate into a
 -- call the replica cannot resolve, and every write names the owner instead.
+-- The application schema major R31 routes and refuses connections by.
+-- connetto:major 1
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0));
 
 -- The lines of an order, keyed by the order and the line number together. It is

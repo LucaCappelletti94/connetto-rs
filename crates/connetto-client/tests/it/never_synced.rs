@@ -28,6 +28,8 @@ use tempfile::tempdir;
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Synced test table.
@@ -151,14 +153,17 @@ fn ack() -> IncomingFrame {
 }
 
 fn tier_schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// Wait for the pump to report the named event, so the assertions that follow

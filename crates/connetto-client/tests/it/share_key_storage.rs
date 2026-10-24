@@ -43,14 +43,17 @@ const SQLITE_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT
             OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;";
 
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 diesel::table! {

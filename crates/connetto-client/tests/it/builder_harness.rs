@@ -24,7 +24,8 @@ use connetto_test_harness::{
 use diesel::prelude::*;
 use tempfile::tempdir;
 
-const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, owner TEXT, body TEXT);";
+const PG_DDL: &str = "-- connetto:major 1
+CREATE TABLE orders (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const POLICIES: &str = "ALTER TABLE orders ENABLE ROW LEVEL SECURITY; \
      CREATE POLICY orders_p ON orders \
      USING (owner = current_setting('app.user_id', true)) \
@@ -310,7 +311,8 @@ async fn builder_held_credential_reads_the_callers_own_row() {
     );
 }
 
-const NOTES_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, label TEXT);";
+const NOTES_DDL: &str = "-- connetto:major 1
+CREATE TABLE notes (id INT PRIMARY KEY, label TEXT);";
 
 diesel::table! {
     /// Notes table, primary key id.

@@ -28,6 +28,8 @@ use tempfile::{TempDir, tempdir};
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Device-private test table, which lives in the attached tier.
@@ -177,14 +179,17 @@ async fn a_tier_rests_at_one_attached_database_and_stays_writable() {
     let dir = tempdir().expect("tempdir");
     let credential = credential();
     let store = super::support::key_store(&credential).await;
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),
@@ -263,14 +268,17 @@ async fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
     let tier = dir.path().join(format!("{name}-tier"));
     open_plain(&dir).await;
     let store = super::support::key_store(&credential).await;
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     assert!(
         ClientBuilder::new(
             schema,
@@ -471,14 +479,17 @@ async fn a_tier_script_may_lead_with_a_pragma() {
     let dir = tempdir().expect("tempdir");
     let credential = credential();
     let store = super::support::key_store(&credential).await;
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(PRAGMA_LED_TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(PRAGMA_LED_TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),

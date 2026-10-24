@@ -82,7 +82,7 @@ A spawn announces its boot and keeps answering for it, because a broadcast is no
 
 Durable share-key records stay outside the encrypted replica under the secret store's gate and are reserved from account enumeration. Construction merges stored and builder pairs, excludes expired grants, and folds the store's protection into custody. Forgetting an identity clears its share-key record.
 
-Expiry remains active while connected, offline or dialing. A locked gate defers the secret-store write while local authorization loses the expired grant, and unlocking persists the deferred set. Replacement refusals preserve the accepted local set and observe the server's retry delay. An elapsed retry waits on any outstanding declaration fence without arming an immediate wake.
+Native and browser drivers prepare authorization before selecting waits and keep expiry, retry and correlated-answer deadlines active while connected, recovering or waiting for content. A locked gate defers secret persistence while expiry removes local authorization, and approval saves the deferred set. Refusals preserve the accepted local set and the server's retry floor, including when a declaration fence remains outstanding.
 
 The replica persists its cursor together with `cursor_subjects`, with `None` meaning unknown and `Some([])` meaning completed empty coverage. Key changes and authorization resends persist unknown before backing rows change, and overlapping subscriptions share one table clear per attach or replacement batch. A handshake or replacement acknowledgment cannot publish known coverage until every declaration fence and row delivery has completed.
 
@@ -290,6 +290,12 @@ One consequence reaches the application: trusted schema off means a function the
 **A bot's replica is `Replica::in_memory()` per login.** A restart resnapshots, an offline commit dies with the process, and a bot that must not lose a write treats its source as the durable store and re-derives. A bot may declare device-local tables like any client and then needs the file replica, encrypted under the replica key chapter 14 describes, whose Linux custody across a reboot R71 provides through a systemd credential or, in a container, a wrap-key file the application names, so the file replica for bots arrives with R93, after R91, and not before. The credential and the key file are the operator's and are not a replica.
 
 **The template is the deliverable.** `examples/bot-template` is copied rather than read, with the scripted tier over `FakeTransport` and an in-memory replica, the semantics tier against the harness server, property tests and a criterion bench all present and green, so a second bot written from it needs no change to `connetto-client`. Two apps built from it run in the demos, an isolated importer that inserts `orders` and `photos` rows for each installer and uploads bytes, and a shared totaliser that holds a sum over every installer's `order_lines` and writes it back into `orders`.
+
+---
+
+## Application schema majors and the update path (R31)
+
+**The major is declared once, in the schema source.** A line `-- connetto:major N` in the Postgres schema source is read by `SchemaBundle::new` into `SchemaBundle::major()`, majors start at 1, and a source without the line fails. The line sits inside the bundle hash. One schema source, read by the application's `build.rs` and the server's boot translation alike, is the deployment's convention, and the handshake is what enforces it at the wire. The client sends its major in the `Handshake` and the server refuses another with `FatalErrorReason::MajorMismatch { server, client }`. The client reads an older own major as `ClientError::UpdateRequired` and a newer one as `ClientError::ServerBehind`. The bundle-hash check stays and catches the same major built from a different schema. Chapter 02 describes the wire side.
 
 ---
 

@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::Major;
+
 /// The one detail text a refused subscription carries.
 ///
 /// Every refusal on the subscribe path reads exactly like this, whatever the
@@ -83,6 +85,16 @@ pub enum FatalErrorReason {
         /// Version declared by the client.
         got: u32,
     },
+    /// The client was built against another application schema major than the
+    /// server's. A client whose major is older than the server's has to update,
+    /// and one whose major is newer is ahead of the server it reached.
+    MajorMismatch {
+        /// The server's major.
+        server: Major,
+        /// The major the client declared, absent from a client built before
+        /// majors existed.
+        client: Option<Major>,
+    },
     /// Session was administratively revoked mid-connection.
     SessionRevoked,
     /// This device's key was reported lost, so its connections close and
@@ -133,6 +145,22 @@ pub enum FatalErrorReason {
     /// The number writer the handshake named is no writer of this account
     /// (R75). The client takes a fresh writer as it would for a retired one.
     WriterUnknown,
+}
+
+impl FatalErrorReason {
+    /// Whether the close names a build the peer can never attach under.
+    ///
+    /// The peer speaks a major or a wire version this build was not built
+    /// for, and no retry against the same peer changes the answer. A client
+    /// ends its recovery here with the reason named, and a relay hub ends
+    /// the same way over its tabs.
+    #[must_use]
+    pub fn is_build_mismatch(&self) -> bool {
+        matches!(
+            self,
+            Self::MajorMismatch { .. } | Self::ProtocolVersionMismatch { .. }
+        )
+    }
 }
 
 /// Session-terminating error frame.

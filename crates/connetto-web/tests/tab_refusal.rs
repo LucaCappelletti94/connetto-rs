@@ -6,11 +6,11 @@
 use core::time::Duration;
 
 use connetto_client::{ClientBuilder, FirstThen, SyncSchema};
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, FatalErrorReason, Handshake};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Major, PROTOCOL_VERSION};
 use connetto_web::{MessageTransport, RelayHub};
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -18,18 +18,29 @@ use web_sys::MessagePort;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
+/// The major [`SOURCE`] declares, which a tab built from it presents.
+fn major() -> Major {
+    Major::declared_in(SOURCE).expect("the source declares major 1")
+}
+
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
 /// The client schema over [`DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A dialer handing out `transport` once and nothing after.
@@ -62,10 +73,9 @@ async fn hub_with_tab() -> (RelayHub, MessageTransport<MessagePort>) {
 async fn a_refused_tab_is_told_why() {
     let (_hub, mut tab) = hub_with_tab().await;
     for _ in 0..2 {
-        tab.send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            "a-tab",
-        )))
+        tab.send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "a-tab").with_major(major()),
+        ))
         .await
         .expect("post handshake");
     }
@@ -86,6 +96,35 @@ async fn a_refused_tab_is_told_why() {
         refusal,
         FatalErrorReason::ProtocolViolation {
             detail: "second handshake".to_owned(),
+        }
+    );
+}
+
+/// A tab built at another major than its worker is refused naming both, since
+/// it would read and write a schema the replica does not hold (R31).
+#[wasm_bindgen_test]
+async fn a_tab_at_another_major_is_refused_naming_both() {
+    let (_hub, mut tab) = hub_with_tab().await;
+    let other = Major::new(2).expect("two is a major");
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "a-tab").with_major(other),
+    ))
+    .await
+    .expect("post handshake");
+    let frame = tokio::select! {
+        frame = tab.recv() => frame.expect("transport"),
+        () = connetto_web::workers::sleep(Duration::from_secs(5)) => {
+            panic!("the hub neither refused the tab nor closed it")
+        }
+    };
+    let Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) = frame else {
+        panic!("the hub's first answer is the refusal, got {frame:?}");
+    };
+    assert_eq!(
+        fatal.reason,
+        FatalErrorReason::MajorMismatch {
+            server: major(),
+            client: Some(other),
         }
     );
 }

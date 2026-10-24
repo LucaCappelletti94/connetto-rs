@@ -35,6 +35,8 @@ CREATE TABLE notes (id INTEGER PRIMARY KEY, draft INTEGER NOT NULL REFERENCES dr
 /// A tier carrying a table the plain build does not have.
 const WIDER_TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT; \
                               CREATE TABLE scratch (id INTEGER PRIMARY KEY, note TEXT) STRICT;";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 #[derive(diesel::QueryableByName, Debug, PartialEq, Eq)]
 struct DraftRow {
@@ -73,13 +75,14 @@ async fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
     let credential = super::support::held(account);
     let store = super::support::key_store(&credential).await;
     let bundle = SchemaBundle::new(
-        "",
+        SOURCE,
         "",
         synced_ddl,
         Vec::<(String, String)>::new(),
         Vec::<String>::new(),
         Some(tier_ddl),
-    );
+    )
+    .expect("the source declares a major");
     let conn = ClientBuilder::new(
         SyncSchema::new(bundle),
         super::support::Once::new(FakeTransport::accepting()),

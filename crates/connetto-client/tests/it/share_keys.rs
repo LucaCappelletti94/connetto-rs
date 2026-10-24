@@ -23,17 +23,20 @@ diesel::table! {
 }
 
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+    SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
          CREATE VIEW visible AS SELECT * FROM notes \
          WHERE owner = current_app_user() \
             OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        vec![("visible".to_owned(), "notes".to_owned())],
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
+            vec![("visible".to_owned(), "notes".to_owned())],
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 fn seed(conn: &mut ConnettoConnection<LoopbackTransport>) {

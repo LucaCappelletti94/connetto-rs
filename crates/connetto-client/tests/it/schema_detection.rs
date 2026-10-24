@@ -10,10 +10,11 @@
 //! A deterministic fake server completes the handshake advertising a chosen
 //! schema version, so the test controls exactly what the client compares against.
 
-use connetto_client::{ClientBuilder, ClientError};
-use connetto_core::messages::{ControlMessage, HandshakeAck};
+use connetto_client::{ClientBuilder, ClientError, SyncSchema};
+use connetto_core::messages::{ControlMessage, FatalError, FatalErrorReason, HandshakeAck};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
+use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
 
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
@@ -114,4 +115,97 @@ async fn empty_server_skips_detection() {
         "a versioned client connects to an unversioned server: {:?}",
         conn.err()
     );
+}
+
+/// Answer the handshake as a server at `server` major that refuses the
+/// client's, and hand back the major the client declared.
+fn refusing_server(
+    server: Major,
+) -> (
+    LoopbackTransport,
+    tokio::sync::oneshot::Receiver<Option<Major>>,
+) {
+    let (client_end, mut server_end) = loopback();
+    let (declared_tx, declared_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) =
+            server_end.recv().await
+        else {
+            return;
+        };
+        let _ = declared_tx.send(handshake.schema_major);
+        let _ = server_end
+            .send_control(ControlMessage::FatalError(FatalError::new(
+                FatalErrorReason::MajorMismatch {
+                    server,
+                    client: handshake.schema_major,
+                },
+            )))
+            .await;
+    });
+    (client_end, declared_rx)
+}
+
+/// The bundle's major is what the handshake declares, and a server at a
+/// newer major tells this build to update (R31).
+#[tokio::test]
+async fn a_newer_server_major_requires_an_update() {
+    let bundle = super::support::bundle(SQLITE_DDL);
+    let built = bundle.major();
+    let server = Major::new(built.get() + 1).expect("one above a major is a major");
+    let (transport, declared) = refusing_server(server);
+
+    let result = ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await;
+
+    assert_eq!(declared.await.expect("the handshake arrived"), Some(built));
+    match result {
+        Err(ClientError::UpdateRequired {
+            client,
+            server: told,
+        }) => {
+            assert_eq!(client, Some(built));
+            assert_eq!(told, server);
+        }
+        Err(other) => panic!("expected UpdateRequired, got {other:?}"),
+        Ok(_) => panic!("a build behind the server's major connected"),
+    }
+}
+
+/// A server at an older major than this build is behind, which is a
+/// deployment's problem rather than a reason to update the app (R31).
+#[tokio::test]
+async fn an_older_server_major_reads_as_server_behind() {
+    let bundle = SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 2",
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 2"),
+    );
+    let server = Major::new(1).expect("one is a major");
+    let (transport, _declared) = refusing_server(server);
+
+    let result = ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await;
+
+    match result {
+        Err(ClientError::ServerBehind {
+            client,
+            server: told,
+        }) => {
+            assert_eq!(client, Major::new(2).expect("two is a major"));
+            assert_eq!(told, server);
+        }
+        Err(other) => panic!("expected ServerBehind, got {other:?}"),
+        Ok(_) => panic!("a build ahead of the server's major connected"),
+    }
 }

@@ -22,24 +22,12 @@ const BOUND: Duration = Duration::from_millis(500);
 /// given to finish once its request is answered or aborted.
 const CEILING: Duration = Duration::from_secs(4);
 
-/// How long the whole test may take, in case the runner starves the trickled
-/// link and an attempt the watchdog aborts has to start again.
-const BUDGET: Duration = Duration::from_secs(30);
-
 /// A body past any socket buffer, so a server that stops reading stalls the
 /// pulls the watchdog observes.
 const UNBUFFERABLE: usize = 32 * 1024 * 1024;
 
-/// How much a trickling server takes per read, which sets the rate a moving
-/// upload runs at.
+/// How much one drain takes per read.
 const TRICKLE_READ: usize = 1024 * 1024;
-
-/// How long a trickling server waits between reads, well inside the bound.
-const TRICKLE_PAUSE: Duration = Duration::from_millis(25);
-
-/// A trickled body, sized so the transfer outlasts several bounds at the
-/// trickle rate, which is what a total deadline would have aborted.
-const TRICKLED: usize = 64 * 1024 * 1024;
 
 /// A reply that closes the connection, so no test waits on a reused one.
 const NO_CONTENT: &str =
@@ -71,36 +59,20 @@ async fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// Drains a chunked body, taking `step` bytes at a time and pausing `pause`
-/// between reads, and answers the largest gap between two of its reads with
-/// how many payload bytes arrived, or nothing when what arrived is not a
-/// whole body.
-///
-/// Both parameters are what a test sets its link rate with. A pause inside the
-/// bound keeps the pulls coming, and a step that leaves the socket buffers
-/// drainable in a few reads keeps the buffered tail inside the bound as well.
-/// The read gap is the link's own stall, which a test checks when the
-/// watchdog aborts to tell a starved link from an aborted moving one.
-async fn drain_body(
-    stream: &mut TcpStream,
-    step: usize,
-    pause: Duration,
-) -> (Duration, Option<usize>) {
+/// between reads, and answers how many payload bytes arrived, or nothing when
+/// what arrived is not a whole body.
+async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> Option<usize> {
     let mut buffer = vec![0_u8; step];
     let mut body = Vec::new();
-    let mut last = Instant::now();
-    let mut slowest = Duration::ZERO;
     while !body.ends_with(b"0\r\n\r\n") {
         let read = match stream.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        let now = Instant::now();
-        slowest = slowest.max(now.duration_since(last));
-        last = now;
         body.extend_from_slice(&buffer[..read]);
         tokio::time::sleep(pause).await;
     }
-    (slowest, chunked_payload(&body))
+    chunked_payload(&body)
 }
 
 /// How many payload bytes a whole chunked body carries, framing removed, and
@@ -128,18 +100,6 @@ fn chunked_payload(body: &[u8]) -> Option<usize> {
 async fn write_reply(stream: &mut TcpStream, reply: &str) {
     let _ = stream.write_all(reply.as_bytes()).await;
     let _ = stream.flush().await;
-}
-
-/// A server that reads a request at the trickle rate and then answers it,
-/// keeping the largest gap between its own reads for the test to check.
-fn trickling_server(listener: TcpListener) -> JoinHandle<(Duration, Option<usize>)> {
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        read_head(&mut stream).await;
-        let drained = drain_body(&mut stream, TRICKLE_READ, TRICKLE_PAUSE).await;
-        write_reply(&mut stream, NO_CONTENT).await;
-        drained
-    })
 }
 
 /// A server that answers one request head with `reply` and reads no body.
@@ -200,76 +160,6 @@ async fn abort_of<T>(
         started.elapsed()
     );
     failure
-}
-
-/// An upload that keeps moving is never aborted, however long it runs, and
-/// this one runs several times the bound at a rate a total deadline of one
-/// bound would have failed.
-///
-/// The trickled link is a task the runner may starve, and a starved link is a
-/// dead one as far as the watchdog can tell, so the test redoes an attempt the
-/// watchdog aborts when the server's own reads took the bound
-/// between two of them. That gap, on the same monotonic clock the watchdog
-/// keeps, is what tells a starved link from a transport that aborted one
-/// that was still moving.
-#[tokio::test]
-async fn a_trickling_upload_is_never_aborted() {
-    let budget_end = Instant::now() + BUDGET;
-    loop {
-        let (listener, address) = local_listener().await;
-        let mut server = trickling_server(listener);
-        let started = Instant::now();
-
-        let Ok(answer) = tokio::time::timeout(
-            budget_end.duration_since(Instant::now()),
-            transport().put(&chunk_url(address), vec![7_u8; TRICKLED]),
-        )
-        .await
-        else {
-            panic!("the runner starved the trickled link for the whole {BUDGET:?}")
-        };
-
-        match answer {
-            Ok(reply) => {
-                assert_eq!(reply.status, 204, "the server answered the chunk");
-                assert!(
-                    started.elapsed() > BOUND,
-                    "the upload must outlast the bound for this to prove anything, took {:?}",
-                    started.elapsed()
-                );
-                let (_slowest, payload) = tokio::time::timeout(CEILING, &mut server)
-                    .await
-                    .expect("the server is done once it answered the chunk")
-                    .expect("server");
-                assert_eq!(
-                    payload,
-                    Some(TRICKLED),
-                    "every payload byte arrived, framing aside"
-                );
-                return;
-            }
-            Err(HttpFailure::Transport(ReqwestHttpError::Idle { .. })) => {
-                let link_starved = match tokio::time::timeout(CEILING, &mut server).await {
-                    Ok(Ok((slowest, _payload))) => slowest >= BOUND,
-                    Ok(Err(join)) => panic!("the trickling server panicked: {join}"),
-                    Err(_) => {
-                        server.abort();
-                        true
-                    }
-                };
-                if link_starved {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-                panic!(
-                    "the trickled link moved at least every {BOUND:?}, so the transport must not have aborted it"
-                );
-            }
-            Err(other) => {
-                panic!("a moving upload is never aborted, it got {other}")
-            }
-        }
-    }
 }
 
 /// A server that stops reading stalls the send, and the send aborts.

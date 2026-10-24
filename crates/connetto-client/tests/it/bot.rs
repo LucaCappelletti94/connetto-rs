@@ -21,6 +21,8 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use uuid::Uuid;
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// The one synced table these builds read back.
@@ -34,14 +36,17 @@ diesel::table! {
 
 /// The translated bundle these builds present, one table and no policies.
 fn bundle() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "schema",
-        "policies",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "policies",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// The refusal a one-shot dialer hands back after it has handed out its

@@ -600,12 +600,11 @@
     <rect x="890" y="124" width="80" height="14" rx="2" fill="#FAFAFA" opacity="0.9" />
     <text x="930" y="134" text-anchor="middle" fill="#4CAF50" font-weight="600">(1) Mutation</text>
 
-    <!-- (6) Schema: server to client, R31 annotation -->
+    <!-- (6) Schema: server to client -->
     <path d="M 863 190 L 995 190" fill="none" stroke="#4CAF50" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-green)" />
     <rect x="892" y="164" width="70" height="14" rx="2" fill="#FAFAFA" opacity="0.9" />
     <text x="927" y="174" text-anchor="middle" fill="#4CAF50" font-weight="600">(6) Schema</text>
-    <text x="927" y="206" text-anchor="middle" font-size="7.5" fill="#C62828">application schema majors:</text>
-    <text x="927" y="216" text-anchor="middle" font-size="7.5" fill="#C62828">R31</text>
+    <text x="927" y="206" text-anchor="middle" font-size="7.5" fill="#4CAF50">major checked at handshake</text>
 
     <!-- WS into native sync engine -->
     <line x1="970" y1="278" x2="995" y2="278" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />

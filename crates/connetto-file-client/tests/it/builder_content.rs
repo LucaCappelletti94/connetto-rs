@@ -18,21 +18,24 @@ use tempfile::tempdir;
 use crate::support::{DDL, photos};
 
 /// The same photo table as Postgres holds it.
-const PG_DDL: &str = "CREATE TABLE photos (id INT PRIMARY KEY, content_id BYTEA, \
+const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE photos (id INT PRIMARY KEY, \
                      content_state TEXT);";
 
 /// The photograph both legs stage.
 const PHOTO: &[u8] = b"a photograph's bytes, standing in for one taken in the field";
 
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        PG_DDL,
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            PG_DDL,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// The refusal the one-shot dialer hands back after its transport.

@@ -342,7 +342,8 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, rosetta_uuid::Uuid::new_v4().to_string())
                 .with_grant(Grant::new(token))
-                .with_writer(WriterRequest::Number(number)),
+                .with_writer(WriterRequest::Number(number))
+                .with_major(demo_schema().major()),
         ))
         .await
         .expect("handshake");

@@ -962,18 +962,24 @@ mod tests {
     use crate::http::ReqwestHttp;
     use crate::store::FsStore;
 
+    /// The major line the test schema source declares.
+    const SOURCE: &str = "-- connetto:major 1";
+
     /// An anonymous connection over `ddl`, opened offline the way a build with
     /// no server yet opens it.
     fn offline(ddl: &str) -> ConnettoConnection<FakeTransport> {
         ClientBuilder::new(
-            SyncSchema::new(SchemaBundle::new(
-                "",
-                "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
-                None::<&str>,
-            )),
+            SyncSchema::new(
+                SchemaBundle::new(
+                    SOURCE,
+                    "",
+                    ddl,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    None::<&str>,
+                )
+                .expect("the source declares major 1"),
+            ),
             || async { Err::<FakeTransport, _>("offline") },
         )
         .open_driven()

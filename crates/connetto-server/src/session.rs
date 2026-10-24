@@ -44,7 +44,9 @@ use connetto_core::traits::{
 };
 
 use crate::device_cert::RevokeError;
-use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
+use connetto_core::{
+    Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId,
+};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -552,6 +554,9 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     schema_version: Option<SchemaVersion>,
+    /// The application schema major a handshake must declare, or `None` to
+    /// check none, for a manager built without a schema.
+    schema_major: Option<Major>,
     /// The total time one connection may wait on reconnect-log reads that failed transiently while resuming.
     resume_read_budget: Duration,
     /// How long one mutation may keep retrying an apply the database failed transiently before it is answered `Indeterminate`.
@@ -567,6 +572,7 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
+            schema_major: None,
             resume_read_budget: Duration::from_secs(30),
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
@@ -594,6 +600,13 @@ impl SessionConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+
+    /// Sets the application schema major a handshake must declare (R31).
+    #[must_use]
+    pub const fn with_schema_major(mut self, schema_major: Option<Major>) -> Self {
+        self.schema_major = schema_major;
         self
     }
 
@@ -838,6 +851,14 @@ pub enum SessionError {
     /// The peer violated the wire protocol.
     #[error("protocol violation: {0}")]
     Protocol(String),
+    /// The client was built against another application schema major (R31).
+    #[error("application schema major mismatch: server {server}, client {}", client.map_or_else(|| "none".to_owned(), |major| major.to_string()))]
+    MajorMismatch {
+        /// The server's major.
+        server: Major,
+        /// The major the client declared, if any.
+        client: Option<Major>,
+    },
     /// Compressing a bulk payload failed.
     #[error(transparent)]
     Compression(#[from] std::io::Error),
@@ -3537,6 +3558,29 @@ where
                 "protocol version mismatch: server {PROTOCOL_VERSION}, client {}",
                 handshake.protocol_version
             )));
+        }
+        if let Some(server) = self.config.schema_major
+            && handshake.schema_major != Some(server)
+        {
+            // Before any grant check, since a client at another major reached the wrong server.
+            tracing::warn!(
+                client_id = %handshake.client_id,
+                server = %server,
+                client = ?handshake.schema_major,
+                "handshake refused, application schema major mismatch"
+            );
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::MajorMismatch {
+                        server,
+                        client: handshake.schema_major,
+                    },
+                )))
+                .await;
+            return Err(SessionError::MajorMismatch {
+                server,
+                client: handshake.schema_major,
+            });
         }
 
         let connection_num = self.next_connection_num();

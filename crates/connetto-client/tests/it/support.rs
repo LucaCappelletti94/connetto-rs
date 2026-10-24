@@ -33,21 +33,27 @@ impl StoreUpkeep for KeyIndependentUpkeep {
     }
 }
 
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 /// A test schema bundle over one raw DDL, no policies, no local tier.
 ///
-/// The schema and policy sources are empty, which is honest for a bundle a
-/// test writes by hand rather than translates, and the version hashes them
-/// with the DDL the way a real build does.
+/// The schema source is the major line a test writes by hand rather than a
+/// translated document, the policy source stays empty, and the version
+/// hashes the sources with the DDL the way a real build does.
 #[must_use]
 pub fn bundle(ddl: &str) -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        ddl,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A held credential for `user_id`, minting the standard `user:<user_id>` grant.

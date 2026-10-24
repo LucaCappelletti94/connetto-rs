@@ -25,14 +25,17 @@ diesel::table! {
 /// 16-byte v4 key on every insert that leaves the key out.
 #[test]
 fn builder_schema_installs_uuidv4_for_a_default_key() {
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "CREATE TABLE things (id UUID PRIMARY KEY, label TEXT);",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1\nCREATE TABLE things (id UUID PRIMARY KEY, label TEXT);",
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),

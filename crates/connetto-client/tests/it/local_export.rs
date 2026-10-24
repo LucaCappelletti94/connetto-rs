@@ -14,6 +14,8 @@ CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT NOT NULL, payload BLOB NO
 CREATE INDEX items_label_idx ON items(label);
 ";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT NOT NULL) STRICT;";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Synced test table for items.
@@ -61,14 +63,17 @@ async fn archive_carries_manifest_and_compressed_patchset_entries() {
     let replica_path = dir.path().join(&name);
     let tier_path = dir.path().join(format!("{name}-tier"));
     let store = super::support::key_store(&credential).await;
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SYNCED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SYNCED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),
@@ -217,14 +222,17 @@ async fn archive_carries_manifest_and_compressed_patchset_entries() {
 
 #[test]
 fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SYNCED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SYNCED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),
@@ -322,14 +330,17 @@ CREATE VIEW orders AS SELECT id, owner_id, payload FROM orders_rls WHERE owner_i
 CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
 ";
     let credential = super::support::held("alice");
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        ddl,
-        vec![("orders", "orders_rls")],
-        vec!["orders"],
-        None::<&str>,
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            ddl,
+            vec![("orders", "orders_rls")],
+            vec!["orders"],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),
@@ -395,14 +406,17 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
 #[test]
 fn a_file_sink_and_a_buffer_sink_write_the_same_archive() {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SYNCED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SYNCED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),

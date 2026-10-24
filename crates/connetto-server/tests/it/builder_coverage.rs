@@ -50,9 +50,14 @@ use super::e2e::{
     mint_tokens, reset_fixture, signing_keys, token_body, with_user_url,
 };
 use super::lifecycle::{
-    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, wait_ready,
+    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, served_major,
+    wait_ready,
 };
 use super::logging::{record_logged, with_capture};
+
+/// The one-table schema the refusal tests hand the builder, with the major
+/// line the build's translation reads from it.
+const T_DDL: &str = "-- connetto:major 1\nCREATE TABLE t (id INT PRIMARY KEY);";
 
 diesel::table! {
     connetto_oplog (commit_lsn, xid, ordinal) {
@@ -259,10 +264,9 @@ async fn anonymous_session(addr: &str, client_id: &str) -> WebSocketTransport<Tc
         .await
         .expect("the axum adapter answers the WebSocket handshake");
     client
-        .send_control(ControlMessage::Handshake(Handshake::new(
-            PROTOCOL_VERSION,
-            client_id,
-        )))
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, client_id).with_major(served_major()),
+        ))
         .await
         .expect("send the handshake");
     // The server leads every connection with a challenge a person ignores (R91).
@@ -702,10 +706,9 @@ async fn a_handshake_racing_the_shutdown_is_told_not_registered() {
             .await
             .expect("the axum adapter answers the racing handshake");
         client
-            .send_control(ControlMessage::Handshake(Handshake::new(
-                PROTOCOL_VERSION,
-                "race-b",
-            )))
+            .send_control(ControlMessage::Handshake(
+                Handshake::new(PROTOCOL_VERSION, "race-b").with_major(served_major()),
+            ))
             .await
             .expect("send the racing handshake");
         client
@@ -777,7 +780,9 @@ async fn the_session_config_credits_are_what_the_client_counts_on() {
         .expect("the axum adapter answers the WebSocket handshake");
     client
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "credits").with_grant(Grant::new(&token)),
+            Handshake::new(PROTOCOL_VERSION, "credits")
+                .with_major(served_major())
+                .with_grant(Grant::new(&token)),
         ))
         .await
         .expect("send the handshake");
@@ -1013,7 +1018,9 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
         .expect("the axum adapter answers the WebSocket handshake");
     again
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "banned").with_grant(Grant::new(&again_token)),
+            Handshake::new(PROTOCOL_VERSION, "banned")
+                .with_major(served_major())
+                .with_grant(Grant::new(&again_token)),
         ))
         .await
         .expect("send the banned handshake");
@@ -1834,7 +1841,7 @@ async fn no_providers_refuses_the_build_before_anything_runs() {
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
             "postgres://connetto:connetto@127.0.0.1:1/connetto",
         ),
-        ServerSchema::new("CREATE TABLE t (id INT PRIMARY KEY);", ""),
+        ServerSchema::new(T_DDL, ""),
         token,
         OpenFga::new("http://127.0.0.1:1", "store"),
     );
@@ -1862,7 +1869,7 @@ async fn a_zero_pool_or_an_overrun_reserve_refuses_before_anything_starts() {
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
                 "postgres://connetto:connetto@127.0.0.1:1/connetto",
             ),
-            ServerSchema::new("CREATE TABLE t (id INT PRIMARY KEY);", ""),
+            ServerSchema::new(T_DDL, ""),
             token,
             OpenFga::new("http://127.0.0.1:1", "store"),
         )
@@ -2385,7 +2392,9 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
                 .await
                 .expect("send the foreign frame");
             ws.send(WsMessage::Binary(control_frame(
-                &ControlMessage::Handshake(Handshake::new(PROTOCOL_VERSION, "skipped")),
+                &ControlMessage::Handshake(
+                    Handshake::new(PROTOCOL_VERSION, "skipped").with_major(served_major()),
+                ),
             )))
             .await
             .expect("send the handshake");
@@ -2435,7 +2444,9 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
             // session ends on it, named.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
             ws.send(WsMessage::Binary(control_frame(
-                &ControlMessage::Handshake(Handshake::new(PROTOCOL_VERSION, "bulk")),
+                &ControlMessage::Handshake(
+                    Handshake::new(PROTOCOL_VERSION, "bulk").with_major(served_major()),
+                ),
             )))
             .await
             .expect("send the handshake");
@@ -2476,7 +2487,9 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
             // the connection going away.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
             ws.send(WsMessage::Binary(control_frame(
-                &ControlMessage::Handshake(Handshake::new(PROTOCOL_VERSION, "closing")),
+                &ControlMessage::Handshake(
+                    Handshake::new(PROTOCOL_VERSION, "closing").with_major(served_major()),
+                ),
             )))
             .await
             .expect("send the handshake");

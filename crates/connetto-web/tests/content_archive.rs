@@ -45,6 +45,9 @@ use support::{
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
 const TEST_LOCK: &str = "connetto-content-archive-test";
 /// Distinct bytes per test, because a relay a finished test left running keeps
@@ -177,14 +180,17 @@ impl Transport for TicketTransport {
 
 /// The client schema over [`DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A dialer handing out `transport` once and nothing after.
