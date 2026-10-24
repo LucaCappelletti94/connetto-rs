@@ -1093,3 +1093,17 @@ fn boot_generated_bootstrap_source_carries_the_boot_identity() {
         "the failure message must carry the boot identity: {source}"
     );
 }
+
+/// The DB worker's deadlines are monotonic readings, so the monotonic clock
+/// must count the time that passes in a worker, which has no window.
+#[wasm_bindgen_test]
+async fn the_monotonic_clock_counts_time_in_a_worker() {
+    use connetto_client::away::Clock;
+    let before = connetto_client::SystemClock.monotonic();
+    super::helpers::sleep_ms(50).await;
+    let after = connetto_client::SystemClock.monotonic();
+    assert!(
+        after.saturating_sub(before) >= core::time::Duration::from_millis(49),
+        "a 50 ms sleep moved the monotonic clock from {before:?} to {after:?}"
+    );
+}

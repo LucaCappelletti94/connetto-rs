@@ -193,7 +193,7 @@ fn stored_sql(conn: &mut Conn, table: &str) -> String {
         #[diesel(sql_type = diesel::sql_types::Text)]
         sql: String,
     }
-    diesel::sql_query("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+    diesel::sql_query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
         .bind::<diesel::sql_types::Text, _>(table)
         .get_result::<Stored>(conn.conn())
         .expect("read the stored table")

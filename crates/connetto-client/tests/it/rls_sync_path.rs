@@ -216,7 +216,7 @@ fn schema_for(pg_ddl: &str) -> SyncSchema {
 
 diesel::table! {
     /// SQLite's own catalogue, read the way a build script reads it.
-    #[sql_name = "sqlite_schema"]
+    #[sql_name = "sqlite_master"]
     sqlite_catalog (name) {
         /// The object kind: `table`, `view`, `index` or `trigger`.
         #[sql_name = "type"]

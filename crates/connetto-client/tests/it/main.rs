@@ -99,6 +99,7 @@ mod share_key_protocol;
 #[cfg(feature = "native-transport")]
 mod share_key_storage;
 mod share_keys;
+mod shared_store;
 
 mod sql_functions;
 

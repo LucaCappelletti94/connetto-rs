@@ -134,7 +134,7 @@ fn unlock_within(
     // The codec only reports a bad key on the first read of a real page. An
     // empty new database passes trivially, which is correct: there is nothing
     // yet to decrypt.
-    let probed = conn.batch_execute("SELECT count(*) FROM sqlite_schema;");
+    let probed = conn.batch_execute("SELECT count(*) FROM sqlite_master;");
     keep_waiting(conn, wait);
     probed.map_err(|err| {
         if busy.load(core::sync::atomic::Ordering::Relaxed) {
@@ -189,17 +189,31 @@ fn keep_waiting(conn: &mut SqliteConnection, _wait: core::time::Duration) {
 
 /// The `PRAGMA key` statement that unlocks a connection with `key`.
 ///
-/// The hex literal form (`x'...'`) with exactly 64 digits is the raw key form:
-/// the bytes become the page key directly, with no KDF. The rendered statement
-/// is wiped when it drops, so the material does not linger in the allocator.
+/// The rendered statement is wiped when it drops, so the material does not
+/// linger in the allocator.
 fn unlock_statement(key: &ReplicaKey) -> Zeroizing<String> {
-    let mut statement = Zeroizing::new(String::with_capacity(20 + ReplicaKey::LEN * 2));
-    statement.push_str("PRAGMA key = \"x'");
-    for byte in key.as_bytes() {
-        let _ = write!(&mut *statement, "{byte:02x}");
-    }
-    statement.push_str("'\";");
+    let literal = raw_key_literal(key);
+    let mut statement = Zeroizing::new(String::with_capacity(20 + literal.len()));
+    statement.push_str("PRAGMA key = \"");
+    statement.push_str(&literal);
+    statement.push_str("\";");
     statement
+}
+
+/// `key` as the text `x'<64 hex digits>'`, which both codecs read as a raw key.
+///
+/// The hex literal with exactly 64 digits is the raw key form, whose bytes
+/// become the page key directly with no KDF. It has to reach the codec as
+/// text. A blob holding the same bytes is taken for a passphrase and run
+/// through the KDF into a different key, on both codecs. Wiped on drop.
+pub(crate) fn raw_key_literal(key: &ReplicaKey) -> Zeroizing<String> {
+    let mut literal = Zeroizing::new(String::with_capacity(3 + ReplicaKey::LEN * 2));
+    literal.push_str("x'");
+    for byte in key.as_bytes() {
+        let _ = write!(&mut *literal, "{byte:02x}");
+    }
+    literal.push('\'');
+    literal
 }
 
 /// The database URL that opens `name` through the page codec layered over the

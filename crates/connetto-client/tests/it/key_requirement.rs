@@ -153,7 +153,7 @@ async fn sqlites_own_statistics_table_is_not_the_applications() {
     conn.batch_execute("INSERT INTO items (id, label) VALUES (1, 'kept'); ANALYZE")
         .expect("analyse the replica");
     let counted: Vec<Counted> = diesel::sql_query(
-        "SELECT count(*) AS rows_found FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+        "SELECT count(*) AS rows_found FROM sqlite_master WHERE name = 'sqlite_stat1'",
     )
     .load(conn.conn())
     .expect("read the catalogue");

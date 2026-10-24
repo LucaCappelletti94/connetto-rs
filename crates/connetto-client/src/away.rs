@@ -132,16 +132,19 @@ fn instant_monotonic() -> Duration {
     std::time::Instant::now().duration_since(*REFERENCE)
 }
 
-/// The browser monotonic reading relative to the current global time origin.
+/// The sleep-counting monotonic reading on the browser, in milliseconds since
+/// the time origin of the window or worker it runs in.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn monotonic() -> Duration {
-    #[wasm_bindgen::prelude::wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = performance, js_name = now)]
-        fn performance_now() -> f64;
-    }
-    let millis = performance_now();
-    // Browser deadlines use whole milliseconds.
+    use js_sys::wasm_bindgen::JsCast;
+    // A worker has no window, so `performance` is read off the global scope,
+    // which carries it in a window and in every kind of worker.
+    let millis = js_sys::Reflect::get(&js_sys::global(), &"performance".into())
+        .ok()
+        .and_then(|performance| performance.dyn_into::<web_sys::Performance>().ok())
+        .map_or(0.0, |p| p.now());
+    // Millis since the time origin, a non-negative integer-valued float within
+    // u64, so the truncating cast loses nothing.
     debug_assert!(
         millis.is_finite() && millis >= 0.0,
         "performance.now is not a valid reading"
