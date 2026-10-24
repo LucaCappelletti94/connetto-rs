@@ -181,6 +181,15 @@ pub(super) async fn next_control(client: &mut WebSocketTransport<TcpStream>) -> 
 
 /// Open a session on the sync route with `token` and wait for the ack.
 pub(super) async fn live_session(addr: &str, token: &str) -> WebSocketTransport<TcpStream> {
+    live_session_as(addr, token, "lifecycle").await
+}
+
+/// [`live_session`] under the named client id.
+pub(super) async fn live_session_as(
+    addr: &str,
+    token: &str,
+    client_id: &str,
+) -> WebSocketTransport<TcpStream> {
     let tcp = TcpStream::connect(addr)
         .await
         .expect("connect the sync route");
@@ -189,7 +198,7 @@ pub(super) async fn live_session(addr: &str, token: &str) -> WebSocketTransport<
         .expect("the axum adapter answers the WebSocket handshake");
     client
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "lifecycle")
+            Handshake::new(PROTOCOL_VERSION, client_id)
                 .with_major(served_major())
                 .with_grant(Grant::new(token)),
         ))

@@ -1,8 +1,8 @@
 //! Build-time schema pipeline for the desktop demo, and the deployment root a
 //! build with the `device-identity` feature ships.
 //!
-//! This demo has its own schema and no local tier, so it runs the shared
-//! schema step over its own documents rather than over the documents the
+//! This demo has its own schema and its own local tier, so it runs the shared
+//! schema step over its three documents rather than over the documents the
 //! browser demos share.
 
 /// The path of the deployment root's `root.der`, which `connetto-demo-stack`
@@ -13,7 +13,7 @@ fn main() {
     connetto_schema::emit::<String, connetto_schema::TextIds>(
         std::path::Path::new("schema.sql"),
         std::path::Path::new("policies.sql"),
-        None,
+        Some(std::path::Path::new("frontend.sql")),
     )
     .expect("translate the demo's schema");
 

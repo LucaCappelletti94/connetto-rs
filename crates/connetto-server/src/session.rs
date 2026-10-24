@@ -6809,7 +6809,7 @@ where
         // (R36 counts probing, and a free failure would hand it an unlimited
         // budget). The permit is held across registration, which is a
         // materializer-lock translate and touches no database, and a computed
-        // subscription drops it before bootstrapping on the owner pool.
+        // subscription drops it, since its reads spend the shared re-execution bound.
         let reader_permit = match self.guard.reader_permit(tier).await {
             Ok(permit) => permit,
             Err(wait) => {
@@ -6877,8 +6877,7 @@ where
                     .await
             }
             Err(capture) => {
-                // Aggregates bootstrap through the re-execution connector on
-                // the owner pool and hold no share permit (R39).
+                // Aggregates bootstrap through the re-execution connector and hold no share permit (R39).
                 drop(reader_permit);
                 self.subscribe_computed(transport, sub, state, capture, reads_subjects, None)
                     .await

@@ -328,7 +328,6 @@ pub mod workers {
         // from the dev identity provider, so the worker authenticates before
         // connecting and names the replica after the acquired identity.
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_upstream("db-upstream", DEMO_QUERY)
             .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
             .with_redirect_uri(crate::auth_landing())
@@ -350,7 +349,6 @@ pub mod workers {
     pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_upstream("db-upstream", DEMO_QUERY)
             .with_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_content_namespace("connetto-photo-content")
@@ -390,7 +388,6 @@ pub mod workers {
             connetto_core::CapabilitySubject::<String>::new(subject),
         )];
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_upstream("db-upstream", DEMO_QUERY)
             .with_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_content_namespace("connetto-photo-content")
@@ -419,7 +416,6 @@ pub mod workers {
     pub async fn db_worker_photo_offline_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_upstream("db-upstream", DEMO_QUERY)
             .with_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_content_namespace("connetto-photo-content")
@@ -450,7 +446,6 @@ pub mod workers {
     pub async fn db_worker_unlock_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-unlock-hub-meta.sqlite")
             .with_upstream("db-unlock-upstream", DEMO_QUERY)
             .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
             .with_redirect_uri(crate::auth_landing())
@@ -484,7 +479,6 @@ pub mod workers {
             std::time::Duration::from_millis(ms as u64)
         });
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-gate-hub-meta.sqlite")
             .with_upstream("db-gate-upstream", DEMO_QUERY)
             .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
             .with_redirect_uri(crate::auth_landing())
@@ -508,7 +502,6 @@ pub mod workers {
     pub async fn db_worker_default_gate_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
         connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-            .with_hub_meta_name("connetto-gate-hub-meta.sqlite")
             .with_upstream("db-gate-upstream", DEMO_QUERY)
             .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
             .with_redirect_uri(crate::auth_landing())

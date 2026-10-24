@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::codec::{TAG_BULK, TAG_CONTROL, encode_bulk, encode_control};
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
-    HandshakeAck, NonFatalError, RateLimited, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AckCredits, AggregateUpdate, BulkMessage, ControlMessage, FatalError, FatalErrorReason, Grant,
+    Handshake, HandshakeAck, NonFatalError, Ping, RateLimited, SnapshotPatch, Subscribe,
+    SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::builder::{
@@ -49,7 +50,8 @@ use super::e2e::{
     mint_tokens, reset_fixture, signing_keys, token_body, with_user_url,
 };
 use super::lifecycle::{
-    BOUND, admin_pool, builder_over, live_session, next_control, served_major, wait_ready,
+    BOUND, admin_pool, builder_over, live_session, live_session_as, next_control, served_major,
+    wait_ready,
 };
 use super::logging::{record_logged, with_capture};
 
@@ -193,6 +195,64 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
     )
     .await;
     provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
+}
+
+/// The count an aggregate answer carries, which the client reads only as a
+/// bare number.
+fn count_of(update: &AggregateUpdate) -> i64 {
+    let body = update.result_json.as_deref().expect("an answer has a body");
+    body.parse()
+        .unwrap_or_else(|_| panic!("a count answers as a bare number, got {body}"))
+}
+
+/// The next aggregate answer for `sub_id`.
+async fn next_update(client: &mut WebSocketTransport<TcpStream>, sub_id: &str) -> AggregateUpdate {
+    match next_control(client).await {
+        ControlMessage::AggregateUpdate(update) => {
+            assert_eq!(update.sub_id, sub_id);
+            update
+        }
+        other => panic!("expected an aggregate answer, got {other:?}"),
+    }
+}
+/// Subscribe `sub_id` to `query` and return the count the first answer
+/// carries.
+async fn first_count(client: &mut WebSocketTransport<TcpStream>, sub_id: &str, query: &str) -> i64 {
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: sub_id.to_owned(),
+            spec: SubscriptionSpec::new(query),
+        }))
+        .await
+        .expect("send the subscription");
+    count_of(&next_update(client, sub_id).await)
+}
+
+/// Ask the session whether a change to another viewer's rows reached its
+/// statistic: every aggregate frame ahead of the fence must still answer
+/// `count`, and the fence must answer its own probe.
+async fn fence_still_answers(client: &mut WebSocketTransport<TcpStream>, sub_id: &str, count: i64) {
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce: 7 }))
+        .await
+        .expect("send the fence");
+    loop {
+        match next_control(client).await {
+            ControlMessage::Pong(pong) => {
+                assert_eq!(pong.nonce, 7, "the fence answered its own probe");
+                break;
+            }
+            ControlMessage::AggregateUpdate(update) => {
+                assert_eq!(update.sub_id, sub_id);
+                assert_eq!(
+                    count_of(&update),
+                    count,
+                    "the change to another viewer's rows must not move this statistic"
+                );
+            }
+            other => panic!("unexpected frame ahead of the fence: {other:?}"),
+        }
+    }
 }
 
 /// Open an anonymous session on the sync route and wait for the ack.
@@ -1188,6 +1248,195 @@ async fn a_second_opinion_divergence_is_counted_not_blocked() {
     );
     stream.abort();
     http.abort();
+}
+
+/// A per-viewer statistic served by the one-construction-path server keeps
+/// the viewer's own rows. The builder wires the session's connector and the
+/// engine's re-execution connector to the pool the production stacks
+/// assemble, and a superuser bypasses ROW LEVEL SECURITY, so the proof is
+/// that a viewer's binding scopes the statistic's rows: alice and bob each
+/// count only their own seed row on the first answer, and a change to
+/// bob's rows moves only bob's number.
+#[tokio::test]
+async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wiring() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    // The identities the deterministic resolver derives before any login.
+    let alice_id =
+        connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "alice").to_string();
+    let bob_id =
+        connetto_server::authn::identity::deterministic_uuid(idp.issuer(), "bob").to_string();
+    seed_owned_rls(&pool, &alice_id).await;
+    exec(
+        &pool,
+        &format!("INSERT INTO owned VALUES (2, '{bob_id}', 'bob seed')"),
+    )
+    .await;
+    fixture.start_replication(&["owned"]).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let fga_url = fixture.fga_url().await.to_owned();
+    let builder = builder_schema(
+        &fixture,
+        port,
+        &idp,
+        (&fga_url, &store),
+        OWNED_PG_DDL,
+        OWNED_POLICIES,
+        "owned",
+    );
+    let base = format!("http://127.0.0.1:{port}");
+
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let (alice_access, minted_alice, _) = mint_tokens(&base, "alice").await;
+    assert_eq!(
+        minted_alice, alice_id,
+        "the login resolves to the identity the row was seeded under"
+    );
+    let (bob_access, minted_bob, _) = mint_tokens(&base, "bob").await;
+    assert_eq!(
+        minted_bob, bob_id,
+        "the login resolves to the identity the row was seeded under"
+    );
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut alice = live_session_as(&addr, &alice_access, "alice-viewer").await;
+    let mut bob = live_session_as(&addr, &bob_access, "bob-viewer").await;
+    assert_eq!(
+        first_count(&mut alice, "count", "SELECT COUNT(*) FROM owned").await,
+        1,
+        "alice's first answer counts only her own row"
+    );
+    assert_eq!(
+        first_count(&mut bob, "count", "SELECT COUNT(*) FROM owned").await,
+        1,
+        "bob's first answer counts only his own row"
+    );
+
+    // A change to bob's rows moves bob's statistic only. The fence then asks
+    // whether the same change reached alice's statistic.
+    exec(
+        &pool,
+        &format!("INSERT INTO owned VALUES (3, '{bob_id}', 'bob second')"),
+    )
+    .await;
+    assert_eq!(
+        count_of(&next_update(&mut bob, "count").await),
+        2,
+        "bob's second row moves his statistic"
+    );
+    fence_still_answers(&mut alice, "count", 1).await;
+    stream.abort();
+    http.abort();
+}
+/// A row inserted straight into Postgres moves the live count of every
+/// subscriber, including one that subscribes after the count first booted.
+/// The table carries no row policies of its own, but the cap connetto
+/// generates secures it, so a per-viewer read must answer as the viewer to
+/// see the row at all.
+#[tokio::test]
+async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let _subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "subql=debug,connetto_server=info,info",
+        ))
+        .try_init();
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    seed_no_rls_orders(&pool).await;
+    fixture.start_replication(&["orders"]).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let fga_url = fixture.fga_url().await.to_owned();
+    let builder = builder_schema(
+        &fixture,
+        port,
+        &idp,
+        (&fga_url, &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    );
+    let base = format!("http://127.0.0.1:{port}");
+
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let (access, _uid, _) = mint_tokens(&base, "carol").await;
+    let addr = format!("127.0.0.1:{port}");
+
+    // The first subscriber boots the count over the empty table.
+    let mut first = live_session_as(&addr, &access, "count-first").await;
+    assert_eq!(
+        first_count(&mut first, "count", "SELECT COUNT(*) FROM orders").await,
+        0,
+        "the empty table answers zero"
+    );
+    exec(&pool, "INSERT INTO orders VALUES (1, 1.0, 1, 'first')").await;
+    assert_eq!(
+        count_of(&next_update(&mut first, "count").await),
+        1,
+        "a backend row moves the first subscriber's count"
+    );
+
+    // A subscriber that arrives later reads the count's current value, and a
+    // backend row moves it the same way.
+    let mut second = live_session_as(&addr, &access, "count-second").await;
+    assert_eq!(
+        first_count(&mut second, "count", "SELECT COUNT(*) FROM orders").await,
+        1,
+        "the late subscriber reads the current count"
+    );
+    exec(&pool, "INSERT INTO orders VALUES (2, 2.0, 2, 'second')").await;
+    assert_eq!(
+        count_of(&next_update(&mut second, "count").await),
+        2,
+        "a backend row moves the late subscriber's count"
+    );
+    stream.abort();
+    http.abort();
+}
+
+/// The `orders` table without row-level security, the demo's shape, with the
+/// reader role granted on it and on the writer bookkeeping.
+async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
+    for stmt in [
+        "DROP TABLE IF EXISTS orders CASCADE",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        PG_DDL,
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON orders TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+    ] {
+        exec(pool, stmt).await;
+    }
+    provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
 }
 
 /// Logging out revokes the session the live connection belongs to, the

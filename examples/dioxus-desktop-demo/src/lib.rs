@@ -43,6 +43,22 @@ pub struct Photo {
     pub content_state: Option<String>,
 }
 
+diesel::table! {
+    notes (id) {
+        id -> diesel::sql_types::BigInt,
+        body -> diesel::sql_types::Text,
+    }
+}
+
+/// Queryable row from the device-private `notes` table.
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = notes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Note {
+    pub id: i64,
+    pub body: String,
+}
+
 /// Inserts a new orders row and a photos row referencing it in the same
 /// transaction, using the file identity the content client assigned.
 ///
