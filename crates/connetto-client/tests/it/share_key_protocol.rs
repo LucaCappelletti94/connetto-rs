@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, Grant, SyncSchema};
+use connetto_client::{
+    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, Grant, SyncSchema,
+};
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
@@ -1117,6 +1119,8 @@ async fn unanswered_request_disconnects(computed: bool) {
         Err(connetto_client::ClientError::NotConnected)
     ));
     assert_eq!(coverage(&mut conn), None);
+    step_or_idle(&mut conn).await;
+    assert_eq!(coverage(&mut conn), None);
     let next = Script::default();
     next.say(ack());
     tokio::time::timeout(Duration::from_secs(5), conn.attach(next.clone()))
@@ -1191,4 +1195,80 @@ async fn expiry_preempts_a_rate_limit_without_retrying_the_replacement_early() {
     step_or_idle(&mut conn).await;
     assert_eq!(replacement(&script).keys, vec![retained]);
     assert_eq!(script.replacements.lock().len(), 2);
+}
+
+/// The pump enforces an expiry-triggered replacement deadline without an external wake.
+#[tokio::test]
+async fn the_pump_closes_the_wire_on_an_unanswered_expiry_deadline() {
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs()
+        + 3;
+    let expiring = mint(Some(i64::try_from(expires).expect("expiry fits")));
+    let (transport, mut server) = connetto_server::loopback();
+    let answer = async {
+        let frame = tokio::time::timeout(Duration::from_secs(10), server.recv())
+            .await
+            .expect("the handshake arrives within its bound")
+            .expect("receive the handshake");
+        assert!(matches!(
+            frame,
+            Some(IncomingFrame::Control(ControlMessage::Handshake(_)))
+        ));
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "deadline-pump".to_owned(),
+                session_token: "deadline-pump".to_owned(),
+                resume_token: "deadline-pump".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(schema().version()),
+                initial_credits: 64,
+                writer: Some(WriterGrant {
+                    number: 7,
+                    frontier: 0,
+                }),
+            }))
+            .await
+            .expect("answer the handshake");
+    };
+    let mut conn = ClientBuilder::new(
+        schema(),
+        super::support::NeverDial::<connetto_server::LoopbackTransport>::default(),
+    )
+    .with_share_keys([(expiring, CapabilitySubject::<String>::new("a"))])
+    .signed_in(super::support::held("tester"))
+    .open_driven()
+    .expect("open the memory replica");
+    let (attached, ()) = tokio::join!(conn.attach(transport), answer);
+    attached.expect("attach the primary wire");
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    let pump = tokio::spawn(pump);
+    let frame = tokio::time::timeout(Duration::from_secs(15), server.recv())
+        .await
+        .expect("expiry sends its replacement within its bound")
+        .expect("receive the replacement");
+    let Some(IncomingFrame::Control(ControlMessage::ReplaceShareKeys(request))) = frame else {
+        panic!("expiry must send a share-key replacement");
+    };
+    // No client call or server frame may wake the pump during this wait.
+    let started = std::time::Instant::now();
+    let closed = matches!(
+        tokio::time::timeout(Duration::from_secs(35), server.recv()).await,
+        Ok(Ok(None))
+    );
+    eprintln!(
+        "share-key-deadline request_id={} wire_closed={} observed_ms={}",
+        request.request_id,
+        closed,
+        started.elapsed().as_millis()
+    );
+    assert!(closed, "the pump must enforce the unanswered deadline");
+    tokio::time::timeout(Duration::from_secs(10), client.close())
+        .await
+        .expect("close the retained client");
+    tokio::time::timeout(Duration::from_secs(10), pump)
+        .await
+        .expect("the pump terminates")
+        .expect("the pump does not panic");
 }

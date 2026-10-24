@@ -4716,11 +4716,11 @@ where
         self.disconnected();
     }
 
-    /// Run due share-key work, deferring secret writes while `persist` is `false`.
+    /// Prepare expiry, protocol work and live-wire coverage before a driver selects its wait, deferring secret writes while `persist` is `false`.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when checkpoint or secret persistence fails.
+    /// [`ClientError`] when checkpoint or secret persistence fails, or a replacement or fence cannot be sent.
     pub async fn process_share_keys(&mut self, persist: bool) -> Result<bool, ClientError> {
         self.check_share_key_deadlines();
         let due = self
@@ -4739,6 +4739,8 @@ where
             store.save(set).await?;
             self.share_key_save_pending = false;
         }
+        self.send_share_key_protocol().await?;
+        self.publish_coverage()?;
         Ok(changed)
     }
 
@@ -4855,10 +4857,10 @@ where
         Ok(())
     }
 
-    /// Publish the durable coverage now that every frame before the cursor is
-    /// owed by the server, so the cursor may be claimed on a resume.
+    /// Publish durable coverage only after a live wire has fenced every preceding delivery.
     fn publish_coverage(&mut self) -> Result<(), ClientError> {
-        if self.cursor_subjects.is_some()
+        if self.wire.is_none()
+            || self.cursor_subjects.is_some()
             || self.share_key_request.is_some()
             || self.declaration_fence.is_some()
             || self.unfenced_count != 0
@@ -5086,6 +5088,19 @@ where
 
     /// Drive replacements, declaration fences, expiry and checkpoint publication.
     async fn step_share_keys(&mut self) -> Result<(), ClientError> {
+        self.send_share_key_protocol().await?;
+        if self
+            .share_key_deadline
+            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at)
+        {
+            self.expire_share_keys(false).await?;
+        }
+        self.publish_coverage()?;
+        Ok(())
+    }
+
+    /// Send ready replacements or declaration fences without expiring the held set.
+    async fn send_share_key_protocol(&mut self) -> Result<(), ClientError> {
         if self.wire.is_some() && matches!(self.attach_replay, AttachReplay::Idle) {
             if self.share_key_request.is_none()
                 && self.share_key_generation > self.share_key_settled
@@ -5102,13 +5117,6 @@ where
                 self.declare_fence().await?;
             }
         }
-        if self
-            .share_key_deadline
-            .is_some_and(|at| crate::away::SystemClock.monotonic() >= at)
-        {
-            self.expire_share_keys(false).await?;
-        }
-        self.publish_coverage()?;
         Ok(())
     }
 

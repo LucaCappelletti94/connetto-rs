@@ -39,6 +39,8 @@ The shipped topology is a dedicated `Worker` spawned by whichever tab wins a Web
 
 **A second interface pins the topology from the other direction, and it pulls the opposite way.** `createSyncAccessHandle` is dedicated-worker-only, which forces the database into the worker. `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, which forces the unlock that produces the replica's key into a tab. The two cannot be co-located, so the key crosses from tab to worker as a non-extractable `CryptoKey` rather than as bytes. `14-at-rest-encryption.md` specifies the handoff and its residual exposure, and `11-authentication.md` qualifies the worker-custody invariant accordingly. Tokens continue to travel in neither direction.
 
+Authorization deadlines read `performance.now()` from the current global scope in both workers and windows.
+
 ### Communication with main thread
 
 The worker exposes a message-passing API to the main thread:
