@@ -27,6 +27,7 @@ async fn expect_complete_replay(
             .expect("apply replayed order");
     }
     assert_eq!(orders(&mut replica), expected);
+    expect_catchup_end(client, "orders").await;
     expect_idle(client).await;
 }
 

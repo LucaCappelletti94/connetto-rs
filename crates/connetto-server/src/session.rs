@@ -4486,18 +4486,7 @@ where
 
         // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
-        // A session that was bound to a device writer leaves the writer's live
-        // set, so a later retirement does not try to close it again (R75).
-        if let Some(row) = state
-            .writer_row
-            .as_ref()
-            .filter(|row| row.device_key.is_some())
-        {
-            let mut live = self.writer_sessions.lock().await;
-            if let Some(set) = live.get_mut(&row.writer) {
-                set.remove(&session_id);
-            }
-        }
+        self.unregister_writer_session(&state).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
         self.guard.forget_connection(session_id);
@@ -4505,6 +4494,19 @@ where
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
         ended
+    }
+
+    async fn unregister_writer_session(&self, state: &SessionState<Id, Key>) {
+        if let Some(row) = state
+            .writer_row
+            .as_ref()
+            .filter(|row| row.device_key.is_some())
+        {
+            let mut live = self.writer_sessions.lock().await;
+            if let Some(set) = live.get_mut(&row.writer) {
+                set.remove(&state.session_id);
+            }
+        }
     }
 
     /// Deliver one item the dispatch side produced for this session, answering
@@ -8027,9 +8029,19 @@ where
                 }
                 Ok(())
             }
-            CatchupWait::Ready(WaveEnd::Done) => Ok(()),
+            CatchupWait::Ready(WaveEnd::Done) => enqueue_and_flush(
+                transport,
+                &mut state.credits,
+                &mut state.pending,
+                Deliverable::SnapshotComplete(SnapshotEnd {
+                    sub_id: sub.sub_id,
+                    cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
+                }),
+            )
+            .await
+            .map_err(transport_err),
             CatchupWait::Ready(WaveEnd::Resync(reason)) => {
-                self.resnapshot_row(transport, state, &sub.sub_id, &reason)
+                self.resnapshot_row(transport, state, &sub.sub_id, &reason, None)
                     .await
             }
             CatchupWait::Ready(WaveEnd::Failed(error)) => Err(error),
@@ -8121,7 +8133,14 @@ where
         tokio::pin!(work);
         loop {
             tokio::select! {
-                result = &mut work => return Ok(CatchupWait::Ready(result)),
+                result = &mut work => {
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return Ok(CatchupWait::Closed(Some(FatalError::new(
+                            FatalErrorReason::ServerShuttingDown,
+                        ))));
+                    }
+                    return Ok(CatchupWait::Ready(result));
+                },
                 incoming = transport.recv() => match incoming.map_err(transport_err)? {
                     Some(frame) => state.input.push(frame, self.config.catchup_input_budget)?,
                     None => return Ok(CatchupWait::Closed(None)),
@@ -8372,17 +8391,7 @@ where
                 self.deliver_record(members, record, reached).await;
             }
         }
-        enqueue_and_flush(
-            transport,
-            &mut state.credits,
-            &mut state.pending,
-            Deliverable::SnapshotComplete(SnapshotEnd {
-                sub_id: sub.sub_id,
-                cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
-            }),
-        )
-        .await
-        .map_err(transport_err)
+        Ok(())
     }
 
     /// Ask the visibility question once for every member `record` reaches and send each its payload (R6, the two-check form).
@@ -8553,6 +8562,17 @@ where
                         members[at].end(WaveEnd::Failed(SessionError::ChangeStreamUnusable(
                             table.clone(),
                         )));
+                    }
+                    return None;
+                }
+                Err(TransitionError::Policy(err)) if !err.clears_by_itself() => {
+                    let table = self.event_table(event);
+                    let reason = err.to_string();
+                    for &(at, _) in reached.iter() {
+                        members[at].end(WaveEnd::Failed(SessionError::AuthorizationUnanswerable {
+                            table: table.clone(),
+                            reason: reason.clone(),
+                        }));
                     }
                     return None;
                 }

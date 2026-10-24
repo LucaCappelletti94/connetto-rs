@@ -1246,29 +1246,11 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
     expect_idle(&mut client).await;
 }
 
-/// Wait until the scripted log has served `read` at least `count` times since it was armed.
-async fn wait_for_reads(script: &std::sync::Mutex<Script>, read: &str, count: usize) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let seen = {
-            let script = script.lock().expect("script");
-            script
-                .reads
-                .iter()
-                .filter(|served| **served == read)
-                .count()
-        };
-        if seen >= count {
-            // The resume that read last enrolls in the same poll, with no await between.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{read} was served {seen} times, expected {count}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+async fn expect_catchup_end<T: Transport>(client: &mut T, sub_id: &str) {
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(end.sub_id, sub_id);
 }
 
 /// Read the live patches `client` receives for `expected`, in order.
@@ -1279,6 +1261,7 @@ async fn expect_patches(client: &mut LoopbackTransport, expected: &[PgChangeEven
         };
         assert_eq!(patch.cursor, cursor_of(event));
     }
+    expect_catchup_end(client, "orders").await;
     expect_idle(client).await;
 }
 
@@ -1302,22 +1285,20 @@ async fn resumes_arriving_during_a_walk_share_the_next_one() {
 
     let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[0])).await;
     subscribe(&mut a).await;
-    arrived.notified().await;
+    failures::page_arrived(&arrived).await;
 
-    // Each resume reads the current position at the handshake, for the catchup decision and for its ceiling.
-    let mut b = open_scripted_as(&manager, "client-b", cursor_of(&events[0])).await;
-    subscribe(&mut b).await;
-    let mut c = open_scripted_as(&manager, "client-c", cursor_of(&events[1])).await;
-    subscribe(&mut c).await;
-    let mut d = open_scripted_as(&manager, "client-d", cursor_of(&events[0])).await;
-    subscribe(&mut d).await;
-    wait_for_reads(&script, "current_position", 12).await;
-    d.close().await.expect("close d");
+    let mut b = failures::wave_client(&manager, &script, "client-b", cursor_of(&events[0])).await;
+    b.subscribe(QUERY).await;
+    let mut c = failures::wave_client(&manager, &script, "client-c", cursor_of(&events[1])).await;
+    c.subscribe(QUERY).await;
+    let mut d = failures::wave_client(&manager, &script, "client-d", cursor_of(&events[0])).await;
+    d.subscribe(QUERY).await;
+    d.close().await;
     release.notify_one();
 
     expect_patches(&mut a, &events[1..]).await;
-    expect_patches(&mut b, &events[1..]).await;
-    expect_patches(&mut c, &events[2..]).await;
+    expect_patches(&mut b.transport, &events[1..]).await;
+    expect_patches(&mut c.transport, &events[2..]).await;
     let walks = {
         let script = script.lock().expect("script");
         script
@@ -1362,20 +1343,19 @@ async fn a_shared_walk_resyncs_only_the_resume_retention_passed() {
 
     let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[2])).await;
     subscribe(&mut a).await;
-    arrived.notified().await;
-    let mut b = open_scripted_as(&manager, "client-b", cursor_of(&events[0])).await;
-    subscribe(&mut b).await;
-    let mut c = open_scripted_as(&manager, "client-c", cursor_of(&events[2])).await;
-    subscribe(&mut c).await;
-    wait_for_reads(&script, "current_position", 9).await;
+    failures::page_arrived(&arrived).await;
+    let mut b = failures::wave_client(&manager, &script, "client-b", cursor_of(&events[0])).await;
+    b.subscribe(QUERY).await;
+    let mut c = failures::wave_client(&manager, &script, "client-c", cursor_of(&events[2])).await;
+    c.subscribe(QUERY).await;
     release.notify_one();
 
     expect_patches(&mut a, &events[3..]).await;
-    let ControlMessage::FullResyncRequired(resync) = next_control(&mut b).await else {
+    let ControlMessage::FullResyncRequired(resync) = next_control(&mut b.transport).await else {
         panic!("expected the resume whose changes were pruned to be replaced");
     };
     assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
-    expect_patches(&mut c, &events[3..]).await;
+    expect_patches(&mut c.transport, &events[3..]).await;
 }
 
 /// Its own log table, shared by the manager before the restart and the one after it.

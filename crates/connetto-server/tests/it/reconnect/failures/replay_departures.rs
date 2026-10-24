@@ -188,8 +188,11 @@ async fn shared_replay_departure_is_one_marked_notice_for_every_window_left() {
             .expect("apply the update");
         assert_eq!(orders(&mut replica_keeper), vec![order(5, 10.0, 60, "row")]);
 
+        expect_catchup_end(&mut left.transport, "orders").await;
         expect_idle(&mut left.transport).await;
+        expect_catchup_end(&mut also.transport, "orders").await;
         expect_idle(&mut also.transport).await;
+        expect_catchup_end(&mut keeper.transport, "orders").await;
         expect_idle(&mut keeper.transport).await;
         left.close().await;
         also.close().await;
@@ -269,7 +272,9 @@ async fn a_replayed_update_crossing_the_policy_ceiling_withdraws_unmarked() {
             .expect("apply the update");
         assert_eq!(orders(&mut replica_open), vec![order(6, 10.0, 60, "row")]);
 
+        expect_catchup_end(&mut strict.transport, "orders").await;
         expect_idle(&mut strict.transport).await;
+        expect_catchup_end(&mut open.transport, "orders").await;
         expect_idle(&mut open.transport).await;
         strict.close().await;
         open.close().await;

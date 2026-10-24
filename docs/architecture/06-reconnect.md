@@ -153,6 +153,8 @@ The worker reads each fenced member's missed transactions and retains only recor
 
 Each session drains its own matched deliveries under its own credits. A resync outcome releases that session immediately, independently of other members' work. Closing its receiver wakes the worker, removes that caller from pending visibility questions and retries, and interrupts pending backend work when no live recipient needs it.
 
+Transient authorization failures pause the reached members and retry the same record. A permanent policy failure ends those members with `AuthorizationUnanswerable` while other members and queued waves continue.
+
 While waiting for worker deliveries or the cursor lock, the session receives peer input and server output. Application frames and nonterminal server output stay in FIFO order behind catch-up. Peer closure, transport errors and server termination close the catch-up receiver, releasing its membership before any terminal send. The normal run loop consumes held frames before newer frames from the same origin. The [held-input budget](02-protocol.md#flow-control) bounds deferred peer traffic independently of delivery credits.
 
 A terminating session opens no further hidden membership subscriptions, including when termination occurs inside a hidden catch-up.

@@ -24,14 +24,14 @@ const WAIT: Duration = Duration::from_secs(15);
 
 type SessionTask = JoinHandle<Result<(), SessionError>>;
 
-struct WaveClient {
-    transport: LoopbackTransport,
+pub(super) struct WaveClient {
+    pub(super) transport: LoopbackTransport,
     enrolled: oneshot::Receiver<()>,
     task: SessionTask,
 }
 
 impl WaveClient {
-    async fn subscribe(&mut self, query: &str) {
+    pub(super) async fn subscribe(&mut self, query: &str) {
         self.transport
             .send_control(ControlMessage::Subscribe(Subscribe {
                 sub_id: "orders".to_owned(),
@@ -45,7 +45,7 @@ impl WaveClient {
             .expect("session reached catch-up");
     }
 
-    async fn close(mut self) {
+    pub(super) async fn close(mut self) {
         self.transport.close().await.expect("close client");
         tokio::time::timeout(WAIT, self.task)
             .await
@@ -55,7 +55,7 @@ impl WaveClient {
     }
 }
 
-async fn wave_client<A>(
+pub(super) async fn wave_client<A>(
     manager: &Arc<ScriptedManager<A>>,
     script: &Arc<Mutex<Script>>,
     name: &str,
@@ -96,7 +96,8 @@ where
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, name)
                 .with_grant(connetto_core::messages::Grant::new(format!("user:{name}")))
-                .with_cursor(resume),
+                .with_cursor(resume)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("send handshake");
@@ -158,7 +159,8 @@ async fn parked_client(
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, name)
                 .with_grant(connetto_core::messages::Grant::new(format!("user:{name}")))
-                .with_cursor(resume),
+                .with_cursor(resume)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("send handshake");
@@ -188,7 +190,7 @@ fn hold_page(script: &Mutex<Script>) -> (Arc<Notify>, Arc<Notify>) {
     (arrived, release)
 }
 
-async fn page_arrived(arrived: &Notify) {
+pub(super) async fn page_arrived(arrived: &Notify) {
     tokio::time::timeout(WAIT, arrived.notified())
         .await
         .expect("held page arrived before deadline");
@@ -336,6 +338,7 @@ async fn expect_recovered_orders(client: &mut LoopbackTransport, events: &[PgCha
             order(3, 1.0, 3, "row"),
         ]
     );
+    expect_catchup_end(client, "orders").await;
     expect_idle(client).await;
 }
 
@@ -470,6 +473,97 @@ impl VisibilityPolicy for SelectiveOutage {
     }
 }
 
+struct PermanentRefusal {
+    roster: RosterAuth,
+    arrived: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl VisibilityPolicy for PermanentRefusal {
+    type Watcher = Arc<Principal>;
+    type Error = connetto_server::RlsAuthError;
+    type Backend = Postgres;
+
+    async fn may_see<R>(
+        &self,
+        row: &R,
+        watchers: &[Self::Watcher],
+        verdicts: &mut [Verdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        if watchers.iter().any(|watcher| {
+            watcher
+                .identity()
+                .is_some_and(|identity| identity.user_id == "refused")
+        }) {
+            self.arrived.notify_one();
+            tokio::time::timeout(WAIT, self.release.notified())
+                .await
+                .expect("the refused visibility question was released");
+            return Err(connetto_server::RlsAuthError::Undecidable {
+                table: "orders".to_owned(),
+                detail: "the caller's policy cannot be evaluated".to_owned(),
+            });
+        }
+        self.roster
+            .may_see(row, watchers, verdicts)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn may_write<R>(
+        &self,
+        write: RowWrite<'_, R>,
+        watcher: &Self::Watcher,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        self.roster
+            .may_write(write, watcher)
+            .await
+            .map_err(|never| match never {})
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permanent_policy_refusal_releases_the_next_resume_wave() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let fixture = acquire_fixture().await;
+        let arrived = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let auth = PermanentRefusal {
+            roster: RosterAuth::granting("refused").and("healthy"),
+            arrived: Arc::clone(&arrived),
+            release: Arc::clone(&release),
+        };
+        let (manager, script, events, _source) =
+            scripted_with_auth(&fixture, SessionConfig::default(), auth, PG_DDL).await;
+        arm(&script, &[], true, None);
+        let mut refused = wave_client(&manager, &script, "refused", cursor_of(&events[0])).await;
+        refused.subscribe(QUERY).await;
+        page_arrived(&arrived).await;
+        let mut healthy = wave_client(&manager, &script, "healthy", cursor_of(&events[0])).await;
+        healthy.subscribe(QUERY).await;
+        release.notify_one();
+        let error = tokio::time::timeout(WAIT, refused.task)
+            .await
+            .expect("permanent refusal ends its session before the deadline")
+            .expect("the refused session did not panic")
+            .expect_err("the permanent policy failure reaches its caller");
+        assert!(
+            matches!(error, SessionError::AuthorizationUnanswerable { .. }),
+            "{error}"
+        );
+        expect_patches(&mut healthy.transport, &events[1..]).await;
+        healthy.close().await;
+    })
+    .await
+    .expect("the queued resume proceeds after the permanent refusal");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_wave_auth_outage_pauses_every_match_then_replays_in_order() {
     tokio::time::timeout(Duration::from_secs(90), async {
@@ -534,6 +628,7 @@ async fn shared_wave_auth_outage_pauses_every_match_then_replays_in_order() {
             ));
             expect_recovered_orders(&mut client.transport, &events).await;
         }
+        expect_catchup_end(&mut unmatched.transport, "orders").await;
         expect_idle(&mut unmatched.transport).await;
         leader.close().await;
         first.close().await;

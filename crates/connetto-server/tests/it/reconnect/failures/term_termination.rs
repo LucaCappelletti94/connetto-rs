@@ -134,7 +134,8 @@ async fn term_client(
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "gone")
                 .with_grant(connetto_core::messages::Grant::new("user:gone"))
-                .with_cursor(resume),
+                .with_cursor(resume)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("handshake");
@@ -230,6 +231,7 @@ async fn a_fatal_during_membership_catchup_opens_no_next_membership() {
         let (member_arrived, _member_release) = hold_page(&script);
         release.notify_one();
         expect_patches_before_truncate(&mut client, &events[1..]).await;
+        expect_catchup_end(&mut client, "orders").await;
         assert!(matches!(
             next_control(&mut client).await,
             ControlMessage::MembershipOpened(_)
@@ -252,11 +254,13 @@ async fn a_live_term_opens_each_membership_and_keeps_serving() {
         page_arrived(&arrived).await;
         release.notify_one();
         expect_patches_before_truncate(&mut client, &events[1..]).await;
+        expect_catchup_end(&mut client, "orders").await;
         let mut mirrored = std::collections::HashSet::new();
         for _ in 0..2 {
             let ControlMessage::MembershipOpened(opened) = next_control(&mut client).await else {
                 panic!("the live term opens its membership");
             };
+            expect_catchup_end(&mut client, &opened.sub_id).await;
             mirrored.insert(opened.member_table);
         }
         assert_eq!(

@@ -139,7 +139,8 @@ async fn handshake(client: &mut LoopbackTransport, cursor: Cursor) {
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "cursor-lock")
                 .with_grant(connetto_core::messages::Grant::new("user:gone"))
-                .with_cursor(cursor),
+                .with_cursor(cursor)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("handshake");

@@ -13,7 +13,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_test_harness::{Fixture, RosterAuth, pool_for, with_user};
 use tokio::sync::mpsc;
 
-use super::{Outbound, Resume, SessionState};
+use super::{HeldInput, Outbound, Resume, SessionState};
 use crate::defaults::ConnettoDefaults;
 use crate::{
     LoopbackTransport, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource,
@@ -60,37 +60,37 @@ async fn manager(fixture: &Fixture) -> Manager {
     .build()
 }
 
-fn state() -> (State, mpsc::UnboundedReceiver<Outbound>) {
+fn state() -> State {
     let (outbound, receiver) = mpsc::unbounded_channel();
     let session_id = SessionId::from_token_hash("rebootstrap-owner");
     let principal =
         Principal::unidentified(session_id).with_capabilities([CapabilitySubject::new("key:a")]);
-    (
-        SessionState {
-            credits: 64,
-            pending: VecDeque::new(),
-            subs: HashMap::new(),
-            paging: VecDeque::new(),
-            reader_reservation: crate::reserve::ReaderReservation::default(),
-            missed: Vec::new(),
-            computed_subs: HashMap::new(),
-            outbound,
-            principal: Arc::new(principal),
-            pending_header: None,
-            deferred: BTreeMap::new(),
-            session_id,
-            writer_row: None,
-            bind_nonce: [0; 32],
-            indeterminate: None,
-            resume: Resume::Fresh,
-            resume_read_budget: Duration::from_secs(10),
-            cursor_subjects: None,
-            key_expiry: BTreeMap::new(),
-            closing: false,
-            enrol_challenge: None,
-        },
-        receiver,
-    )
+    SessionState {
+        credits: 64,
+        pending: VecDeque::new(),
+        input: HeldInput::default(),
+        outbound_rx: receiver,
+        held_outbound: VecDeque::new(),
+        subs: HashMap::new(),
+        paging: VecDeque::new(),
+        reader_reservation: crate::reserve::ReaderReservation::default(),
+        missed: Vec::new(),
+        computed_subs: HashMap::new(),
+        outbound,
+        principal: Arc::new(principal),
+        pending_header: None,
+        deferred: BTreeMap::new(),
+        session_id,
+        writer_row: None,
+        bind_nonce: [0; 32],
+        indeterminate: None,
+        resume: Resume::Fresh,
+        resume_read_budget: Duration::from_secs(10),
+        cursor_subjects: None,
+        key_expiry: BTreeMap::new(),
+        closing: false,
+        enrol_challenge: None,
+    }
 }
 
 async fn next_control(client: &mut LoopbackTransport) -> ControlMessage {
@@ -192,7 +192,7 @@ async fn assert_no_job_output(
 async fn a_queued_rebootstrap_cannot_resurrect_an_unsubscribed_label() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture).await;
-    let (mut state, mut receiver) = state();
+    let mut state = state();
     let (mut server, mut client) = loopback();
     subscribe(
         &manager,
@@ -203,7 +203,7 @@ async fn a_queued_rebootstrap_cannot_resurrect_an_unsubscribed_label() {
     .await;
     answer(&mut client, 2).await;
     swap(&manager, &mut state, "key:b").await;
-    let job = queued(&mut receiver).await;
+    let job = queued(&mut state.outbound_rx).await;
     unsubscribe(&manager, &mut server, &mut state).await;
     assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
 }
@@ -212,7 +212,7 @@ async fn a_queued_rebootstrap_cannot_resurrect_an_unsubscribed_label() {
 async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture).await;
-    let (mut state, mut receiver) = state();
+    let mut state = state();
     let (mut server, mut client) = loopback();
     subscribe(
         &manager,
@@ -223,7 +223,7 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
     .await;
     answer(&mut client, 2).await;
     swap(&manager, &mut state, "key:b").await;
-    let job = queued(&mut receiver).await;
+    let job = queued(&mut state.outbound_rx).await;
     unsubscribe(&manager, &mut server, &mut state).await;
     subscribe(
         &manager,
@@ -235,7 +235,7 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
     answer(&mut client, "30").await;
     assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
     swap(&manager, &mut state, "key:c").await;
-    let job = queued(&mut receiver).await;
+    let job = queued(&mut state.outbound_rx).await;
     assert!(
         manager
             .handle_outbound(&mut server, job, &mut state)
@@ -253,7 +253,7 @@ async fn a_queued_rebootstrap_cannot_replace_a_new_subscription_using_the_label(
 async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current_keys() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture).await;
-    let (mut state, mut receiver) = state();
+    let mut state = state();
     let (mut server, mut client) = loopback();
     subscribe(
         &manager,
@@ -264,7 +264,7 @@ async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current
     .await;
     answer(&mut client, "10").await;
     swap(&manager, &mut state, "key:b").await;
-    let first = queued(&mut receiver).await;
+    let first = queued(&mut state.outbound_rx).await;
     swap(&manager, &mut state, "key:c").await;
     assert!(
         manager
@@ -278,7 +278,7 @@ async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current
     assert_eq!(notice.sub_id, LABEL);
     assert_eq!(notice.reason, FullResyncReason::AuthorizationChange);
     answer(&mut client, "40").await;
-    while let Ok(job) = receiver.try_recv() {
+    while let Ok(job) = state.outbound_rx.try_recv() {
         assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
     }
 }
@@ -287,7 +287,7 @@ async fn repeated_key_changes_replace_a_pending_statistic_once_under_the_current
 async fn a_failed_rebootstrap_releases_its_label_for_a_new_subscription() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture).await;
-    let (mut state, mut receiver) = state();
+    let mut state = state();
     let (mut server, mut client) = loopback();
     subscribe(
         &manager,
@@ -298,7 +298,7 @@ async fn a_failed_rebootstrap_releases_its_label_for_a_new_subscription() {
     .await;
     answer(&mut client, 2).await;
     swap(&manager, &mut state, "key:b").await;
-    let job = queued(&mut receiver).await;
+    let job = queued(&mut state.outbound_rx).await;
     fixture
         .exec("REVOKE SELECT ON notes FROM rebootstrap_reader")
         .await;
@@ -348,7 +348,7 @@ async fn row_snapshot(client: &mut LoopbackTransport) {
 async fn a_reserved_row_resend_cannot_replace_a_new_subscription_using_the_label() {
     let fixture = Fixture::acquire().await;
     let manager = manager(&fixture).await;
-    let (mut state, _receiver) = state();
+    let mut state = state();
     let (mut server, mut client) = loopback();
     subscribe(&manager, &mut server, &mut state, "SELECT * FROM notes").await;
     row_snapshot(&mut client).await;

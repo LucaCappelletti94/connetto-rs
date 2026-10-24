@@ -45,7 +45,8 @@ async fn native_client(
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, name)
                 .with_grant(connetto_core::messages::Grant::new(format!("user:{name}")))
-                .with_cursor(resume),
+                .with_cursor(resume)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("send the native handshake");
@@ -348,10 +349,12 @@ async fn frames_arriving_during_catchup_are_served_in_order_behind_the_replay() 
             assert_eq!(patch.sub_id, "orders");
             assert_eq!(patch.cursor, cursor_of(event));
         }
+        expect_catchup_end(&mut held.transport, "orders").await;
         let ControlMessage::Pong(pong) = next_control(&mut held.transport).await else {
             panic!("the first ping is answered after the replay");
         };
         assert_eq!(pong.nonce, 11);
+        expect_catchup_end(&mut held.transport, "solo").await;
         let ControlMessage::Pong(pong) = next_control(&mut held.transport).await else {
             panic!("the second ping is answered after the first");
         };
