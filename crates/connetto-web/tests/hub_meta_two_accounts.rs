@@ -22,8 +22,10 @@ use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{ReplicaKeyStore, Transport};
 use connetto_web::RelayHub;
+use connetto_web::auth::{BuilderKeyStore, IdbKeyStore};
 use connetto_web::storage::{ReplicaStorage, hub_meta_db_name, replica_name};
 use diesel::prelude::*;
+use std::rc::Rc;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -103,6 +105,12 @@ fn once<T: Transport + 'static>(
     FirstThen::new(transport, || core::future::ready(Err("spent")))
 }
 
+async fn share_store() -> BuilderKeyStore {
+    BuilderKeyStore::new(Rc::new(
+        IdbKeyStore::open().await.expect("open the key store"),
+    ))
+}
+
 /// The account's replica, opened the way the worker opens it: the name
 /// derived from the credential, the codec URL over the pool VFS, the
 /// account's own key, over a fake server that acknowledges the handshake
@@ -121,7 +129,7 @@ async fn open_replica(
             HeldCredential::new(connetto_client::Grant::new("user:tester"), identity)
                 .expect("a string identity serializes"),
         )
-        .durable(place, Holding(key))
+        .durable(place, Holding(key), share_store().await)
         .with_gate(Gate::off())
         .connect_driven()
         .await
