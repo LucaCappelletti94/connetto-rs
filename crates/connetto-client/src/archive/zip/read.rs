@@ -639,6 +639,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_truncated_capture_major_is_refused() {
+        let entry = crate::archive::ArchivedEntry {
+            writer: connetto_core::messages::WriterRef::Number(u64::MAX),
+            seq: 1,
+            hash: [7; 32],
+            major: Major::new(1),
+            changeset: vec![8],
+            provenance: None,
+        };
+        let mut bytes = super::super::write::encode_pending(std::slice::from_ref(&entry));
+        assert_eq!(
+            decode_pending(&bytes)
+                .expect("a valid capture major")
+                .as_slice(),
+            std::slice::from_ref(&entry)
+        );
+        let major_at = 8 + 8 + crate::writer_id(&entry.writer).len() + 8 + 32;
+        for kept in (0..4).rev() {
+            bytes.truncate(major_at + kept);
+            assert!(matches!(
+                decode_pending(&bytes),
+                Err(crate::ClientError::Import(message)) if message == "the queue entry is malformed"
+            ));
+        }
+    }
+
     /// An attachment above the per-entry ceiling is refused from what the
     /// directory declares, so the bytes it claims never have to exist.
     ///
