@@ -1,8 +1,11 @@
 //! The client keepalive against scripted servers over loopback pairs. A
 //! silent upstream is noticed once the probe and answer bounds elapse and the
-//! client recovers, a busy link is never probed, a handshake that draws no
-//! answer is abandoned and redialed, the probe still goes out while the away
-//! gate is locked, and pump steps without a frame keep the one armed sleep.
+//! client recovers, an answered probe keeps the link while a pong with
+//! another nonce does not, a probe that cannot be sent drops the link, a
+//! deadline fires only when due and current, a busy link is never probed, a
+//! handshake that draws no answer is abandoned and redialed, the probe still
+//! goes out while the away gate is locked, and pump steps without a frame
+//! keep the one armed sleep.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -80,10 +83,12 @@ fn tuning() -> SyncTuning {
 
 /// A dialer that opens a fresh scripted server on every attempt. While
 /// `quiet` is set the server answers the handshake and the one snapshot and
-/// then holds its silence, counting the probes it draws.
+/// then holds its silence, counting the probes it draws. Otherwise it answers
+/// every probe with a pong whose nonce is the probe's plus `nonce_offset`.
 struct Scripted {
     quiet: Arc<AtomicBool>,
     pings: Arc<AtomicU32>,
+    nonce_offset: u64,
 }
 
 impl TransportFactory for Scripted {
@@ -95,6 +100,7 @@ impl TransportFactory for Scripted {
     ) -> impl Future<Output = Result<LoopbackTransport, std::convert::Infallible>> + Send {
         let quiet = Arc::clone(&self.quiet);
         let pings = Arc::clone(&self.pings);
+        let nonce_offset = self.nonce_offset;
         async move {
             let (mut server, client_end) = loopback();
             tokio::spawn(async move {
@@ -113,7 +119,9 @@ impl TransportFactory for Scripted {
                             pings.fetch_add(1, Ordering::Relaxed);
                             if !quiet.load(Ordering::Acquire) {
                                 server
-                                    .send_control(ControlMessage::Pong(Pong { nonce: ping.nonce }))
+                                    .send_control(ControlMessage::Pong(Pong {
+                                        nonce: ping.nonce + nonce_offset,
+                                    }))
                                     .await
                                     .expect("pong the probe");
                             }
@@ -153,10 +161,20 @@ impl TransportFactory for Scripted {
 /// A pump over a scripted dialer, backoff and all, with the probe counter to
 /// watch.
 async fn running(quiet: Arc<AtomicBool>) -> (ConnettoClient<LoopbackTransport>, Arc<AtomicU32>) {
+    running_offset(quiet, 0).await
+}
+
+/// [`running`] over a server whose pongs carry the probe's nonce plus
+/// `nonce_offset`.
+async fn running_offset(
+    quiet: Arc<AtomicBool>,
+    nonce_offset: u64,
+) -> (ConnettoClient<LoopbackTransport>, Arc<AtomicU32>) {
     let pings = Arc::new(AtomicU32::new(0));
     let dialer = Scripted {
         quiet,
         pings: Arc::clone(&pings),
+        nonce_offset,
     };
     let (running, pump) = ClientBuilder::new(super::support::bundle(DDL), dialer)
         .with_tuning(tuning())
@@ -229,6 +247,257 @@ async fn a_silent_upstream_is_dropped_and_the_client_recovers() {
     .await;
 }
 
+/// A probe answered by its own pong clears, so the link stays up across many
+/// probe bounds and the next silence draws a fresh probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answered_probe_keeps_the_link_and_probes_again() {
+    let (client, pings) = running(Arc::new(AtomicBool::new(false))).await;
+    let mut events = client.events();
+    next_event(
+        &mut events,
+        std::time::Instant::now() + BOUND,
+        "the connection never stood",
+        |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected)),
+    )
+    .await;
+    // Six probe bounds, each probe answered well inside the answer bound.
+    let watched = tokio::time::timeout(PROBE_AFTER * 6, async {
+        loop {
+            if let ClientEvent::SyncStatus(SyncStatus::Offline) =
+                events.recv().await.expect("the pump is running")
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(watched.is_err(), "an answered probe never drops the link");
+    assert!(
+        pings.load(Ordering::Acquire) >= 2,
+        "the pong returned the link to its silence clock, so it was probed again"
+    );
+}
+
+/// A pong carrying another nonce restarts the answer bound but does not
+/// answer the probe, so a server that only ever answers with the wrong nonce
+/// is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pong_with_another_nonce_does_not_answer_the_probe() {
+    let (client, pings) = running_offset(Arc::new(AtomicBool::new(false)), 1_000).await;
+    let mut events = client.events();
+    let deadline = std::time::Instant::now() + BOUND;
+    next_event(&mut events, deadline, "the connection never stood", |e| {
+        matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected))
+    })
+    .await;
+    next_event(
+        &mut events,
+        deadline,
+        "a probe answered with another nonce was taken as answered",
+        |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Offline)),
+    )
+    .await;
+    assert!(
+        pings.load(Ordering::Acquire) >= 1,
+        "the probe went out and drew the stale pong before the drop"
+    );
+}
+
+/// A client end whose probe sends fail, as a link that died under the probe
+/// would, and that forwards every other frame.
+struct ProbeFails(LoopbackTransport);
+
+impl Transport for ProbeFails {
+    type Error = String;
+
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
+        if matches!(message, ControlMessage::Ping(_)) {
+            return Err("the link died under the probe".to_owned());
+        }
+        self.0
+            .send_control(message)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
+        self.0.send_bulk(message).await.map_err(|e| e.to_string())
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        self.0.recv().await.map_err(|e| e.to_string())
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.0.close().await.map_err(|e| e.to_string())
+    }
+}
+
+/// A dialer handing out [`ProbeFails`] ends over servers that ack and then
+/// hold their silence.
+struct ProbeFailing;
+
+impl TransportFactory for ProbeFailing {
+    type Transport = ProbeFails;
+    type Error = std::convert::Infallible;
+
+    fn connect(
+        &mut self,
+    ) -> impl Future<Output = Result<ProbeFails, std::convert::Infallible>> + Send {
+        let (transport, _pings, nudge) = counting_server();
+        // The server outlives the nudge sender, so dropping it keeps the link.
+        drop(nudge);
+        core::future::ready(Ok(ProbeFails(transport)))
+    }
+}
+
+/// A probe that cannot be sent is the link dying, so the pump drops it and
+/// goes back to dialing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_that_cannot_be_sent_drops_the_link() {
+    let (running, pump) = ClientBuilder::new(super::support::bundle(DDL), ProbeFailing)
+        .with_tuning(tuning())
+        .with_reconnect(ReconnectPolicy::default())
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .connect_with_pump()
+        .await
+        .expect("the first dial hands back a transport");
+    let client = running.client().clone();
+    let mut events = client.events();
+    tokio::spawn(pump);
+    let deadline = std::time::Instant::now() + BOUND;
+    next_event(&mut events, deadline, "the connection never stood", |e| {
+        matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected))
+    })
+    .await;
+    next_event(
+        &mut events,
+        deadline,
+        "the failed probe never dropped the link",
+        |e| matches!(e, ClientEvent::SyncStatus(SyncStatus::Offline)),
+    )
+    .await;
+    next_event(
+        &mut events,
+        deadline,
+        "the dropped link was never redialed",
+        |e| matches!(e, ClientEvent::Reconnecting { .. }),
+    )
+    .await;
+}
+
+/// A loopback server that acks the handshake, counts the probes it draws and
+/// sends one frame other than a pong to a probe for every nudge.
+fn counting_server() -> (
+    LoopbackTransport,
+    Arc<AtomicU32>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let (mut server, client_end) = loopback();
+    let pings = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&pings);
+    let (nudge, mut nudges) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        server.send_control(ack()).await.expect("ack the handshake");
+        let mut nudging = true;
+        loop {
+            tokio::select! {
+                frame = server.recv() => match frame {
+                    Ok(Some(IncomingFrame::Control(ControlMessage::Ping(_)))) => {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Some(_)) => {}
+                    _ => return,
+                },
+                request = nudges.recv(), if nudging => match request {
+                    // Probe nonces start at one, so this pong answers none.
+                    Some(()) => server
+                        .send_control(ControlMessage::Pong(Pong { nonce: 0 }))
+                        .await
+                        .expect("send the nudge"),
+                    None => nudging = false,
+                },
+            }
+        }
+    });
+    (client_end, pings, nudge)
+}
+
+/// A deadline fires only when it is both due and current: one read before
+/// the silence ran out sends nothing, one a frame re-armed sends nothing, the
+/// current one sends the probe, and the answer bound then runs from the probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_keepalive_deadline_fires_only_when_due_and_current() {
+    // Wide bounds, so a loaded machine cannot let one run out between steps.
+    const PROBE: Duration = Duration::from_millis(600);
+    const ANSWER: Duration = Duration::from_millis(600);
+    let (transport, pings, nudge) = counting_server();
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(transport),
+    )
+    .with_tuning(
+        SyncTuning::default()
+            .with_probe_after(PROBE)
+            .with_answer_within(ANSWER),
+    )
+    .connect_driven()
+    .await
+    .expect("connect");
+    // The build states Offline and then Connected before any frame.
+    conn.pump_one().await.expect("the offline status");
+    conn.pump_one().await.expect("the connected status");
+
+    let early = conn
+        .keepalive_timer()
+        .expect("a standing link arms a deadline");
+    conn.keepalive_fire(early)
+        .await
+        .expect("a deadline not yet due is a no-op");
+
+    tokio::time::sleep(PROBE).await;
+    let re_armed = conn.keepalive_timer().expect("the deadline still stands");
+    nudge.send(()).expect("the server takes nudges");
+    conn.pump_one().await.expect("the nudge arrives");
+    conn.keepalive_fire(re_armed)
+        .await
+        .expect("a deadline a frame re-armed is a no-op");
+
+    tokio::time::sleep(PROBE).await;
+    let due = conn.keepalive_timer().expect("the deadline stands");
+    conn.keepalive_fire(due).await.expect("the probe goes out");
+    let answer = conn.keepalive_timer().expect("the answer bound stands");
+    conn.keepalive_fire(answer)
+        .await
+        .expect("an answer bound not yet run out is a no-op");
+    assert!(conn.is_connected(), "the answer bound runs from the probe");
+
+    tokio::time::sleep(ANSWER).await;
+    let answer = conn.keepalive_timer().expect("the answer bound stands");
+    conn.keepalive_fire(answer)
+        .await
+        .expect("the unanswered probe drops the link");
+    assert!(
+        !conn.is_connected(),
+        "the unanswered probe dropped the link"
+    );
+    assert!(
+        conn.keepalive_timer().is_none(),
+        "no deadline stands without a link"
+    );
+    // The server counts each probe when it reads it, so give it a turn.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        pings.load(Ordering::Acquire),
+        1,
+        "only the deadline that was due and current sent a probe"
+    );
+}
+
 /// Pump steps that take no frame keep the keepalive sleep already armed, so
 /// the app's sleeper is not asked for a fresh timer on every step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -238,6 +507,7 @@ async fn steps_without_a_frame_keep_the_armed_keepalive_sleep() {
     let dialer = Scripted {
         quiet: Arc::new(AtomicBool::new(false)),
         pings: Arc::new(AtomicU32::new(0)),
+        nonce_offset: 0,
     };
     // The default probe bound outlasts the test, so no probe or pong moves
     // the deadline while the steps run.
@@ -445,6 +715,7 @@ async fn the_probe_runs_while_the_gate_is_locked() {
                 Scripted {
                     quiet: Arc::new(AtomicBool::new(true)),
                     pings,
+                    nonce_offset: 0,
                 },
             )
             .with_tuning(tuning())
