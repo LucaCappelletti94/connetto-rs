@@ -3383,32 +3383,31 @@ fn install_storage_layout<S: ReplicaStorage>(
     check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
 }
 
-/// The schema and metadata tables an open installs, in dependency order and in one transaction.
+/// The schema and metadata tables an open installs, in dependency order.
 #[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
     config: &ClientConfig,
 ) -> Result<(), ClientError> {
-    db.transaction(|db| {
-        // The views are what the map has to agree with.
-        check_policy_tables(db, &config.policy_tables)?;
-        // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
-        check_recorded_tables(db, "main", &config.unrecorded_tables)?;
-        db.batch_execute(META_DDL)?;
-        match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
-            Ok(()) => {}
-            Err(diesel::result::Error::DatabaseError(_, info))
-                if info.message().contains("duplicate column name") => {}
-            Err(error) => return Err(error.into()),
-        }
-        db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
-        // After the subscription tables, since it references `_connetto_query`.
-        db.batch_execute(aggregates::AGGREGATE_DDL)?;
-        #[cfg(feature = "device-identity")]
-        db.batch_execute(enrolment::CERTIFICATE_DDL)?;
-        // A watch the previous run died still holding counts down from now.
-        subscriptions::anchor_launch(db)
-    })
+    // The views are what the map has to agree with.
+    check_policy_tables(db, &config.policy_tables)?;
+    // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
+    check_recorded_tables(db, "main", &config.unrecorded_tables)?;
+    db.batch_execute(META_DDL)?;
+    match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
+        Ok(()) => {}
+        Err(diesel::result::Error::DatabaseError(_, info))
+            if info.message().contains("duplicate column name") => {}
+        Err(error) => return Err(error.into()),
+    }
+    db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+    // After the subscription tables, since it references `_connetto_query`.
+    db.batch_execute(aggregates::AGGREGATE_DDL)?;
+    #[cfg(feature = "device-identity")]
+    db.batch_execute(enrolment::CERTIFICATE_DDL)?;
+    // A watch the previous run died still holding counts down from now.
+    subscriptions::anchor_launch(db)?;
+    Ok(())
 }
 
 impl<T> ConnettoConnection<T>
@@ -3552,7 +3551,7 @@ where
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         install_storage_layout(&mut db, replica, sqlite_ddl, config)?;
-        install_replica_schema(&mut db, config)?;
+        db.transaction(|db| install_replica_schema(db, config))?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
