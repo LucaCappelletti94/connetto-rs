@@ -101,6 +101,8 @@ pub struct SchemaBundle {
     policy_views: Vec<String>,
     local_tier_ddl: Option<String>,
     shared_tables: Vec<String>,
+    shared_layout: Option<SharedLayout>,
+    connection_ddl: String,
 }
 
 impl SchemaBundle {
@@ -142,6 +144,8 @@ impl SchemaBundle {
             policy_views: policy_views.into_iter().map(Into::into).collect(),
             local_tier_ddl: local_tier_ddl.map(Into::into),
             shared_tables: Vec::new(),
+            shared_layout: None,
+            connection_ddl: String::new(),
         }
     }
 
@@ -164,6 +168,26 @@ impl SchemaBundle {
         tables: impl IntoIterator<Item = T>,
     ) -> Self {
         self.shared_tables = tables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Return a copy of this bundle carrying the shared store's translated
+    /// layout, for a build that stores a table once for every account. The
+    /// version is unaffected, since the layout is a device-side artifact, not
+    /// part of the synced shape it covers.
+    #[must_use]
+    pub fn with_shared_layout(mut self, layout: SharedLayout) -> Self {
+        self.shared_layout = Some(layout);
+        self
+    }
+
+    /// Return a copy of this bundle carrying its connection program, the
+    /// statements a connection to an existing replica runs to recreate its
+    /// `TEMP` objects. The version is unaffected, since the first
+    /// initialization the replica DDL hashes already covers it.
+    #[must_use]
+    pub fn with_connection_ddl(mut self, ddl: impl Into<String>) -> Self {
+        self.connection_ddl = ddl.into();
         self
     }
 
@@ -212,6 +236,21 @@ impl SchemaBundle {
     #[must_use]
     pub fn shared_tables(&self) -> &[String] {
         &self.shared_tables
+    }
+
+    /// The shared store's translated layout, when the build shares a table.
+    /// It is not part of the synced shape the version covers.
+    #[must_use]
+    pub fn shared_layout(&self) -> Option<&SharedLayout> {
+        self.shared_layout.as_ref()
+    }
+
+    /// The connection program, the statements a connection to an existing
+    /// replica runs to recreate its `TEMP` objects. Empty when the build has
+    /// none. It is not part of the synced shape the version covers.
+    #[must_use]
+    pub fn connection_ddl(&self) -> &str {
+        &self.connection_ddl
     }
 
     /// The schema version this bundle presents at handshake.
@@ -266,6 +305,48 @@ impl fmt::Debug for SchemaBundle {
             .field("policy_tables", &self.policy_tables)
             .field("policy_views", &self.policy_views)
             .finish_non_exhaustive()
+    }
+}
+
+/// The shared store's translated layout: the four SQL programs a device runs to
+/// open a replica whose shared tables live in a separate database file, one for
+/// each freshness situation of the main and shared files.
+#[derive(Clone, Debug)]
+pub struct SharedLayout {
+    fresh_both: String,
+    fresh_main: String,
+    fresh_shared: String,
+    reopen: String,
+}
+
+impl SharedLayout {
+    /// Build a layout from its four programs, in the order both files fresh,
+    /// main fresh only, shared fresh only, and connection reopen.
+    #[must_use]
+    pub fn new(
+        fresh_both: impl Into<String>,
+        fresh_main: impl Into<String>,
+        fresh_shared: impl Into<String>,
+        reopen: impl Into<String>,
+    ) -> Self {
+        Self {
+            fresh_both: fresh_both.into(),
+            fresh_main: fresh_main.into(),
+            fresh_shared: fresh_shared.into(),
+            reopen: reopen.into(),
+        }
+    }
+
+    /// The program a device runs to open its replica, given whether each file
+    /// is freshly created.
+    #[must_use]
+    pub fn sql(&self, fresh_main: bool, fresh_shared: bool) -> &str {
+        match (fresh_main, fresh_shared) {
+            (true, true) => &self.fresh_both,
+            (true, false) => &self.fresh_main,
+            (false, true) => &self.fresh_shared,
+            (false, false) => &self.reopen,
+        }
     }
 }
 
@@ -596,5 +677,59 @@ mod tests {
         )
         .version();
         assert_eq!(lf, crlf);
+    }
+
+    /// The four lifecycle programs of one shared store layout, each distinct so
+    /// a selection that picks the wrong program reads wrong.
+    fn layout() -> SharedLayout {
+        SharedLayout::new("both", "main", "shared", "reopen")
+    }
+
+    /// A shared layout and a connection program are device-side artifacts, not
+    /// part of the synced shape, so neither changes the version.
+    #[test]
+    fn the_shared_layout_and_connection_program_do_not_change_the_version() {
+        let base = reference().version();
+        assert_eq!(
+            base,
+            reference().with_shared_layout(layout()).version(),
+            "the shared layout alone changes nothing on the wire"
+        );
+        assert_eq!(
+            base,
+            reference()
+                .with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")
+                .version(),
+            "the connection program alone changes nothing on the wire"
+        );
+        assert_eq!(
+            base,
+            reference()
+                .with_shared_layout(layout())
+                .with_connection_ddl("CREATE TEMP VIEW reader AS SELECT 1;")
+                .version(),
+            "a device that shares a table must present the same schema as one that does not"
+        );
+    }
+
+    /// `sql` hands back the program named by the two file-freshness flags, and
+    /// no other.
+    #[test]
+    fn sql_selects_the_program_for_each_freshness_pair() {
+        let layout = layout();
+        assert_eq!(layout.sql(true, true), "both");
+        assert_eq!(layout.sql(true, false), "main");
+        assert_eq!(layout.sql(false, true), "shared");
+        assert_eq!(layout.sql(false, false), "reopen");
+    }
+
+    /// A bundle built without a shared store has no layout and no connection
+    /// program, so a device that never shares reads `None` and the empty
+    /// program.
+    #[test]
+    fn a_fresh_bundle_has_no_shared_layout_and_no_connection_program() {
+        let base = reference();
+        assert!(base.shared_layout().is_none());
+        assert_eq!(base.connection_ddl(), "");
     }
 }

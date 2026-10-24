@@ -25,14 +25,14 @@ pub use connetto_core::bots::{TextIds, UuidIds};
 use connetto_core::sql::quote_ident;
 use connetto_core::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
-    CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaBundle, UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION,
+    CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaBundle, SharedLayout, UUID_FUNCTION,
+    WRITE_EXEMPTION_FUNCTION,
 };
 use diesel::connection::SimpleConnection;
 use diesel::{Connection, SqliteConnection};
 use pg2sqlite::manifest::WrapperKind;
-use pg2sqlite::prelude::{
-    Pg2Sqlite, Pg2SqliteOptions, Script, SessionVariableMapping, UuidRepresentation,
-};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::script::{FreshFiles, Script};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView, Expr,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement,
@@ -334,6 +334,39 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema_sql: &str,
     policies_sql: &str,
 ) -> Result<SchemaBundle, SchemaError> {
+    translated::<K, Id>(schema_sql, policies_sql, &[])
+}
+
+/// Translate the two Postgres source documents with connetto's fixed options,
+/// placing the validated `shared` tables in a separate `connetto_shared` store.
+///
+/// As [`translate`], but first checks `shared` under [`shared_tables`] and
+/// compiles the shared store's four lifecycle programs from a second
+/// translation that places those tables in the `connetto_shared` schema. The
+/// bundle carries the shared tables and the layout beside the unshared
+/// replica DDL; the version is the unshared one, since where a device stores a
+/// table changes nothing on the wire.
+///
+/// # Errors
+///
+/// As [`translate`], plus [`SchemaError::SharedTableUndeclared`] and
+/// [`SchemaError::SharedTableReadsCaller`] when the list is refused.
+pub fn translate_shared<K: CapabilityKey, Id: BotRegistryIdSql>(
+    schema_sql: &str,
+    policies_sql: &str,
+    shared: &[&str],
+) -> Result<SchemaBundle, SchemaError> {
+    let shared = shared_tables::<Id>(schema_sql, policies_sql, shared)?;
+    translated::<K, Id>(schema_sql, policies_sql, &shared)
+}
+
+/// The shared step behind [`translate`] and [`translate_shared`]: translate
+/// the synced tier, and when `shared` is non-empty compile its layout.
+fn translated<K: CapabilityKey, Id: BotRegistryIdSql>(
+    schema_sql: &str,
+    policies_sql: &str,
+    shared: &[String],
+) -> Result<SchemaBundle, SchemaError> {
     let schema_sql = with_registry::<Id>(schema_sql);
     let options = options::<K>();
     let mut translator = parsed_documents(&without_references(&schema_sql)?, policies_sql)?;
@@ -346,8 +379,9 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     let report = translator
         .translate_with_report(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
-    let ddl = statements_to_ddl(&report.script);
-    validate(&ddl, "replica")?;
+    let replica_ddl = statements_to_ddl(report.script.iter());
+    validate(&replica_ddl, "replica")?;
+    let connection_ddl = connection_program(&report.script)?;
     let manifest = translator
         .translation_manifest(&options)
         .map_err(|err| SchemaError::Translate(err.to_string()))?;
@@ -356,14 +390,27 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
         .filter(|entry| entry.wrapper == WrapperKind::RlsView)
         .map(|entry| (entry.logical.clone(), entry.physical.clone()))
         .collect::<Vec<(String, String)>>();
-    Ok(SchemaBundle::new(
+    let views = view_names(report.script.iter());
+    let mut bundle = SchemaBundle::new(
         schema_sql,
         policies_sql,
-        ddl,
+        replica_ddl,
         pairs,
-        view_names(&report.script),
+        views,
         None::<&str>,
-    ))
+    )
+    .with_connection_ddl(connection_ddl)
+    .with_shared_tables(shared.iter().cloned());
+    if !shared.is_empty() {
+        let shared_options =
+            options.with_attached_tables("connetto_shared", shared.iter().cloned());
+        let shared_report = translator
+            .translate_with_report(&shared_options)
+            .map_err(|err| SchemaError::Translate(err.to_string()))?;
+        let layout = shared_layout(&shared_report.script)?;
+        bundle = bundle.with_shared_layout(layout);
+    }
+    Ok(bundle)
 }
 
 /// `schema_sql` with every column `REFERENCES` and table `FOREIGN KEY` clause
@@ -528,8 +575,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     let schema_sql = std::fs::read_to_string(schema)?;
     let policies_sql = std::fs::read_to_string(policies)?;
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
-    let mut bundle = translate::<K, Id>(&schema_sql, &policies_sql)?
-        .with_shared_tables(shared_tables::<Id>(&schema_sql, &policies_sql, shared)?);
+    let mut bundle = translate_shared::<K, Id>(&schema_sql, &policies_sql, shared)?;
     if let Some(local_tier) = local_tier {
         println!("cargo::rerun-if-changed={}", local_tier.display());
         let tier_sql = std::fs::read_to_string(local_tier)?;
@@ -538,7 +584,7 @@ pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
         let report = tier
             .translate_with_report(&options)
             .map_err(|err| SchemaError::Translate(err.to_string()))?;
-        let ddl = statements_to_ddl(&report.script);
+        let ddl = statements_to_ddl(report.script.iter());
         validate(&ddl, "local tier")?;
         bundle = bundle.with_local_tier(ddl);
     }
@@ -656,10 +702,9 @@ fn cap_statement(table: &str, verb: &str) -> String {
 }
 
 /// Join the translated statements the way the artifacts do: `;` between and
-/// a `;` after the last, connection setup first.
-fn statements_to_ddl(script: &Script) -> String {
-    let mut ddl = script
-        .iter()
+/// a `;` after the last.
+fn statements_to_ddl<'a>(statements: impl Iterator<Item = &'a Statement>) -> String {
+    let mut ddl = statements
         .map(Statement::to_string)
         .collect::<Vec<_>>()
         .join(";\n");
@@ -685,9 +730,8 @@ fn validate(ddl: &str, tier: &'static str) -> Result<(), SchemaError> {
 
 /// The views a translation creates, read off the `CREATE VIEW` statements it
 /// emits, so a server without SQLite can compute them.
-fn view_names(script: &Script) -> Vec<String> {
-    script
-        .iter()
+fn view_names<'a>(statements: impl Iterator<Item = &'a Statement>) -> Vec<String> {
+    statements
         .filter_map(|statement| match statement {
             Statement::CreateView(CreateView { name, .. }) => name
                 .0
@@ -698,6 +742,69 @@ fn view_names(script: &Script) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The program a connection to an existing replica runs, the statements that
+/// recreate the source's `TEMP` objects.
+fn connection_program(script: &Script) -> Result<String, SchemaError> {
+    let program = script.connect().map_err(|err| {
+        SchemaError::Translate(format!("the connection program cannot be rendered: {err}"))
+    })?;
+    Ok(statements_to_ddl(program))
+}
+
+/// The shared store's four lifecycle programs, compiled from the shared
+/// translation's script and validated against a throwaway database with the
+/// store attached.
+fn shared_layout(script: &Script) -> Result<SharedLayout, SchemaError> {
+    let fresh_both = selection(script, FreshFiles::Both, "the both-fresh program")?;
+    let fresh_main = selection(script, FreshFiles::Main, "the main-fresh program")?;
+    let fresh_shared = selection(script, FreshFiles::Attached, "the shared-fresh program")?;
+    let reopen = connection_program(script)?;
+    // The both-fresh program creates every file object, so applying it to a
+    // throwaway database with the store attached is what proves SQLite accepts
+    // the placement.
+    validate_shared(&fresh_both)?;
+    Ok(SharedLayout::new(
+        fresh_both,
+        fresh_main,
+        fresh_shared,
+        reopen,
+    ))
+}
+
+/// One fresh-file selection of a script, rendered as its DDL.
+fn selection(
+    script: &Script,
+    files: FreshFiles,
+    what: &'static str,
+) -> Result<String, SchemaError> {
+    let program = script
+        .initialize(files)
+        .map_err(|err| SchemaError::Translate(format!("{what} cannot be rendered: {err}")))?;
+    Ok(statements_to_ddl(program))
+}
+
+/// Apply `program` to a throwaway in-memory database with the shared store
+/// attached, failing when SQLite refuses it.
+fn validate_shared(program: &str) -> Result<(), SchemaError> {
+    let mut probe = SqliteConnection::establish(":memory:").map_err(|err| SchemaError::Sqlite {
+        tier: "shared store",
+        detail: err.to_string(),
+    })?;
+    probe
+        .batch_execute("ATTACH ':memory:' AS connetto_shared")
+        .map_err(|err| SchemaError::Sqlite {
+            tier: "shared store",
+            detail: err.to_string(),
+        })?;
+    probe
+        .batch_execute(program)
+        .map_err(|err| SchemaError::Sqlite {
+            tier: "shared store",
+            detail: err.to_string(),
+        })?;
+    Ok(())
 }
 
 /// The file an application `include!`s.
@@ -731,6 +838,20 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
     };
     let views = borrowed_slice(bundle.policy_views());
     let shared = borrowed_slice(bundle.shared_tables());
+    let layout = match bundle.shared_layout() {
+        Some(layout) => {
+            // An `Option` either way, so the const's type never depends on
+            // whether this build shares a table.
+            format!(
+                "pub const SHARED_LAYOUT: Option<(&str, &str, &str, &str)> = Some(({}, {}, {}, {}));",
+                raw_literal(layout.sql(true, true)),
+                raw_literal(layout.sql(true, false)),
+                raw_literal(layout.sql(false, true)),
+                raw_literal(layout.sql(false, false)),
+            )
+        }
+        None => "pub const SHARED_LAYOUT: Option<(&str, &str, &str, &str)> = None;".to_string(),
+    };
     format!(
         "// Generated by connetto_schema::emit. Do not edit.\n\
          #[doc(hidden)]\n\
@@ -741,6 +862,8 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
         pub const POLICIES_SOURCE: &str = {};\n\
         /// The translated replica DDL a client applies to a fresh replica.\n\
         pub const REPLICA_DDL: &str = {};\n\
+        /// The connection program that recreates the TEMP objects a source leaves.\n\
+        pub const CONNECTION_DDL: &str = {};\n\
         /// The bot cap the deployment applies beside its schema and policies.\n\
         pub const CAP_POLICIES: &str = {};\n\
          /// The translated local tier, when the build has one.\n\
@@ -751,11 +874,14 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
          pub const POLICY_VIEWS: &[&str] = {views};\n\
          /// The tables a device stores once for every account.\n\
          pub const SHARED_TABLES: &[&str] = {shared};\n\
+         /// The shared store's four lifecycle programs, when the build shares a\n\
+         /// table. The tuple is (both-fresh, main-fresh, shared-fresh, reopen).\n\
+         {layout}\n\
          /// The schema bundle this build translated from its own Postgres\n\
          /// sources. The version is the hash of exactly these contents.\n\
          #[must_use]\n\
          pub fn bundle() -> connetto_core::SchemaBundle {{\n\
-         connetto_core::SchemaBundle::new(\n\
+         let mut bundle = connetto_core::SchemaBundle::new(\n\
              SCHEMA_SOURCE,\n\
              POLICIES_SOURCE,\n\
              REPLICA_DDL,\n\
@@ -764,11 +890,19 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
              LOCAL_TIER_DDL,\n\
          )\n\
          .with_shared_tables(SHARED_TABLES.iter().copied())\n\
+         .with_connection_ddl(CONNECTION_DDL);\n\
+         if let Some((both_fresh, main_fresh, shared_fresh, reopen)) = SHARED_LAYOUT {{\n\
+             bundle = bundle.with_shared_layout(\n\
+                 connetto_core::SharedLayout::new(both_fresh, main_fresh, shared_fresh, reopen),\n\
+             );\n\
+         }}\n\
+         bundle\n\
          }}\n\
          }}\n",
         raw_literal(bundle.schema_source()),
         raw_literal(bundle.policies_source()),
         raw_literal(bundle.replica_ddl()),
+        raw_literal(bundle.connection_ddl()),
         raw_literal(cap),
     )
 }
@@ -949,8 +1083,8 @@ mod tests {
         let report = translator
             .translate_with_report(&options)
             .expect("translate the deployment");
-        let ddl = statements_to_ddl(&report.script);
-        let derived = view_names(&report.script);
+        let ddl = statements_to_ddl(report.script.iter());
+        let derived = view_names(report.script.iter());
         let built = sqlite_views(&ddl);
         assert!(!derived.is_empty(), "the deployment's policies build views");
         assert_eq!(
@@ -1166,5 +1300,266 @@ mod tests {
         assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
         assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
         assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
+    }
+
+    // The consumer behavior of the shared store layout, read through the
+    // replica's logical names the way an application does.
+
+    diesel::table! {
+        /// The shareable table the layout consumer tests translate.
+        words (id) {
+            id -> Integer,
+            word -> Text,
+        }
+    }
+
+    diesel::table! {
+        /// The caller-private main table the shared one joins against.
+        notes (id) {
+            id -> Integer,
+            word_id -> Integer,
+            owner_id -> Text,
+            body -> Text,
+        }
+    }
+
+    diesel::allow_tables_to_appear_in_same_query!(words, notes);
+
+    /// The schema the layout consumer tests translate, a shareable table and a
+    /// caller-private one.
+    const SHARED_CONSUMER_SCHEMA: &str = "CREATE TABLE words (id INT PRIMARY KEY, word TEXT); \
+                                          CREATE TABLE notes (id INT PRIMARY KEY, \
+                                            word_id INT NOT NULL, owner_id TEXT NOT NULL, \
+                                            body TEXT);";
+
+    /// The policies [`SHARED_CONSUMER_SCHEMA`] carries, constant on the shared
+    /// `words` and private to the caller on `notes`.
+    const SHARED_CONSUMER_POLICIES: &str = "ALTER TABLE words ENABLE ROW LEVEL SECURITY; \
+                                            CREATE POLICY words_p ON words FOR ALL USING (true); \
+                                            ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+                                            CREATE POLICY notes_p ON notes FOR ALL USING \
+                                              (owner_id = current_setting('app.user_id', true));";
+
+    /// The bundle a build of the consumer schema sharing `words` produces.
+    fn shared_consumer_bundle() -> connetto_core::SchemaBundle {
+        translate_shared::<String, connetto_core::bots::TextIds>(
+            SHARED_CONSUMER_SCHEMA,
+            SHARED_CONSUMER_POLICIES,
+            &["words"],
+        )
+        .expect("the schema translates with a shared store")
+    }
+
+    /// A fresh replica connection with the shared store attached from `shared`.
+    fn conn_with_shared(shared: &str) -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open the replica");
+        conn.batch_execute(&format!("ATTACH '{shared}' AS connetto_shared"))
+            .expect("attach the shared store");
+        conn
+    }
+
+    /// Register the replica functions a translated replica calls, holding the
+    /// write exemption open so the test's own writes are admitted.
+    fn register_replica_functions(conn: &mut SqliteConnection, caller: &str, bot_list: &str) {
+        use diesel::sqlite::SqliteFunctionBehavior;
+        let behavior = SqliteFunctionBehavior::DETERMINISTIC | SqliteFunctionBehavior::INNOCUOUS;
+        let caller = caller.to_owned();
+        conn.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+            CALLER_FUNCTION,
+            behavior,
+            move || caller.clone(),
+        )
+        .expect("register the caller");
+        conn.register_noarg_sql_function::<
+            diesel::sql_types::Nullable<diesel::sql_types::Text>,
+            _,
+            _,
+        >(
+            SUBJECTS_FUNCTION,
+            behavior,
+            move || None::<String>,
+        )
+        .expect("register the subjects");
+        let bot_list = bot_list.to_owned();
+        conn.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+            BOT_LIST_FUNCTION,
+            behavior,
+            move || bot_list.clone(),
+        )
+        .expect("register the bot list");
+        conn.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
+            WRITE_EXEMPTION_FUNCTION,
+            SqliteFunctionBehavior::INNOCUOUS,
+            move || true,
+        )
+        .expect("register the write exemption");
+    }
+
+    /// A guard that removes its temp files on drop.
+    struct TempFiles(Vec<std::path::PathBuf>);
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// A unique temp file path for one test run.
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("connetto-shared-{}-{name}", std::process::id()));
+        path
+    }
+
+    fn url(path: &std::path::Path) -> String {
+        path.to_str().expect("a utf-8 temporary path").to_owned()
+    }
+
+    /// A policy-independent shared table joins with a caller-private main table
+    /// on the replica the layout builds.
+    #[test]
+    fn a_shared_table_joins_with_a_private_main_table() {
+        use diesel::JoinOnDsl as _;
+        let bundle = shared_consumer_bundle();
+        let layout = bundle.shared_layout().expect("the build shares a table");
+        let mut conn = conn_with_shared(":memory:");
+        conn.batch_execute(layout.sql(true, true))
+            .expect("apply the fresh layout");
+        register_replica_functions(&mut conn, "alice", "*");
+        diesel::insert_into(words::table)
+            .values((words::id.eq(1), words::word.eq("hello")))
+            .execute(&mut conn)
+            .expect("seed the shared table");
+        diesel::insert_into(notes::table)
+            .values((
+                notes::id.eq(1),
+                notes::word_id.eq(1),
+                notes::owner_id.eq("alice"),
+                notes::body.eq("b"),
+            ))
+            .execute(&mut conn)
+            .expect("seed the main table");
+        let joined: Vec<String> = words::table
+            .inner_join(notes::table.on(words::id.eq(notes::word_id)))
+            .select(words::word)
+            .load(&mut conn)
+            .expect("read the join");
+        assert_eq!(joined, vec!["hello".to_owned()]);
+    }
+
+    /// Reopening with a fresh main file over an existing shared file keeps the
+    /// shared rows and applies the main-fresh program to the new main.
+    #[test]
+    fn a_reopen_with_a_fresh_main_keeps_the_shared_file() {
+        let bundle = shared_consumer_bundle();
+        let layout = bundle.shared_layout().expect("the build shares a table");
+        let shared = temp_file("shared.db");
+        let main_first = temp_file("main-first.db");
+        let main_second = temp_file("main-second.db");
+        let _guard = TempFiles(vec![
+            shared.clone(),
+            main_first.clone(),
+            main_second.clone(),
+        ]);
+
+        // First open: both files fresh, seed a shared row.
+        {
+            let mut conn = SqliteConnection::establish(url(&main_first).as_str())
+                .expect("open the first main");
+            conn.batch_execute(&format!("ATTACH '{}' AS connetto_shared", url(&shared)))
+                .expect("attach the shared store");
+            conn.batch_execute(layout.sql(true, true))
+                .expect("apply the fresh layout");
+            register_replica_functions(&mut conn, "alice", "*");
+            diesel::insert_into(words::table)
+                .values((words::id.eq(1), words::word.eq("hello")))
+                .execute(&mut conn)
+                .expect("seed the shared store");
+        }
+
+        // Second open: a fresh main over the existing shared file.
+        let mut conn =
+            SqliteConnection::establish(url(&main_second).as_str()).expect("open the fresh main");
+        conn.batch_execute(&format!("ATTACH '{}' AS connetto_shared", url(&shared)))
+            .expect("attach the existing shared store");
+        conn.batch_execute(layout.sql(true, false))
+            .expect("apply the main-fresh layout");
+        register_replica_functions(&mut conn, "alice", "*");
+        diesel::insert_into(notes::table)
+            .values((
+                notes::id.eq(1),
+                notes::word_id.eq(1),
+                notes::owner_id.eq("alice"),
+                notes::body.eq("b"),
+            ))
+            .execute(&mut conn)
+            .expect("seed the fresh main");
+        let shared_rows: Vec<String> = words::table
+            .select(words::word)
+            .load(&mut conn)
+            .expect("read the shared store");
+        assert_eq!(
+            shared_rows,
+            vec!["hello".to_owned()],
+            "the shared row survived the main being rebuilt"
+        );
+        let bodies: Vec<String> = notes::table
+            .select(notes::body)
+            .load(&mut conn)
+            .expect("read the fresh main");
+        assert_eq!(bodies, vec!["b".to_owned()]);
+    }
+
+    /// Reopening both existing files recreates the shared table's readers.
+    #[test]
+    fn a_reopen_recreates_the_shared_readers() {
+        let bundle = shared_consumer_bundle();
+        let layout = bundle.shared_layout().expect("the build shares a table");
+        let shared = temp_file("shared-reopen.db");
+        let main = temp_file("main-reopen.db");
+        let _guard = TempFiles(vec![shared.clone(), main.clone()]);
+        {
+            let mut conn = SqliteConnection::establish(url(&main).as_str()).expect("open the main");
+            conn.batch_execute(&format!("ATTACH '{}' AS connetto_shared", url(&shared)))
+                .expect("attach the shared store");
+            conn.batch_execute(layout.sql(true, true))
+                .expect("apply the fresh layout");
+            register_replica_functions(&mut conn, "alice", "*");
+            diesel::insert_into(words::table)
+                .values((words::id.eq(1), words::word.eq("hello")))
+                .execute(&mut conn)
+                .expect("seed the shared store");
+        }
+        let mut conn = SqliteConnection::establish(url(&main).as_str()).expect("reopen the main");
+        conn.batch_execute(&format!("ATTACH '{}' AS connetto_shared", url(&shared)))
+            .expect("attach the shared store");
+        conn.batch_execute(layout.sql(false, false))
+            .expect("apply the reopen layout");
+        register_replica_functions(&mut conn, "alice", "*");
+        let words: Vec<String> = words::table
+            .select(words::word)
+            .load(&mut conn)
+            .expect("read through the recreated reader");
+        assert_eq!(words, vec!["hello".to_owned()]);
+    }
+
+    /// The schema a device shares and the one it does not present the same wire
+    /// version, so a server that names no shared table accepts the client that
+    /// does.
+    #[test]
+    fn sharing_a_table_does_not_change_the_wire_version() {
+        let unshared = translate::<String, connetto_core::bots::TextIds>(
+            SHARED_CONSUMER_SCHEMA,
+            SHARED_CONSUMER_POLICIES,
+        )
+        .expect("translates unshared");
+        let shared = shared_consumer_bundle();
+        assert_eq!(
+            unshared.version(),
+            shared.version(),
+            "sharing a table changes nothing the server sees"
+        );
     }
 }

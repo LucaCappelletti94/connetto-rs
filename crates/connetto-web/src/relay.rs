@@ -473,6 +473,12 @@ const LOCAL_SCHEMA: &str = "connetto_local";
 /// lives. Named so a snapshot reads the same way for either tier.
 const MAIN_SCHEMA: &str = "main";
 
+/// The attach name of the device-wide shared store on the worker connection.
+/// Its rows belong to every identity of the device, so a snapshot of them is
+/// served from this attached schema rather than from the identity's own
+/// replica, which holds only the layout's readers onto them.
+const SHARED_SCHEMA: &str = "connetto_shared";
+
 /// The schema the hub's own durable state is attached under.
 const HUB_SCHEMA: &str = "connetto_hub";
 
@@ -4204,9 +4210,10 @@ fn forward_worker_rate_limited(state: &HubState, related_to: Option<&str>, retry
     }
 }
 
-/// Answer one tab subscription: a snapshot from the worker replica for synced
-/// tables and from the attached device-private tables for the rest, both over
-/// the one connection and between one begin and end pair.
+/// Answer one tab subscription: a snapshot from the worker replica for the
+/// synced tables, from the attached shared store for the device's shared
+/// tables, and from the attached device-private tables for the rest, all
+/// over the one connection and between one begin and end pair.
 ///
 /// Both payloads are built and compressed before any frame goes out. A begin
 /// ahead of a failing read would mark the refusal as one that got as far as
@@ -4225,20 +4232,35 @@ where
     U::Error: core::fmt::Display,
 {
     let local_tables: HashSet<String> = tables.intersection(tier_tables).cloned().collect();
-    let synced: HashSet<String> = tables.difference(&local_tables).cloned().collect();
+    // The map cannot be borrowed across the mutable `conn()` borrow.
+    let map = worker.policy_tables().clone();
+    let shared = worker.shared_tables();
+    let shared_tables: HashSet<String> = tables
+        .iter()
+        .filter(|name| {
+            !local_tables.contains(*name)
+                && (shared.contains(*name)
+                    || map
+                        .physical(name)
+                        .is_some_and(|physical| shared.contains(physical)))
+        })
+        .cloned()
+        .collect();
+    let synced: HashSet<String> = tables
+        .iter()
+        .filter(|name| !local_tables.contains(*name) && !shared_tables.contains(*name))
+        .cloned()
+        .collect();
     let mut payloads: Vec<Vec<u8>> = Vec::new();
-    if !synced.is_empty() {
-        let map = worker.policy_tables().clone();
-        let patchset = synced_snapshot(worker.conn(), &map, &synced, blank)?;
-        if !patchset.is_empty() {
-            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
+    for (schema, set) in [(MAIN_SCHEMA, &synced), (SHARED_SCHEMA, &shared_tables)] {
+        if !set.is_empty() {
+            let patchset = synced_snapshot(worker.conn(), schema, &map, set, blank)?;
+            push_payload(&mut payloads, &patchset)?;
         }
     }
     if !local_tables.is_empty() {
         let patchset = snapshot_patchset(worker.conn(), LOCAL_SCHEMA, &local_tables, blank)?;
-        if !patchset.is_empty() {
-            payloads.push(zstd::encode_all(&patchset[..], ZSTD_LEVEL)?);
-        }
+        push_payload(&mut payloads, &patchset)?;
     }
     let _ = tab.out.send(TabOut::Control(ControlMessage::SnapshotBegin(
         SnapshotBegin {
@@ -4265,6 +4287,14 @@ where
             cursor: relay_cursor(worker),
         }),
     );
+    Ok(())
+}
+
+/// Compress a non-empty snapshot patchset onto the payloads a subscription serves.
+fn push_payload(payloads: &mut Vec<Vec<u8>>, patchset: &[u8]) -> Result<(), RelayError> {
+    if !patchset.is_empty() {
+        payloads.push(zstd::encode_all(patchset, ZSTD_LEVEL)?);
+    }
     Ok(())
 }
 
@@ -4309,16 +4339,17 @@ fn flush_tab_bulk(tab: &mut TabState) {
     }
 }
 
-/// Build the synced-tier snapshot for `tables` (logical names), reading each
+/// Build the snapshot for `tables` (logical names) in `schema`, reading each
 /// policy-split table through its physical backing table and renaming the
 /// patchset back, so the tab-facing payload speaks logical names exactly like
 /// the server does.
 ///
-/// The logical name of a split table is a view in the replica, which a
+/// The logical name of a split table is a view in the schema, which a
 /// session cannot diff, and the plain read used to match nothing and serve an
 /// empty snapshot silently.
 fn synced_snapshot(
     conn: &mut SqliteConnection,
+    schema: &str,
     map: &PolicyTables,
     tables: &HashSet<String>,
     blank: &mut BlankState,
@@ -4336,7 +4367,7 @@ fn synced_snapshot(
             }
         }
     }
-    let patchset = snapshot_patchset(conn, MAIN_SCHEMA, &read, blank)?;
+    let patchset = snapshot_patchset(conn, schema, &read, blank)?;
     if back.is_empty() || patchset.is_empty() {
         return Ok(patchset);
     }
@@ -5093,7 +5124,8 @@ mod tests {
             core::iter::once("orders".to_owned()).collect();
         let mut blank = super::BlankState::default();
         let patchset =
-            super::synced_snapshot(&mut conn, &map, &tables, &mut blank).expect("snapshot");
+            super::synced_snapshot(&mut conn, super::MAIN_SCHEMA, &map, &tables, &mut blank)
+                .expect("snapshot");
         assert!(
             !patchset.is_empty(),
             "the seeded backing-table row has to appear in the patchset"
@@ -5105,6 +5137,300 @@ mod tests {
         };
         let names: Vec<String> = set.iter().map(|op| op.table().name().clone()).collect();
         assert_eq!(names, ["orders"], "one insert, under the logical name");
+    }
+
+    /// One cell of a decoded snapshot row.
+    type Cell = sqlite_diff_rs::Value<String, Vec<u8>>;
+
+    /// The private table of the shared-store fixture.
+    const SHARED_FIXTURE_ORDERS: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT)";
+
+    /// The reader the layout recreates on every open, a TEMP view over the
+    /// split shared table's backing table in the attached store.
+    const SHARED_FIXTURE_TEMP: &str =
+        "CREATE TEMP VIEW public AS SELECT id, owner_id FROM connetto_shared.public_rls";
+
+    /// The shared-file side of the shared-store fixture.
+    const SHARED_FIXTURE_SHARED: &str = "CREATE TABLE connetto_shared.entries (id INTEGER PRIMARY KEY, author TEXT); \
+         CREATE TABLE connetto_shared.public_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL)";
+
+    /// The shared-store fixture bundle, whose main layout keeps the shared
+    /// tables as ordinary tables for a relay tab's mirror.
+    fn shared_bundle() -> connetto_core::schema::SchemaBundle {
+        connetto_core::schema::SchemaBundle::new(
+            "",
+            "",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT); \
+             CREATE TABLE entries (id INTEGER PRIMARY KEY, author TEXT); \
+             CREATE TABLE public_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL); \
+             CREATE VIEW public AS SELECT id, owner_id FROM public_rls;",
+            [("public", "public_rls")],
+            ["public"],
+            None::<&str>,
+        )
+        .with_shared_tables(["entries", "public"])
+        .with_shared_layout(connetto_core::schema::SharedLayout::new(
+            format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}; {SHARED_FIXTURE_SHARED}"),
+            format!("{SHARED_FIXTURE_ORDERS}; {SHARED_FIXTURE_TEMP}"),
+            format!("{SHARED_FIXTURE_SHARED}; {SHARED_FIXTURE_TEMP}"),
+            SHARED_FIXTURE_TEMP,
+        ))
+    }
+
+    /// An offline signed-in worker over the shared-store fixture, the shared
+    /// store enabled when `shared`.
+    fn shared_worker(
+        shared: bool,
+    ) -> connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport> {
+        let schema = connetto_client::SyncSchema::new(shared_bundle()).with_shared_store(shared);
+        connetto_client::ClientBuilder::new(schema, || async {
+            Err::<connetto_core::test_support::FakeTransport, _>("offline")
+        })
+        .signed_in(
+            connetto_client::HeldCredential::new(
+                connetto_client::Grant::new("user:token"),
+                "token",
+            )
+            .expect("a string identity serializes"),
+        )
+        .open_driven()
+        .expect("the worker opens offline")
+    }
+
+    /// The rows a late tab reads for `query` through the hub's tab path, the
+    /// snapshot payloads decoded.
+    async fn late_tab_rows(
+        worker: &mut connetto_client::ConnettoConnection<
+            connetto_core::test_support::FakeTransport,
+        >,
+        query: &str,
+    ) -> Vec<(String, Vec<Cell>)> {
+        use connetto_core::messages::{BulkMessage, ControlMessage, Subscribe, SubscriptionSpec};
+        use std::collections::{HashMap, VecDeque};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (out_tx, mut out_rx) = unbounded_channel();
+        let mut tab = super::TabState {
+            out: out_tx,
+            handshaken: true,
+            subs: Vec::new(),
+            pending_write: None,
+            client_id: None,
+            applied_watermark: None,
+            local_watermark: None,
+            credits: super::INITIAL_CREDITS,
+            pending: VecDeque::new(),
+            staged: VecDeque::new(),
+        };
+        let mut blank = super::BlankState::default();
+        let local: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let spec = SubscriptionSpec::new(query);
+        let subscribe = Subscribe {
+            sub_id: "s1".to_owned(),
+            spec,
+        };
+        match super::handle_tab_subscribe(
+            worker,
+            &mut HashMap::new(),
+            &mut blank,
+            &local,
+            &mut tab,
+            1,
+            subscribe,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(super::TabFault::Close(detail)) => {
+                panic!("the hub closed the tab: {detail}")
+            }
+            Err(super::TabFault::Hub(err)) => panic!("the hub failed: {err}"),
+        }
+        let mut rows = Vec::new();
+        loop {
+            let frame = out_rx
+                .try_recv()
+                .expect("the snapshot frame reaches the tab");
+            match frame {
+                super::TabOut::Control(ControlMessage::SnapshotBegin(begin)) => {
+                    assert_eq!(begin.sub_id, "s1", "the snapshot belongs to the sub");
+                }
+                super::TabOut::Bulk(BulkMessage::SnapshotPatch(patch)) => {
+                    assert_eq!(patch.sub_id, "s1", "the patch belongs to the sub");
+                    let bytes = zstd::decode_all(patch.patchset_zstd.as_slice())
+                        .expect("the payload decompresses");
+                    let sqlite_diff_rs::ParsedDiffSet::Patchset(set) =
+                        sqlite_diff_rs::ParsedDiffSet::parse(&bytes).expect("the payload parses")
+                    else {
+                        panic!("a snapshot travels as a patchset");
+                    };
+                    for op in set.iter() {
+                        let sqlite_diff_rs::PatchsetOp::Insert { table, values, .. } = op else {
+                            panic!("a snapshot holds inserts only");
+                        };
+                        rows.push((table.name().to_owned(), values.to_vec()));
+                    }
+                }
+                super::TabOut::Control(ControlMessage::SnapshotEnd(_)) => break,
+                _ => panic!("an unexpected frame precedes the snapshot end"),
+            }
+        }
+        rows
+    }
+
+    /// The rendered form of a cell, for row comparison.
+    fn cell_key(cell: &Cell) -> String {
+        match cell {
+            Cell::Null => "null".to_owned(),
+            Cell::Integer(number) => format!("int:{number}"),
+            Cell::Real(number) => format!("real:{number}"),
+            Cell::Text(text) => format!("text:{text}"),
+            Cell::Blob(bytes) => format!("blob:{}", bytes.len()),
+        }
+    }
+
+    /// The fixture's rows grouped by table, rendered.
+    fn fixture_rows() -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "orders".to_owned(),
+            vec![vec!["int:1".to_owned(), "text:bob".to_owned()]],
+        );
+        map.insert(
+            "entries".to_owned(),
+            vec![
+                vec!["int:1".to_owned(), "text:alice".to_owned()],
+                vec!["int:2".to_owned(), "text:bob".to_owned()],
+            ],
+        );
+        map.insert(
+            "public".to_owned(),
+            vec![vec!["int:7".to_owned(), "text:alice".to_owned()]],
+        );
+        map
+    }
+
+    /// `rows` grouped by table and rendered, so the assert ignores payload
+    /// and row order.
+    fn rows_by_table(
+        rows: Vec<(String, Vec<Cell>)>,
+    ) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+        let mut map: std::collections::BTreeMap<String, Vec<Vec<String>>> =
+            std::collections::BTreeMap::new();
+        for (table, values) in rows {
+            map.entry(table)
+                .or_default()
+                .push(values.iter().map(cell_key).collect());
+        }
+        for rows in map.values_mut() {
+            rows.sort();
+        }
+        map
+    }
+
+    /// A late tab that reads private and shared tables in one query gets both
+    /// tiers' rows, the shared rows from the store and not from the replica.
+    #[wasm_bindgen_test]
+    async fn a_late_tab_snapshot_covers_private_and_shared_tables() {
+        let mut worker = shared_worker(true);
+        worker
+            .conn()
+            .batch_execute(
+                "INSERT INTO orders VALUES (1, 'bob');
+                 INSERT INTO connetto_shared.entries VALUES (1, 'alice'), (2, 'bob');
+                 INSERT INTO connetto_shared.public_rls VALUES (7, 'alice');",
+            )
+            .expect("seed the tiers");
+        let rows = late_tab_rows(
+            &mut worker,
+            "SELECT o.label, e.author FROM orders o JOIN entries e ON o.id = e.id",
+        )
+        .await;
+        let mut expected = fixture_rows();
+        expected.remove("public");
+        assert_eq!(
+            rows_by_table(rows),
+            expected,
+            "the join's private and shared tables both arrive, under logical names"
+        );
+    }
+
+    /// A late tab reading only shared tables gets the store's rows and nothing
+    /// from the worker's own replica.
+    #[wasm_bindgen_test]
+    async fn a_shared_only_snapshot_serves_nothing_from_the_replica() {
+        let mut worker = shared_worker(true);
+        worker
+            .conn()
+            .batch_execute(
+                "INSERT INTO orders VALUES (1, 'bob');
+                 INSERT INTO connetto_shared.entries VALUES (1, 'alice'), (2, 'bob');",
+            )
+            .expect("seed the tiers");
+        let rows = late_tab_rows(&mut worker, "SELECT id, author FROM entries").await;
+        let mut expected = fixture_rows();
+        expected.remove("orders");
+        expected.remove("public");
+        assert_eq!(
+            rows_by_table(rows),
+            expected,
+            "the shared rows arrive and the private rows stay behind"
+        );
+    }
+
+    /// A late tab reading a policy-split shared table gets its rows under the
+    /// logical name, the physical backing table staying out of the payload.
+    #[wasm_bindgen_test]
+    async fn a_split_shared_table_snapshot_reads_the_store_and_speaks_logically() {
+        let mut worker = shared_worker(true);
+        worker
+            .conn()
+            .batch_execute("INSERT INTO connetto_shared.public_rls VALUES (7, 'alice');")
+            .expect("seed the store");
+        let rows = late_tab_rows(&mut worker, "SELECT id, owner_id FROM public").await;
+        let mut expected = fixture_rows();
+        expected.remove("orders");
+        expected.remove("entries");
+        assert_eq!(
+            rows_by_table(rows),
+            expected,
+            "one insert, under the logical name"
+        );
+    }
+
+    /// With the shared store disabled the same names are ordinary replica
+    /// tables, and the snapshot serves them from the replica.
+    #[wasm_bindgen_test]
+    async fn a_disabled_shared_store_serves_its_names_from_the_replica() {
+        let mut worker = shared_worker(false);
+        assert!(
+            worker.shared_tables().is_empty(),
+            "a disabled store names no shared tables"
+        );
+        worker
+            .conn()
+            .batch_execute(
+                "INSERT INTO orders VALUES (1, 'bob');
+                 INSERT INTO entries VALUES (1, 'alice');
+                 INSERT INTO public_rls VALUES (7, 'alice');",
+            )
+            .expect("seed the replica");
+        let rows = late_tab_rows(
+            &mut worker,
+            "SELECT o.label, e.author FROM orders o JOIN entries e ON o.id = e.id",
+        )
+        .await;
+        let mut expected = fixture_rows();
+        expected.remove("public");
+        expected.insert(
+            "entries".to_owned(),
+            vec![vec!["int:1".to_owned(), "text:alice".to_owned()]],
+        );
+        assert_eq!(
+            rows_by_table(rows),
+            expected,
+            "every name serves from the replica when the store is off"
+        );
     }
 
     /// R83 browser done-when: a tab's aggregate watch is answered from the

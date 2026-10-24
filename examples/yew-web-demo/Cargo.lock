@@ -2247,7 +2247,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#ed881482991a52b21836afb895c0975a0670b0b7"
+source = "git+https://github.com/connetto-rs/pg2sqlite?branch=main#6c89348bf8c3097ffd430b4322fb4a5accec865f"
 dependencies = [
  "git2",
  "sql-traits",
@@ -3183,7 +3183,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sql-traits?branch=main#13a012e778cbda0ebc5dcf62e76a84f45ecc3696"
+source = "git+https://github.com/connetto-rs/sql-traits?branch=main#332c1f179da65d55a092a5358b6acf2d89bc88e2"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -3238,7 +3238,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#581fea4d502bb8cc9c630b341108e15251d4c0af"
 dependencies = [
  "log",
  "recursive",
@@ -3259,7 +3259,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#aab619465b7edaae99b647015df82f2b76764c58"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql?branch=main#8ba43e6a9dee5b24bfbd918d93b50d596fa451b5"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.20",
@@ -3268,7 +3268,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9119ec6bef4acadea510bb6e7bd89eb30b904b6b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#581fea4d502bb8cc9c630b341108e15251d4c0af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3409,7 +3409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.52.0",

@@ -155,6 +155,7 @@ pub struct Replica<'a, S: ReplicaStorage> {
     path: &'a str,
     key: Option<ReplicaKey>,
     tier: Tier<'a>,
+    shared: Option<(String, ReplicaKey)>,
     storage: core::marker::PhantomData<S>,
 }
 
@@ -173,6 +174,7 @@ impl<'a> Replica<'a, InMemory> {
             path: ":memory:",
             key: None,
             tier: Tier::None,
+            shared: None,
             storage: core::marker::PhantomData,
         }
     }
@@ -228,8 +230,15 @@ impl<'a> Replica<'a, Encrypted> {
             path,
             key: Some(key),
             tier: Tier::None,
+            shared: None,
             storage: core::marker::PhantomData,
         })
+    }
+
+    /// Attach the device's shared file under its independent key.
+    pub(crate) fn with_shared_store(mut self, path: String, key: ReplicaKey) -> Self {
+        self.shared = Some((path, key));
+        self
     }
 
     /// A durable device-private database beside the replica, created with `ddl`
@@ -268,6 +277,11 @@ impl<'a> Replica<'a, Encrypted> {
 }
 
 impl<'a, S: ReplicaStorage> Replica<'a, S> {
+    /// The device-wide file and the key that decrypts it.
+    pub(crate) fn shared_store(&self) -> Option<(&str, &ReplicaKey)> {
+        self.shared.as_ref().map(|(path, key)| (path.as_str(), key))
+    }
+
     /// The key, or `None` when nothing is at rest to key.
     ///
     /// For a second connection that has to match this replica's cipher, which in
