@@ -75,7 +75,7 @@ fn split_schema(major: u32) -> SyncSchema {
         SchemaBundle::new(
             format!("{MAJOR_DIRECTIVE} {major}\n-- split"),
             "",
-            SPLIT_DDL,
+            format!("{SPLIT_DDL} {V1_DDL};"),
             vec![("t".to_owned(), "physical_t".to_owned())],
             vec!["t".to_owned()],
             None::<&str>,
@@ -223,6 +223,120 @@ async fn a_replica_from_before_majors_is_stamped_with_the_build() {
 }
 
 #[tokio::test]
+async fn a_recorded_major_without_its_build_hash_is_refused() {
+    for remove in ["DROP TABLE _connetto_build", "DELETE FROM _connetto_build"] {
+        let dir = tempdir().expect("temp dir");
+        {
+            let mut conn = open(&dir, schema(1, V1_DDL)).await.expect("fresh open");
+            conn.conn().batch_execute(remove).expect("remove the hash");
+        }
+        match open(&dir, schema(1, V1_DDL)).await {
+            Err(ClientError::ReplicaRecordMissing { recorded }) => {
+                assert_eq!(recorded, Major::new(1).expect("one is a major"));
+            }
+            Err(other) => panic!("expected ReplicaRecordMissing, got {other:?}"),
+            Ok(_) => panic!("a recorded major opened without its build hash"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_idle_replica_rebuilds_and_queues_writes_under_the_active_major() {
+    let dir = tempdir().expect("temp dir");
+    drop(open(&dir, schema(1, V1_DDL)).await.expect("fresh open"));
+    let built = schema(2, V2_DDL);
+    let mut conn = open(&dir, built.clone()).await.expect("rebuild");
+    assert_eq!(user_version(&mut conn), 2);
+    assert_eq!(recorded_version(&mut conn), built.version().hash());
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::label.eq("active")))
+        .execute(conn.conn())
+        .expect("write under the active major");
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(0),
+            seq: 1,
+            major: Major::new(2),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_replica_without_split_metadata_preserves_its_queued_wire_bytes() {
+    let dir = tempdir().expect("temp dir");
+    let expected: (Vec<u8>, Vec<u8>) = {
+        let mut conn = open(&dir, schema(1, V1_DDL)).await.expect("fresh open");
+        diesel::insert_into(items::table)
+            .values((items::id.eq(1), items::label.eq("held")))
+            .execute(conn.conn())
+            .expect("write offline");
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        conn.conn()
+            .batch_execute("DROP TABLE _connetto_build_renames")
+            .expect("remove split metadata");
+        pending::table
+            .select((pending::changeset, pending::entry_hash))
+            .first(conn.conn())
+            .expect("read the queued bytes")
+    };
+    let mut conn = open(&dir, schema(2, V2_DDL)).await.expect("rebuild");
+    assert_eq!(user_version(&mut conn), 2);
+    let actual: (Vec<u8>, Vec<u8>) = pending::table
+        .select((pending::changeset, pending::entry_hash))
+        .first(conn.conn())
+        .expect("read the held bytes");
+    assert_eq!(actual, expected);
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(0),
+            seq: 1,
+            major: Major::new(1),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_rebuild_preserves_the_schema_record_rows_and_queue() {
+    let dir = tempdir().expect("temp dir");
+    let first = schema(1, V1_DDL);
+    let expected: (Vec<u8>, Vec<u8>) = {
+        let mut conn = open(&dir, first.clone()).await.expect("fresh open");
+        diesel::insert_into(items::table)
+            .values((items::id.eq(1), items::label.eq("retained")))
+            .execute(conn.conn())
+            .expect("write offline");
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        pending::table
+            .select((pending::changeset, pending::entry_hash))
+            .first(conn.conn())
+            .expect("read the queued bytes")
+    };
+    let broken = schema(2, &format!("{V2_DDL}; {V2_DDL}"));
+    assert!(matches!(open(&dir, broken).await, Err(ClientError::Db(_))));
+    let mut conn = open(&dir, first.clone())
+        .await
+        .expect("reopen the original build");
+    assert_eq!(user_version(&mut conn), 1);
+    assert_eq!(recorded_version(&mut conn), first.version().hash());
+    assert_eq!(
+        items::table
+            .select(items::label)
+            .first::<Option<String>>(conn.conn())
+            .expect("read the retained row")
+            .as_deref(),
+        Some("retained")
+    );
+    let actual: (Vec<u8>, Vec<u8>) = pending::table
+        .select((pending::changeset, pending::entry_hash))
+        .first(conn.conn())
+        .expect("read the retained queue");
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
 async fn a_newer_major_rebuilds_the_replica_in_place_and_keeps_unsent_writes_under_their_major() {
     let dir = tempdir().expect("temp dir");
     let first = schema(1, V1_DDL);
@@ -332,7 +446,9 @@ async fn a_rebuild_stores_a_split_tables_older_entry_under_its_wire_name() {
     {
         let mut conn = open(&dir, split_schema(1)).await.expect("fresh open");
         conn.conn()
-            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .batch_execute(
+                "INSERT INTO t (id) VALUES (1); INSERT INTO items (id, label) VALUES (2, 'plain')",
+            )
             .expect("write through the view");
         conn.push().await.expect("queue").expect("a seq");
     }
@@ -345,11 +461,17 @@ async fn a_rebuild_stores_a_split_tables_older_entry_under_its_wire_name() {
         .first(conn.conn())
         .expect("read the older entry");
     let mut parsed = ParsedDiffSet::parse(&changeset).expect("parse the entry");
+    let mut names = Vec::new();
     assert_eq!(
-        parsed.rename_tables(|name| (name == "physical_t").then(|| "t".to_owned())),
+        parsed.rename_tables(|name| {
+            names.push(name.to_owned());
+            (name == "physical_t").then(|| "t".to_owned())
+        }),
         0,
         "the entry names the table the older major's server reads"
     );
+    names.sort();
+    assert_eq!(names, ["items", "t"]);
     assert_eq!(
         stored.as_slice(),
         entry_hash(&GENESIS, 1, &changeset),

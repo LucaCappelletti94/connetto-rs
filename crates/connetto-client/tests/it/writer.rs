@@ -1287,6 +1287,64 @@ async fn an_older_majors_entry_holds_the_newer_majors_writes_off_the_wire() {
 }
 
 #[tokio::test]
+async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = split_open(&dir).await;
+        conn.attach(Wire::default().silent()).await.expect("attach");
+        conn.conn()
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("write through the view");
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        drain(&mut conn).await;
+    }
+    let active = SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 2",
+            "",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY); \
+             CREATE VIEW next_t AS SELECT * FROM t; \
+             CREATE TRIGGER next_t_insert INSTEAD OF INSERT ON next_t \
+             BEGIN INSERT INTO t (id) VALUES (NEW.id); END;",
+            vec![("next_t".to_owned(), "t".to_owned())],
+            vec!["next_t".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 2"),
+    );
+    let mut conn = open_with(&dir, active.clone()).await;
+    let held: Vec<u8> = _connetto_pending::table
+        .select(_connetto_pending::changeset)
+        .first(conn.conn())
+        .expect("read the held wire bytes");
+    let error = conn
+        .attach(Wire::default().refusing_with(FatalErrorReason::WriterUnknown))
+        .await
+        .expect_err("the refused writer fails the attach");
+    assert!(matches!(
+        error,
+        ClientError::Refused {
+            reason: FatalErrorReason::WriterUnknown
+        }
+    ));
+    let (carried, hash): (Vec<u8>, Vec<u8>) = _connetto_pending::table
+        .select((_connetto_pending::changeset, _connetto_pending::entry_hash))
+        .first(conn.conn())
+        .expect("read the carried entry");
+    assert_eq!(carried, held);
+    assert_eq!(hash.as_slice(), entry_hash(&GENESIS, 1, &carried));
+    let expected = vec![UnsyncedWrite {
+        writer: WriterRef::Number(0),
+        seq: 1,
+        major: Major::new(1),
+    }];
+    assert_eq!(conn.unsynced(), expected);
+    drop(conn);
+    let conn = open_with(&dir, active).await;
+    assert_eq!(conn.unsynced(), expected);
+}
+
+#[tokio::test]
 async fn a_split_table_entry_hashes_the_logical_bytes() {
     let dir = tempdir().expect("temp dir");
     let mut conn = split_open(&dir).await;
