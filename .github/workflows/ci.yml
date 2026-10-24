@@ -97,7 +97,7 @@ jobs:
       # desktop feature and its webview stack, and Tauri links the same one.
       - name: Install desktop dependencies
         if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
-        uses: ./.github/actions/install-desktop-deps
+        uses: $/.github/actions/install-desktop-deps
 
       # Tauri's context macro needs the UI's output directory, which only the
       # Tauri CLI fills, and a check never serves the UI.
@@ -174,7 +174,7 @@ jobs:
           rustup target add wasm32-unknown-unknown --toolchain nightly
 
       - name: Install desktop dependencies
-        uses: ./.github/actions/install-desktop-deps
+        uses: $/.github/actions/install-desktop-deps
 
       # Tauri's context macro needs the UI's output directory, which only the
       # Tauri CLI fills, and a lint never serves the UI.
@@ -357,7 +357,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios-sim --toolchain stable
 
-      - uses: ./.github/actions/install-tauri-tools
+      - uses: $/.github/actions/install-tauri-tools
 
       # The proof reads the simulator's pages through ios_webkit_debug_proxy.
       - name: Install ios_webkit_debug_proxy
@@ -369,7 +369,7 @@ jobs:
           cargo +stable build --release --all-features -p connetto-server --bin connetto-server
           cargo +stable build --release -p connetto-test-harness --bin connetto-demo-stack --bin connetto-ios-proof
 
-      - uses: ./.github/actions/start-native-services
+      - uses: $/.github/actions/start-native-services
 
       # The proof builds the demo with `cargo tauri ios build` once the stack has minted its device CA.
       - name: Walk the proof on a simulator
@@ -451,7 +451,7 @@ jobs:
             cargo +stable test --no-run --target aarch64-apple-ios-sim -p "${crate[@]}"
           done < .github/ios-crates.txt
 
-      - uses: ./.github/actions/start-native-services
+      - uses: $/.github/actions/start-native-services
 
       - name: Boot a simulator
         run: |
@@ -576,7 +576,7 @@ jobs:
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
         if: matrix.name == 'rest'
-        uses: ./.github/actions/install-desktop-deps
+        uses: $/.github/actions/install-desktop-deps
 
       - uses: taiki-e/install-action@nextest
 
@@ -584,7 +584,7 @@ jobs:
         if: matrix.bins != ''
         run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features --bins ${{ matrix.bins }}
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # nextest rather than cargo test, matching the local runner: each test
       # gets its own process, which the merged tests/it targets rely on for
@@ -662,7 +662,7 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # coverage.yml runs this group instrumented whenever it runs the client suite.
       - name: Run Secret Service custody tests
@@ -780,12 +780,12 @@ jobs:
       - name: Strip debug sections from the prebuilt binaries
         run: strip --strip-debug browser-bins/* android-bins/*
 
-      - uses: ./.github/actions/put-files
+      - uses: $/.github/actions/put-files
         with:
           name: browser-bins
           path: browser-bins
 
-      - uses: ./.github/actions/put-files
+      - uses: $/.github/actions/put-files
         with:
           name: android-bins
           path: android-bins
@@ -856,7 +856,7 @@ jobs:
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
 
-      - uses: ./.github/actions/get-files
+      - uses: $/.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
@@ -879,7 +879,7 @@ jobs:
           echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
           echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       - name: Run browser suites
         env:
@@ -942,12 +942,12 @@ jobs:
           key: t-android-emulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || '' }}
 
-      - uses: ./.github/actions/get-files
+      - uses: $/.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
 
-      - uses: ./.github/actions/get-files
+      - uses: $/.github/actions/get-files
         with:
           name: android-bins
           path: android-bins
@@ -961,7 +961,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add x86_64-linux-android --toolchain stable
 
-      - uses: ./.github/actions/install-tauri-tools
+      - uses: $/.github/actions/install-tauri-tools
 
       # Vendored OpenSSL looks for a target-prefixed ar and ranlib the NDK no longer ships.
       - name: Point the Tauri CLI at the runner's Android SDK
@@ -991,7 +991,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: line-tables-only
         run: cargo tauri android build --debug --apk --target x86_64 --features device-identity
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       - name: Enable KVM
         run: |

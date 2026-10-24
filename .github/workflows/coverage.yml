@@ -88,12 +88,12 @@ jobs:
       # --all-features turns on connetto-dioxus's desktop feature.
       - name: Install desktop dependencies
         if: matrix.name == 'rest'
-        uses: ./.github/actions/install-desktop-deps
+        uses: $/.github/actions/install-desktop-deps
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # testfast is release without the fat link: instrumentation on top of
       # lto and one codegen unit more than doubles the build.
@@ -197,7 +197,7 @@ jobs:
           # The archive carries the server's own binary but not the client's.
           cp target/testfast/connetto-client coverage-server/
 
-      - uses: ./.github/actions/put-files
+      - uses: $/.github/actions/put-files
         with:
           name: coverage-server
           path: coverage-server
@@ -232,12 +232,12 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
-      - uses: ./.github/actions/get-files
+      - uses: $/.github/actions/get-files
         with:
           name: coverage-server
           path: ${{ runner.temp }}/coverage-server
 
-      - uses: ./.github/actions/pull-test-images
+      - uses: $/.github/actions/pull-test-images
 
       # Extracted into the checkout, where the tests' compiled-in binary
       # paths and the report expect the target directory.
