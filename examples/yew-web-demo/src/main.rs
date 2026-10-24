@@ -45,9 +45,11 @@ use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::PendingWork;
 use connetto_web::builder::{AttachedTab, TabTopology, WebClientBuilder};
 use connetto_web::unlock::serve_account_choice;
-use connetto_web::{MessageTransport, TabContent, TabResolved, deliver_login_code, workers};
+use connetto_web::{
+    MessageTransport, ObjectUrl, TabContent, TabResolved, deliver_login_code, workers,
+};
 use connetto_yew::use_live;
-use connetto_yew_web_demo::status_label;
+use connetto_yew_web_demo::{short_id, status_label};
 use diesel::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -56,6 +58,7 @@ use web_sys::{BroadcastChannel, Event, HtmlInputElement, MessageEvent};
 
 include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 use yew::prelude::*;
+use yew_icons::{Icon, IconData};
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
@@ -175,6 +178,36 @@ fn fresh_quantity() -> i64 {
     // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
     debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
     (scaled as i64 + 1) * 5
+}
+
+/// The header's gate line for the custody standing and the worker's reported
+/// unlock state, the lock standing where a gate guards the data, the no-gate
+/// statement where there is none.
+fn gate_text(custody: Custody, state: &'static str) -> &'static str {
+    match custody {
+        Custody::Verified => state,
+        Custody::Unverified(_) | Custody::Ephemeral => {
+            "none, local data opens without user verification"
+        }
+    }
+}
+
+/// The header's custody line for the standing, naming the at-rest policy and
+/// the reason it stands as it does in this browser.
+fn custody_text(custody: Custody) -> &'static str {
+    match custody {
+        Custody::Verified => "released only after user verification",
+        Custody::Unverified(NoGate::Offerable) => {
+            "stored without user verification, a passkey can be set up"
+        }
+        Custody::Unverified(NoGate::Declined) => {
+            "stored without user verification, the passkey was declined"
+        }
+        Custody::Unverified(NoGate::Unsupported) => {
+            "stored without user verification, the browser refused a passkey for this address"
+        }
+        Custody::Ephemeral => "no durable key, nothing is kept",
+    }
 }
 
 /// The tab mirror's physical footprint: total pages and free pages a trim can reclaim.
@@ -486,27 +519,49 @@ async fn boot_window() -> Result<Boot, JsValue> {
     })
 }
 
-/// Styling kept minimal: the demo is the topology, not the paint.
-const CSS: &str = r"
-    body { font-family: sans-serif; margin: 0; }
-    .wrap { padding: 16px; max-width: 720px; margin: 0 auto; }
-    .panes { display: flex; gap: 16px; flex-wrap: wrap; }
-    .pane { flex: 1 1 300px; border: 1px solid #ccc; border-radius: 8px; padding: 12px; }
-    .pane h2 { margin-top: 0; font-size: 1.1em; }
-    .badge { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; }
-    .synced { background: #e6f0ff; color: #14458c; }
-    .local { background: #fde6e6; color: #8c1414; }
-    .trim { background: #eef7e6; color: #2e6b14; }
-    .status { color: #555; font-family: monospace; }
-    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-    th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
-    input { padding: 4px; }
-    button { padding: 4px 10px; cursor: pointer; }
-    .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-    .auth-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; padding: 8px; background: #f8f8f8; border-radius: 6px; }
-    .picker { border: 1px solid #bbb; border-radius: 8px; padding: 12px; margin: 8px 0; background: #fffbe6; }
-    .expiry-warn { border: 1px solid #e0a020; border-radius: 6px; padding: 8px 12px; background: #fff8e1; margin: 8px 0; }
-";
+/// The one stylesheet the demo renders, identical to the dioxus demo's.
+const CSS: &str = r#"
+:root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1f2328; background: #fff; }
+.wrap { padding: 16px; max-width: 960px; margin: 0 auto; }
+h1 { font-size: 1.4em; margin: 0 0 8px; }
+h1, h2 { display: flex; align-items: center; gap: 8px; }
+.panes { display: flex; gap: 16px; flex-wrap: wrap; }
+.pane { flex: 1 1 300px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fff; }
+.pane h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 1.05em; }
+.badge { font-size: 0.7em; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.synced { background: #ddf4ff; color: #0a3069; }
+.local { background: #ffebe9; color: #82071e; }
+.trim { background: #dafbe1; color: #116329; }
+.status { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: var(--surface); border-radius: 4px; padding: 0 4px; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+th { font-size: 0.85em; color: var(--muted); font-weight: 600; }
+input { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 0.9em; font-weight: 500; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #1f2328; cursor: pointer; transition: background-color .12s, border-color .12s; }
+button svg { flex: none; fill: currentColor; }
+button:hover:not(:disabled) { background: #eaeef2; border-color: #afb8c1; }
+button:active:not(:disabled) { background: #dde3e9; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.danger { background: #fff; color: var(--danger); border-color: #f5c2bd; }
+button.danger:hover:not(:disabled) { background: #fff1f0; border-color: var(--danger); }
+input[type=file]::file-selector-button { font: inherit; font-size: 0.9em; padding: 6px 12px; margin-right: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
+input[type=file] { border: none; padding: 0; }
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+.auth-banner { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; background: var(--surface); }
+.auth-banner p { margin: 0; }
+.confirm { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 8px; padding: 8px 12px; }
+.confirm p { margin: 0 0 6px; }
+.warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
+.error { color: var(--danger); }
+.peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
+img.thumb { max-height: 60px; border-radius: 4px; }
+"#;
 
 /// A cheaply clonable, identity-compared client handle for props.
 ///
@@ -743,6 +798,7 @@ fn use_boot_window_effect(
     status: UseStateHandle<String>,
     boot_hold: Rc<RefCell<Option<Boot>>>,
     custody: UseStateHandle<Option<Custody>>,
+    gate: UseStateHandle<&'static str>,
 ) {
     use_effect_with((), move |()| {
         spawn_local(async move {
@@ -755,6 +811,14 @@ fn use_boot_window_effect(
                     status.set("connected".to_owned());
                     *boot_hold.borrow_mut() = Some(boot);
                     while let Ok(event) = events.recv().await {
+                        // The header's gate line tracks the worker's reported unlock state.
+                        match event {
+                            ClientEvent::Locked | ClientEvent::UnlockDismissed => {
+                                gate.set("locked");
+                            }
+                            ClientEvent::Unlocked => gate.set("open"),
+                            _ => {}
+                        }
                         if let Some(label) = status_label(&event) {
                             status.set(label);
                         }
@@ -790,9 +854,12 @@ fn app() -> Html {
     // The account a reload restores; the session broadcast refreshes it.
     let stored_account = use_state(read_stored_account);
 
-    // Passkey custody level, unknown until boot_window returns, so the page
-    // shows no passkey line before the worker has said which it is.
+    // The passkey custody level, unknown until boot_window returns, so the
+    // header shows no gate or custody line before the worker has said which it is.
     let custody = use_state(|| None::<Custody>);
+    // The gate line's lock standing, open until the worker reports the data
+    // waiting on user verification.
+    let gate = use_state(|| "open");
 
     // Session expiry warning: Some when the session is near its end and there
     // are unsynced writes that would be lost if it lapses.
@@ -840,6 +907,7 @@ fn app() -> Html {
         status.clone(),
         boot_hold.clone(),
         custody.clone(),
+        gate.clone(),
     );
 
     let open_login = {
@@ -948,23 +1016,28 @@ fn app() -> Html {
             .cloned()
             .map(|account| {
                 let pending_choice = pending_choice.clone();
-                let label = account.clone();
+                let label = stored_identity(&account);
                 html! {
                     <button onclick={Callback::from(move |_| {
                         *pending_choice.borrow_mut() =
                             Some(AccountChoice::Account(account.clone()));
                     })}>
-                        { format!("Sign in as {label}") }
+                        <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
+                        { "Sign in as " }
+                        <code class="id" title={label.clone()}>{ short_id(&label) }</code>
                     </button>
                 }
             })
             .collect();
         html! {
-            <div class="picker">
+            <div class="confirm">
                 <strong>{ "Choose account:" }</strong>
                 <div class="row">
                     { switch_buttons }
-                    <button onclick={add_new}>{ "Add new account" }</button>
+                    <button onclick={add_new}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
+                        { "Add new account" }
+                    </button>
                 </div>
             </div>
         }
@@ -976,7 +1049,7 @@ fn app() -> Html {
     let expiry_html = if let Some(warn) = (*expiry_warn).clone() {
         let count = warn.pending_count();
         html! {
-            <div class="expiry-warn">
+            <div class="warn">
                 { format!(
                     "Session nearing expiry with {count} pending local item(s). \
                      Reconnect before the session lapses to avoid data loss."
@@ -992,23 +1065,24 @@ fn app() -> Html {
         let prompt_present = (*login_url).is_some();
         let stored = (*stored_account).clone();
         if signed_in {
-            let passkey_line = (*custody)
-                .as_ref()
-                .map(|custody| format!(" Passkey: {custody}."))
-                .unwrap_or_default();
             let account_line = {
                 let uid = (*identity).clone().unwrap_or_default();
-                match (*booted_account).clone() {
-                    Some(acc) => html! {
+                let decoded = (*booted_account).clone().map(|acc| stored_identity(&acc));
+                match decoded {
+                    Some(acc) if acc != uid => html! {
                         <span>
-                            { format!("Signed in as {} (account: {}).", uid, acc) }
-                            { passkey_line }
+                            { "Signed in as " }
+                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            { " (account: " }
+                            <code class="id" title={acc.clone()}>{ short_id(&acc) }</code>
+                            { ")." }
                         </span>
                     },
-                    None => html! {
+                    _ => html! {
                         <span>
-                            { format!("Signed in as {}.", uid) }
-                            { passkey_line }
+                            { "Signed in as " }
+                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            { "." }
                         </span>
                     },
                 }
@@ -1024,7 +1098,7 @@ fn app() -> Html {
                     let status = status.clone();
                     let identity = identity.clone();
                     let booted_account = booted_account.clone();
-                    let label = account.clone();
+                    let label = stored_identity(&account);
                     html! {
                         <button onclick={Callback::from(move |_| {
                             // Cleared before the reboot, not after it. The banner
@@ -1043,7 +1117,9 @@ fn app() -> Html {
                                 Some(Err(e)) => status.set(format!("switch failed: {e:?}")),
                             }
                         })}>
-                            { format!("Switch to {label}") }
+                            <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
+                            { "Switch to " }
+                            <code class="id" title={label.clone()}>{ short_id(&label) }</code>
                         </button>
                     }
                 })
@@ -1076,9 +1152,15 @@ fn app() -> Html {
                 html! {
                     <span>
                         { format!("{count} local item(s) will be lost. ") }
-                        <button onclick={confirm_delete}>{ "Delete anyway" }</button>
+                        <button class="danger" onclick={confirm_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_CHECK} width={"14"} height={"14"} />
+                            { "Delete anyway" }
+                        </button>
                         { " " }
-                        <button onclick={cancel_confirm.clone()}>{ "Cancel" }</button>
+                        <button onclick={cancel_confirm.clone()}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_XMARK} width={"14"} height={"14"} />
+                            { "Cancel" }
+                        </button>
                     </span>
                 }
             } else {
@@ -1090,9 +1172,15 @@ fn app() -> Html {
                 html! {
                     <span>
                         { format!("Refused: {count} local item(s) still pending. ") }
-                        <button onclick={force_delete}>{ "Force delete" }</button>
+                        <button class="danger" onclick={force_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
+                            { "Force delete" }
+                        </button>
                         { " " }
-                        <button onclick={cancel_confirm}>{ "Cancel" }</button>
+                        <button onclick={cancel_confirm}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_XMARK} width={"14"} height={"14"} />
+                            { "Cancel" }
+                        </button>
                     </span>
                 }
             } else {
@@ -1141,26 +1229,40 @@ fn app() -> Html {
                     });
                 });
                 html! {
-                    <span>
-                        <button onclick={enrol_gate}>{ "Enrol passkey gate" }</button>
-                    </span>
+                    <button onclick={enrol_gate}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FINGERPRINT} width={"14"} height={"14"} />
+                        { "Enrol passkey gate" }
+                    </button>
                 }
             } else {
                 html! {}
             };
 
             html! {
-                <div class="auth-bar">
+                <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
                     { account_line }
-                    { enrol_html }
-                    <span>
-                        <button onclick={logout_keep}>{ "Log out, keep local data" }</button>
-                        { " " }
-                        <button onclick={logout_delete}>{ "Delete local data and log out" }</button>
-                        { " " }
+                    <div class="row">
                         { switch_buttons }
-                        <button onclick={add_account}>{ "Add another account" }</button>
-                    </span>
+                        <button onclick={add_account}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
+                            { "Add another account" }
+                        </button>
+                        { enrol_html }
+                    </div>
+                    <div class="row">
+                        <button onclick={logout_keep}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_FROM_BRACKET} width={"14"} height={"14"} />
+                            { "Log out, keep local data" }
+                        </button>
+                        <button class="danger" onclick={logout_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
+                            { "Delete local data and log out" }
+                        </button>
+                    </div>
                     { confirm_html }
                     { refused_html }
                 </div>
@@ -1168,18 +1270,34 @@ fn app() -> Html {
         } else if prompt_present || stored.is_none() {
             // The button opens the login URL the worker parks; it is inert until one arrives.
             html! {
-                <div class="auth-bar">
+                <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
                     <span>
                         { "Sign in to begin. " }
-                        <button disabled={!prompt_present} onclick={open_login}>{ "Sign in" }</button>
+                        <button class="primary" disabled={!prompt_present} onclick={open_login}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_TO_BRACKET} width={"14"} height={"14"} />
+                            { "Sign in" }
+                        </button>
                     </span>
                 </div>
             }
         } else {
             let account = stored.unwrap_or_default();
+            let identity = stored_identity(&account);
             html! {
-                <div class="auth-bar">
-                    <span>{ format!("Signed in as {}.", stored_identity(&account)) }</span>
+                <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
+                    <span>
+                        { "Signed in as " }
+                        <code class="id" title={identity.clone()}>{ short_id(&identity) }</code>
+                        { "." }
+                    </span>
                 </div>
             }
         }
@@ -1195,12 +1313,30 @@ fn app() -> Html {
         html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
     };
 
+    // The header's gate and custody lines, shown once the worker has said
+    // which custody level the page runs under.
+    let gate_line_html = match *custody {
+        Some(custody) => html! {
+            <p class="status">{ format!("gate: {}", gate_text(custody, *gate)) }</p>
+        },
+        None => html! {},
+    };
+    let custody_line_html = match *custody {
+        Some(custody) => html! {
+            <p class="status">{ format!("custody: {}", custody_text(custody)) }</p>
+        },
+        None => html! {},
+    };
+
     html! {
         <>
             <style>{ CSS }</style>
             <div class="wrap">
                 <h1>{ "connetto web demo (Yew)" }</h1>
                 <p class="status">{ format!("status: {}", &*status) }</p>
+                { gate_line_html }
+                <p class="status">{ "device: no device identity in this build" }</p>
+                { custody_line_html }
                 { picker_html }
                 { expiry_html }
                 { auth_bar }
@@ -1217,15 +1353,15 @@ fn panes_skeleton() -> Html {
     html! {
         <div class="panes">
             <div class="pane">
-                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ "count 0, total quantity 0. Converges across every window through Postgres." }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ "count 0, total quantity 0. Newest first. Converges across every window through Postgres." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ "count 0. Pick an image file to stage and upload through the content route." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
@@ -1233,7 +1369,7 @@ fn panes_skeleton() -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
                 <p>{ "count 0. Converges across this device's windows through the DB worker, never the server." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
@@ -1241,12 +1377,12 @@ fn panes_skeleton() -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
                 <p>{ "Replica mirror: 0 pages (~0 KB), 0 free to reclaim. Covered rows: 0." }</p>
                 <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
             </div>
             <div class="pane">
-                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
                 <p>{ "Save a zip archive of this device's local data. The archive is not \
                       encrypted and holds every row the device can read: whoever holds \
                       the file holds the data." }</p>
@@ -1254,6 +1390,117 @@ fn panes_skeleton() -> Html {
             </div>
         </div>
     }
+}
+
+#[derive(Properties, PartialEq)]
+struct PhotoStorageControlsProps {
+    content: ContentHandle,
+    refresh: UseStateHandle<u64>,
+}
+
+#[function_component(PhotoStorageControls)]
+fn photo_storage_controls(props: &PhotoStorageControlsProps) -> Html {
+    let message = use_state(|| None::<String>);
+    let pin = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content
+                    .pin_content("photos", "SELECT content_id FROM photos", "content_id")
+                    .await
+                    .map_or_else(
+                        |err| format!("pin failed: {err}"),
+                        |_| "pinned photos".to_owned(),
+                    );
+                message.set(Some(result));
+            });
+        })
+    };
+    let unpin = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content.unpin_content("photos").await.map_or_else(
+                    |err| format!("unpin failed: {err}"),
+                    |_| "unpinned photos".to_owned(),
+                );
+                message.set(Some(result));
+            });
+        })
+    };
+    let fetch = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        let refresh = props.refresh.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            let refresh = refresh.clone();
+            spawn_local(async move {
+                let result = content.fetch_pinned().await.map_or_else(
+                    |err| format!("fetch failed: {err}"),
+                    |ids| format!("fetched {} pinned file(s)", ids.len()),
+                );
+                refresh.set(*refresh + 1);
+                message.set(Some(result));
+            });
+        })
+    };
+    let tidy = {
+        let content = Rc::clone(&props.content.0);
+        let message = message.clone();
+        Callback::from(move |_| {
+            let content = Rc::clone(&content);
+            let message = message.clone();
+            spawn_local(async move {
+                let result = content.tidy().await.map_or_else(
+                    |err| format!("content tidy failed: {err}"),
+                    |n| format!("content tidy: {n} file(s) evicted"),
+                );
+                message.set(Some(result));
+            });
+        })
+    };
+
+    html! {
+        <>
+            <div class="row">
+                <button onclick={pin}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_THUMBTACK} width={"14"} height={"14"} />
+                    { "Pin all photos" }
+                </button>
+                <button onclick={unpin}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_LINK_SLASH} width={"14"} height={"14"} />
+                    { "Unpin photos" }
+                </button>
+                <button onclick={fetch}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_DOWNLOAD} width={"14"} height={"14"} />
+                    { "Fetch pinned" }
+                </button>
+                <button onclick={tidy}>
+                    <Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />
+                    { "Free up content storage" }
+                </button>
+            </div>
+            if let Some(message) = &*message {
+                <p class="status">{ message.clone() }</p>
+            }
+        </>
+    }
+}
+
+#[derive(Clone)]
+enum PhotoUrl {
+    /// The signed server URL.
+    Remote(String),
+    /// The local bytes through an owned object URL, revoked when the last owner drops.
+    Local(ObjectUrl),
 }
 
 /// The client the dashboard drives, passed once from [`App`] when it is ready.
@@ -1276,6 +1523,12 @@ fn dashboard(props: &DashboardProps) -> Html {
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
     let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
     let count = use_live(&client, orders::table.count());
+    let counts_by_quantity = use_live(
+        &client,
+        orders::table
+            .group_by(orders::quantity)
+            .select((orders::quantity, diesel::dsl::count_star())),
+    );
 
     let order_rows = orders.value();
     let note_rows = notes.value();
@@ -1287,28 +1540,52 @@ fn dashboard(props: &DashboardProps) -> Html {
     let count_text = count
         .value()
         .map_or_else(|| "pending".to_owned(), |value| value.to_string());
+    let grouped_text = grouped_label(&counts_by_quantity.value());
 
-    // Resolved signed URLs for available photos. Refetched (not cached) whenever the
-    // set of available photos changes, so a stale ticket never wedges the panel.
-    let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, String>::new);
+    // The display source of each photo's bytes, refetched on a row's id or content
+    // state change and when the fetch button restores bytes, so a stale ticket
+    // never wedges the panel.
+    let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, PhotoUrl>::new);
+    let src_refresh = use_state(|| 0_u64);
     {
         let content = Rc::clone(&props.content.0);
         let photo_urls = photo_urls.clone();
-        let available: Vec<(rosetta_uuid::Uuid, Vec<u8>)> = photo_rows
+        let rows: Vec<(rosetta_uuid::Uuid, Vec<u8>, bool)> = photo_rows
             .iter()
-            .filter(|p| p.content_state.as_deref() == Some("available"))
-            .map(|p| (p.id, p.content_id.clone()))
+            .map(|p| {
+                (
+                    p.id,
+                    p.content_id.clone(),
+                    p.content_state.as_deref() == Some("available"),
+                )
+            })
             .collect();
-        let key: Vec<rosetta_uuid::Uuid> = available.iter().map(|(id, _)| *id).collect();
+        let key = (
+            rows.iter()
+                .map(|(id, _, available)| (*id, *available))
+                .collect::<Vec<_>>(),
+            *src_refresh,
+        );
         use_effect_with(key, move |_| {
             spawn_local(async move {
                 let mut new_urls = HashMap::new();
-                for (id, content_id) in available {
-                    if let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) {
-                        let file_id = FileId::from_bytes(bytes);
-                        if let TabResolved::Remote { url } = content.resolve(file_id).await {
-                            new_urls.insert(id, url);
+                for (id, content_id, available) in rows {
+                    let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) else {
+                        continue;
+                    };
+                    let file_id = FileId::from_bytes(bytes);
+                    let resolved = content.resolve(file_id).await;
+                    match resolved {
+                        TabResolved::Remote { url } if available => {
+                            new_urls.insert(id, PhotoUrl::Remote(url));
                         }
+                        TabResolved::Local { .. } => {
+                            let Ok(Some(object_url)) = resolved.into_object_url() else {
+                                continue;
+                            };
+                            new_urls.insert(id, PhotoUrl::Local(object_url));
+                        }
+                        _ => {}
                     }
                 }
                 photo_urls.set(new_urls);
@@ -1570,33 +1847,44 @@ fn dashboard(props: &DashboardProps) -> Html {
     };
 
     let orders_error = orders.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("orders error: {err}") }</p> }
+        html! { <p class="error">{ format!("orders error: {err}") }</p> }
     });
     let notes_error = notes.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("notes error: {err}") }</p> }
+        html! { <p class="error">{ format!("notes error: {err}") }</p> }
     });
     let photos_error = photos.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("photos error: {err}") }</p> }
+        html! { <p class="error">{ format!("photos error: {err}") }</p> }
     });
     let count_error = count.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("count error: {err}") }</p> }
+        html! { <p class="error">{ format!("count error: {err}") }</p> }
+    });
+    let grouped_error = counts_by_quantity.error().map(|err| {
+        html! { <p class="error">{ format!("grouped subscription error: {err}") }</p> }
     });
     let urls = (*photo_urls).clone();
 
     html! {
         <div class="panes">
             <div class="pane">
-                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ format!("count {order_count}, total quantity {order_sum}. Newest first. Converges across every window through Postgres.") }</p>
                 <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
+                <p>{ "COUNT(*) grouped by quantity: " }<strong>{ grouped_text }</strong></p>
                 <div class="row">
-                    <button onclick={add_order} disabled={identity.is_empty()}>{ "Add order" }</button>
+                    <button class="primary" onclick={add_order} disabled={identity.is_empty()}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_PLUS} width={"14"} height={"14"} />
+                        { "Add order" }
+                    </button>
                     if newest_order.is_some() {
-                        <button onclick={remove_order}>{ "Remove newest" }</button>
+                        <button class="danger" onclick={remove_order}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_MINUS} width={"14"} height={"14"} />
+                            { "Remove newest" }
+                        </button>
                     }
                 </div>
                 { orders_error.unwrap_or_default() }
                 { count_error.unwrap_or_default() }
+                { grouped_error.unwrap_or_default() }
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody>
@@ -1604,7 +1892,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                             let id = row.id.to_string();
                             html! {
                                 <tr key={id.clone()}>
-                                    <td>{ id }</td>
+                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
                                     <td>{ row.quantity.to_string() }</td>
                                 </tr>
                             }
@@ -1613,7 +1901,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {photo_count}. Pick an image file to stage and upload through the content route.") }</p>
                 <div class="row">
                     <input type="file" accept="image/*" onchange={pick_photo} disabled={identity.is_empty()} />
@@ -1625,12 +1913,17 @@ fn dashboard(props: &DashboardProps) -> Html {
                         { for photo_rows.iter().map(|row| {
                             let id = row.id.to_string();
                             let state = row.content_state.as_deref().unwrap_or("pending");
-                            let img = urls.get(&row.id).map(|url| {
-                                html! { <img src={url.clone()} style="max-height:60px;" /> }
+                            let img = urls.get(&row.id).map(|src| match src {
+                                PhotoUrl::Remote(url) => {
+                                    html! { <img class="thumb" src={url.clone()} /> }
+                                }
+                                PhotoUrl::Local(object_url) => {
+                                    html! { <img class="thumb" src={object_url.as_str().to_owned()} /> }
+                                }
                             });
                             html! {
                                 <tr key={id.clone()}>
-                                    <td>{ id }</td>
+                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
                                     <td>{ state }</td>
                                     <td>{ img.unwrap_or_default() }</td>
                                 </tr>
@@ -1638,13 +1931,17 @@ fn dashboard(props: &DashboardProps) -> Html {
                         }) }
                     </tbody>
                 </table>
+                <PhotoStorageControls content={props.content.clone()} refresh={src_refresh.clone()} />
             </div>
             <div class="pane">
-                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
                 <p>{ format!("count {note_count}. Converges across this device's windows through the DB worker, never the server.") }</p>
                 <div class="row">
                     <input type="text" placeholder="note body" value={(*note_text).clone()} oninput={on_note_input} />
-                    <button onclick={save_note}>{ "Save note" }</button>
+                    <button class="primary" onclick={save_note}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FLOPPY_DISK} width={"14"} height={"14"} />
+                        { "Save note" }
+                    </button>
                 </div>
                 { notes_error.unwrap_or_default() }
                 <table>
@@ -1663,32 +1960,52 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
                 <p>{ format!("Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {}.", order_count + note_count + photo_count) }</p>
                 <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
                 <div class="row">
-                    <button onclick={tidy}>{ "Free up space" }</button>
+                    <button onclick={tidy}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />
+                        { "Free up space" }
+                    </button>
                 </div>
             </div>
             <div class="pane">
-                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
                 <p>{ "Save a zip archive of this device's local data. The archive is not \
                       encrypted and holds every row the device can read: whoever holds \
                       the file holds the data." }</p>
                 <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
                 <div class="row">
-                    <button onclick={export}>{ "Export local data" }</button>
+                    <button onclick={export}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FILE_EXPORT} width={"14"} height={"14"} />
+                        { "Export local data" }
+                    </button>
                 </div>
                 if let Some(message) = (*export_status).clone() {
-                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                    <p class="status">{ message }</p>
                 }
                 <div class="row">
                     <input type="file" accept=".zip" onchange={import_cb} />
                 </div>
                 if let Some(message) = (*import_status).clone() {
-                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                    <p class="status">{ message }</p>
                 }
             </div>
         </div>
     }
+}
+
+/// `quantity: count` pairs in quantity order, or `none` for an empty snapshot.
+fn grouped_label(counts: &HashMap<i64, i64>) -> String {
+    let mut sorted: Vec<(i64, i64)> = counts.iter().map(|(q, c)| (*q, *c)).collect();
+    sorted.sort_unstable();
+    if sorted.is_empty() {
+        return "none".to_owned();
+    }
+    sorted
+        .iter()
+        .map(|(quantity, count)| format!("{quantity}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

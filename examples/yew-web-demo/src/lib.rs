@@ -13,6 +13,13 @@ pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 
+/// The first dash-separated segment of an id, the compact form the screen
+/// shows. The whole string when it carries no dash.
+#[must_use]
+pub fn short_id(id: &str) -> &str {
+    id.split_once('-').map(|(head, _)| head).unwrap_or(id)
+}
+
 // Distinct names separate test records within the shared pool.
 const ALIGN_DB_PREFIX: &str = "connetto-yew-align";
 const ALIGN_AUTH_DB: &str = "connetto-yew-align-auth.sqlite";
