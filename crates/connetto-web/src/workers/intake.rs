@@ -372,7 +372,7 @@ pub(super) async fn await_db_worker_ready_bounded(
                 && !id.is_empty()
                 && is_known(id)
             {
-                // Progress only extends a running deadline; the user is what an AtUser boot waits on.
+                // An AtUser boot waits on the user, so progress extends only a running deadline.
                 if let HelloReady::Counting { deadline } = &mut *state {
                     let candidate = SystemClock.monotonic() + silence;
                     if candidate > *deadline {
