@@ -959,6 +959,7 @@ dependencies = [
 name = "connetto-core"
 version = "0.0.0"
 dependencies = [
+ "diesel",
  "futures-util",
  "rcgen",
  "rmp-serde",
@@ -986,8 +987,10 @@ dependencies = [
  "connetto-core",
  "diesel",
  "pg2sqlite",
+ "serde",
  "sqlparser",
  "thiserror 2.0.20",
+ "toml 0.8.2",
 ]
 
 [[package]]

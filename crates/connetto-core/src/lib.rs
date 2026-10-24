@@ -22,6 +22,8 @@ pub mod session_id;
 pub mod sql;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+#[cfg(feature = "sqlite-shape")]
+pub mod tier_shape;
 pub mod traits;
 #[cfg(feature = "loopback")]
 pub mod transport;
@@ -42,10 +44,15 @@ pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
     CALLER_FUNCTION, MAJOR_DIRECTIVE, Major, MajorError, SUBJECTS_FUNCTION, SchemaBundle,
-    SchemaVersion, UUID_FUNCTION, WRITE_EXEMPTION_FUNCTION, schema_hash,
+    SchemaVersion, TierBoundary, TierHistory, TierHistoryError, UUID_FUNCTION,
+    WRITE_EXEMPTION_FUNCTION, schema_hash,
 };
 pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;
+#[cfg(feature = "sqlite-shape")]
+pub use tier_shape::{
+    ShapeDifference, ShapeError, TierColumn, TierIndex, TierShape, TierTable, read_tier_shape,
+};
 pub use traits::{
     CheckedGrant, ContentTicketSigner, GrantCheckFuture, GrantRefused, HandleError,
     HandshakeAuthority, IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore,
