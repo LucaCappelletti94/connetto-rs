@@ -1327,6 +1327,25 @@ async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames()
             reason: FatalErrorReason::WriterUnknown
         }
     ));
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 1,
+            major: Major::new(1),
+        }]
+    );
+    let timer = conn.drain_timer().expect("the held major owes a dial");
+    conn.attach_drain(
+        timer,
+        Wire::default().refusing_with(FatalErrorReason::WriterUnknown),
+    )
+    .await
+    .expect("the held writer refusal arms another dial");
+    let timer = conn.drain_timer().expect("the held writer needs a number");
+    conn.attach_drain(timer, Wire::default().grant(9, 0).silent())
+        .await
+        .expect("the held major issues a fresh number");
     let (carried, hash): (Vec<u8>, Vec<u8>) = _connetto_pending::table
         .select((_connetto_pending::changeset, _connetto_pending::entry_hash))
         .first(conn.conn())
@@ -1334,7 +1353,7 @@ async fn a_refused_writer_carries_held_bytes_without_the_active_builds_renames()
     assert_eq!(carried, held);
     assert_eq!(hash.as_slice(), entry_hash(&GENESIS, 1, &carried));
     let expected = vec![UnsyncedWrite {
-        writer: WriterRef::Number(0),
+        writer: WriterRef::Number(9),
         seq: 1,
         major: Major::new(1),
     }];
