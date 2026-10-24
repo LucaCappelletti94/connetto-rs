@@ -303,6 +303,75 @@ async fn a_pong_with_another_nonce_does_not_answer_the_probe() {
     );
 }
 
+/// A server that acks, answers the first probe with its own nonce and every
+/// later probe with that first nonce again, counting the probes.
+fn replaying_server() -> (LoopbackTransport, Arc<AtomicU32>) {
+    let (mut server, client_end) = loopback();
+    let pings = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&pings);
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        server.send_control(ack()).await.expect("ack the handshake");
+        let mut first = None;
+        while let Ok(Some(frame)) = server.recv().await {
+            if let IncomingFrame::Control(ControlMessage::Ping(ping)) = frame {
+                counted.fetch_add(1, Ordering::Relaxed);
+                let nonce = *first.get_or_insert(ping.nonce);
+                if server
+                    .send_control(ControlMessage::Pong(Pong { nonce }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+    (client_end, pings)
+}
+
+/// Every probe carries a fresh nonce, so a late pong for an earlier probe
+/// does not answer the current one, and a server that only replays its first
+/// answer is dropped after the second probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_pong_for_an_earlier_probe_does_not_answer_the_next() {
+    let (transport, pings) = replaying_server();
+    let (running, pump) = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(transport),
+    )
+    .with_tuning(tuning())
+    .with_reconnect(ReconnectPolicy::default())
+    .with_sleeper(|d| tokio::time::sleep(d))
+    .connect_with_pump()
+    .await
+    .expect("the one transport hands back");
+    let client = running.client().clone();
+    let mut events = client.events();
+    tokio::spawn(pump);
+    let deadline = std::time::Instant::now() + BOUND;
+    next_event(&mut events, deadline, "the connection never stood", |e| {
+        matches!(e, ClientEvent::SyncStatus(SyncStatus::Connected))
+    })
+    .await;
+    // The one transport is spent, so the drop shows as the redial attempts.
+    next_event(
+        &mut events,
+        deadline,
+        "a replayed answer to an earlier probe was taken as answering the next",
+        |e| matches!(e, ClientEvent::Reconnecting { .. }),
+    )
+    .await;
+    assert_eq!(
+        pings.load(Ordering::Acquire),
+        2,
+        "the first probe was answered and the second was not"
+    );
+}
+
 /// A client end whose probe sends fail, as a link that died under the probe
 /// would, and that forwards every other frame.
 struct ProbeFails(LoopbackTransport);

@@ -53,6 +53,9 @@ enum Answer {
     OtherError,
     /// The snapshot, one photo row.
     Serve,
+    /// The one fixed refusal phrase, then a beat later the snapshot after
+    /// all, as a server that re-serves a subscription it refused.
+    RefuseThenServe,
 }
 
 /// Compressed changeset bytes inserting the one served photo.
@@ -107,7 +110,7 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
         for (sub_id, answer) in sub_ids.into_iter().zip(answers) {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let detail = match answer {
-                Answer::Refuse => Some(SUBSCRIPTION_REFUSED),
+                Answer::Refuse | Answer::RefuseThenServe => Some(SUBSCRIPTION_REFUSED),
                 Answer::OtherError => Some("the server is busy"),
                 Answer::Serve => None,
             };
@@ -119,8 +122,10 @@ fn scripted_server(answers: Vec<Answer>) -> LoopbackTransport {
                     }))
                     .await;
             }
-            if matches!(answer, Answer::Refuse) {
-                continue;
+            match answer {
+                Answer::Refuse => continue,
+                Answer::RefuseThenServe => tokio::time::sleep(Duration::from_millis(100)).await,
+                Answer::OtherError | Answer::Serve => {}
             }
             let _ = server
                 .send_control(ControlMessage::SnapshotBegin(SnapshotBegin {
@@ -263,5 +268,31 @@ async fn another_non_fatal_detail_refuses_nothing() {
         .await
         .expect("the snapshot ends the wait")
         .expect("another detail is no refusal");
+    assert_eq!(photos.rows().len(), 1, "the served row reached the handle");
+}
+
+/// A subscription the server serves after refusing it is live again: the
+/// handle that answered the refusal sees the rows once they arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_served_subscription_clears_its_refusal() {
+    let client = client_over(vec![Answer::RefuseThenServe]).await;
+    let mut photos: LiveQuery<Photo> = client
+        .watch(photos::table.order_by(photos::id))
+        .await
+        .expect("watch");
+    tokio::time::timeout(BOUND, photos.changed())
+        .await
+        .expect("the refusal must end the wait")
+        .expect_err("the server refused the subscription first");
+    let served = tokio::time::timeout(BOUND, async {
+        loop {
+            if photos.changed().await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(served.is_ok(), "the re-served snapshot clears the refusal");
     assert_eq!(photos.rows().len(), 1, "the served row reached the handle");
 }
