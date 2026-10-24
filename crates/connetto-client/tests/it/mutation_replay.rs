@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, DataDir};
+use connetto_client::{
+    ClientBuilder, ClientEvent, ConnettoConnection, DataDir, MemoryRefreshStore,
+};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
@@ -307,7 +309,11 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
             super::support::Once::new(open_session(&manager)),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            keys.clone(),
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("prime connect");
@@ -321,7 +327,11 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
         super::support::Once::new(black_hole()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), keys)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        keys,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("connect");
@@ -480,7 +490,11 @@ async fn restart_replays_persisted_pending() {
             super::support::Once::new(open_session(&manager)),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            keys.clone(),
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("prime connect");
@@ -491,7 +505,11 @@ async fn restart_replays_persisted_pending() {
             super::support::Once::new(black_hole()),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            keys.clone(),
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("black hole connect");
@@ -506,7 +524,11 @@ async fn restart_replays_persisted_pending() {
         super::support::Once::new(open_session(&manager)),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), keys)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        keys,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("second connect");

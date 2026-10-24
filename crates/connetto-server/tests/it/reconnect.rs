@@ -6,6 +6,7 @@
 //!
 //! * within the retained window: the client receives exactly the entries after
 //!   its cursor as `LivePatch`, and its replica reaches row parity;
+//! * a catchup completion follows all rows and carries their ceiling.
 //! * outside the window (after a prune): the client receives
 //!   `FullResyncRequired { CursorOutsideRetention }` followed by a fresh
 //!   snapshot;
@@ -24,7 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FullResyncReason, Handshake, Subscribe, SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, FullResyncReason, Handshake, Ping, Subscribe,
+    SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
@@ -184,6 +186,45 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
     assert!(outcome.is_err(), "expected no frame, got {outcome:?}");
 }
 
+/// The next frame in wire order, giving up after a bound so a frame the server
+/// never sends fails the test instead of hanging it.
+async fn next_frame_bounded<T: Transport>(transport: &mut T) -> IncomingFrame {
+    tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("a frame within five seconds")
+        .expect("recv")
+        .expect("connection open")
+}
+
+/// The next control frame under the bound above.
+async fn next_control_bounded<T: Transport>(transport: &mut T) -> ControlMessage {
+    let frame = next_frame_bounded(transport).await;
+    let IncomingFrame::Control(msg) = frame else {
+        panic!("expected a control frame, got {frame:?}");
+    };
+    msg
+}
+
+/// Every frame between the call and the pong for `nonce`, in wire order.
+///
+/// The run loop handles frames one at a time, so the pong proves everything
+/// produced before it is already in the transport.
+async fn barrier<T: Transport>(client: &mut T, nonce: u64) -> Vec<IncomingFrame> {
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce }))
+        .await
+        .expect("send barrier ping");
+    let mut seen = Vec::new();
+    loop {
+        let frame = next_frame_bounded(client).await;
+        if let IncomingFrame::Control(ControlMessage::Pong(pong)) = &frame {
+            assert_eq!(pong.nonce, nonce, "the barrier's own pong");
+            return seen;
+        }
+        seen.push(frame);
+    }
+}
+
 /// Execute `sql` against the emulated backend, route every resulting event
 /// through the manager (which appends to the oplog), and return the events.
 /// The emulator stamps monotonic LSNs, which the LSN-keyed oplog relies on.
@@ -278,6 +319,10 @@ async fn subscribe<T: Transport>(client: &mut T) {
         .expect("send subscribe");
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "The snapshot, missed changes and completed catchup form one scenario."
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catchup_within_window_streams_missed_ops() {
     let fixture = Fixture::acquire().await;
@@ -336,7 +381,7 @@ async fn catchup_within_window_streams_missed_ops() {
     // Drive the withheld row into the oplog while the client is disconnected.
     // quantity=1 matches the subscription predicate, so its absence after
     // reconnect proves the policy suppresses it on the catchup path.
-    drive(
+    let withheld = drive(
         &mut source,
         &manager,
         &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
@@ -382,6 +427,16 @@ async fn catchup_within_window_streams_missed_ops() {
             .apply_diffset(&live.patchset_zstd, &mut replica)
             .expect("apply catchup patch");
     }
+    // The replay ends with its completion, carrying the ceiling the replay read.
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(
+        end.cursor,
+        cursor_of(&withheld[0]),
+        "the ceiling names the newest row in the log, withheld rows included"
+    );
     expect_idle(&mut client).await;
 
     // The replica reached parity with the server's matching rows.
@@ -393,6 +448,171 @@ async fn catchup_within_window_streams_missed_ops() {
 
     client.close().await.expect("close client");
     server.await.expect("join server");
+}
+
+/// An ordinary row catchup ends with a completion frame carrying the ceiling the replay read, so a client resuming from that cursor replays nothing it has not applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_catchup_ends_with_a_completion_at_the_ceiling() {
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
+        SeedSnapshot,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'paid')",
+        )
+        .await,
+    );
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "INSERT INTO orders (id, price, quantity, status) VALUES (2, 4.0, 5, 'new')",
+        )
+        .await,
+    );
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "UPDATE orders SET quantity = 7 WHERE id = 1",
+        )
+        .await,
+    );
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "INSERT INTO orders (id, price, quantity, status) VALUES (3, 2.0, 2, 'later')",
+        )
+        .await,
+    );
+    events.extend(drive(&mut source, &manager, "DELETE FROM orders WHERE id = 2").await);
+    assert_eq!(events.len(), 5, "one CDC event per statement");
+
+    let resume = cursor_of(&events[1]);
+    let (mut client, server) = open_session(&manager, "client-a", Some(resume)).await;
+    subscribe(&mut client).await;
+
+    for event in &events[2..] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(live.sub_id, "orders");
+        assert_eq!(
+            live.cursor,
+            cursor_of(event),
+            "patch carries the event cursor"
+        );
+    }
+
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(
+        end.cursor,
+        cursor_of(&events[4]),
+        "the completion names the ceiling the replay read"
+    );
+    expect_idle(&mut client).await;
+
+    client.close().await.expect("close client");
+    server.await.expect("join server");
+}
+
+/// With the credit window shut, an ordinary catchup's completion waits behind the rows it completes until the last credit releases them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credit_starved_catchup_holds_its_completion_behind_its_rows() {
+    let fixture = Fixture::acquire().await;
+    let (manager, _script, events, _source) =
+        scripted(&fixture, SessionConfig::new().with_initial_credits(0)).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    subscribe(&mut client).await;
+
+    assert!(
+        barrier(&mut client, 1).await.is_empty(),
+        "with no credits the replayed rows cannot leave, so their completion may not either"
+    );
+
+    client
+        .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
+        .await
+        .expect("credit one row");
+    let released = barrier(&mut client, 2).await;
+    assert_eq!(
+        released.len(),
+        1,
+        "one credit releases exactly one row, and nothing else"
+    );
+    let IncomingFrame::Bulk(BulkMessage::LivePatch(live)) = &released[0] else {
+        panic!("the released frame is the first row, got {released:?}");
+    };
+    assert_eq!(live.sub_id, "orders");
+    assert_eq!(
+        live.cursor,
+        cursor_of(&events[1]),
+        "the first missed row, in log order"
+    );
+
+    client
+        .send_control(ControlMessage::AckCredits(AckCredits { credits: 1 }))
+        .await
+        .expect("credit the last row");
+    let released = barrier(&mut client, 3).await;
+    assert_eq!(
+        released.len(),
+        2,
+        "the final row and, behind it, the completion"
+    );
+    let IncomingFrame::Bulk(BulkMessage::LivePatch(live)) = &released[0] else {
+        panic!("the last released row leads, got {released:?}");
+    };
+    assert_eq!(live.cursor, cursor_of(&events[2]), "the last missed row");
+    let IncomingFrame::Control(ControlMessage::SnapshotEnd(end)) = &released[1] else {
+        panic!("the completion follows the rows it completes, got {released:?}");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(
+        end.cursor,
+        cursor_of(&events[2]),
+        "the completion names the ceiling"
+    );
+    expect_idle(&mut client).await;
+}
+
+/// Resuming at the ceiling replays no rows, but the catchup still completes, and the completion carries the cursor the resume presented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_catchup_still_sends_its_completion() {
+    let fixture = Fixture::acquire().await;
+    let (manager, _script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[2])).await;
+    subscribe(&mut client).await;
+
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected the empty catchup's completion");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(
+        end.cursor,
+        cursor_of(&events[2]),
+        "with nothing to replay the ceiling is the resume cursor"
+    );
+    expect_idle(&mut client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -502,7 +722,7 @@ async fn tombstone_replays_the_delete() {
     // Drive the withheld row into the oplog before reconnect so it falls in the
     // catchup window. quantity=1 matches the subscription predicate, so its
     // absence after reconnect proves the policy suppresses it on the catchup path.
-    drive(
+    let withheld = drive(
         &mut source,
         &manager,
         &format!("INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 1.0, 1, 'withheld')"),
@@ -533,6 +753,11 @@ async fn tombstone_replays_the_delete() {
     applier
         .apply_diffset(&live.patchset_zstd, &mut replica)
         .expect("apply tombstone patch");
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(end.cursor, cursor_of(&withheld[0]));
     expect_idle(&mut client).await;
 
     assert!(
@@ -877,6 +1102,11 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
         assert_eq!(live.cursor, cursor_of(event));
     }
 
+    // The first catchup's completion left queued behind its rows.
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected the first catchup's completion");
+    };
+
     // The second subscription's reads keep failing, so only what is left of the budget stands before the end.
     arm(&script, &["min_position"; 64], true, None);
     client
@@ -923,12 +1153,20 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
     .await;
     release.notify_one();
 
-    for event in events[1..].iter().chain(&live) {
+    for event in &events[1..] {
         let BulkMessage::LivePatch(patch) = next_bulk(&mut client).await else {
             panic!("expected the replay and then the live change");
         };
         assert_eq!(patch.cursor, cursor_of(event));
     }
+    // The replay's completion leaves before the queued live change.
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected the replay's completion before the live change");
+    };
+    let BulkMessage::LivePatch(patch) = next_bulk(&mut client).await else {
+        panic!("expected the live change after the replay");
+    };
+    assert_eq!(patch.cursor, cursor_of(&live[0]));
     expect_idle(&mut client).await;
 }
 
@@ -1044,6 +1282,15 @@ async fn a_restarted_feed_replaying_rows_a_caught_up_client_holds_keeps_running(
         );
     }
     let held = cursor_of(&events[3]);
+
+    // The log's replay completes before the restarted feed's re-delivery reaches the client.
+    let ControlMessage::SnapshotEnd(end) = next_control(&mut client).await else {
+        panic!("expected the catchup completion");
+    };
+    assert_eq!(
+        end.cursor, held,
+        "the completion names the last row the client holds"
+    );
 
     // The restarted feed re-delivers every unacknowledged insert, then a new one.
     for (index, event) in events.iter().enumerate() {
@@ -1310,6 +1557,11 @@ async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held
             "catchup replays only what the snapshot lacked"
         );
     }
+    let ControlMessage::SnapshotEnd(end) = next_control_bounded(&mut client).await else {
+        panic!("expected catchup completion");
+    };
+    assert_eq!(end.sub_id, "orders");
+    assert_eq!(end.cursor, cursor_of(&beyond));
     expect_idle(&mut client).await;
 
     manager

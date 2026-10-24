@@ -93,6 +93,11 @@ mod schema_handshake;
 #[cfg(feature = "native-auth")]
 mod secret_stores;
 
+mod share_key_protocol;
+#[cfg(feature = "native-transport")]
+mod share_key_storage;
+mod share_keys;
+
 mod sql_functions;
 
 mod synced_references;

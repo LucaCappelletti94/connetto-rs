@@ -8,7 +8,7 @@
 
 use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient, DataDir, Gate, GateAskFuture,
-    GateAskOutcome, GateMechanism, Moment,
+    GateAskOutcome, GateMechanism, MemoryRefreshStore, Moment,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ControlMessage, GateState, HandshakeAck, LivePatch,
@@ -238,7 +238,11 @@ async fn client() -> (ConnettoClient<Script>, Script) {
         super::support::Once::new(script.clone()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        key_store,
+        MemoryRefreshStore::default(),
+    )
     .connect_with_pump()
     .await
     .expect("the builder connects");
@@ -873,7 +877,11 @@ fn gated_connect(
             super::support::Once::new(script),
         )
         .signed_in(credential)
-        .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            key_store,
+            MemoryRefreshStore::default(),
+        )
         .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
         .with_gate_mechanism(mechanism)
         .connect_with_pump()
@@ -1160,7 +1168,11 @@ async fn a_mechanism_already_open_at_launch_starts_the_gate_open() {
         super::support::Once::new(script.clone()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        key_store,
+        MemoryRefreshStore::default(),
+    )
     .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
     .with_gate_mechanism(mechanism.clone())
     .connect_with_pump()

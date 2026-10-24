@@ -2,8 +2,8 @@
 
 # connetto-rs
 
-[![CI](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/LucaCappelletti94/connetto-rs/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/connetto-rs)
+[![CI](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/connetto-rs/connetto-rs/graph/badge.svg)](https://codecov.io/gh/connetto-rs/connetto-rs)
 [![Quality gate](https://sonarcloud.io/api/project_badges/measure?project=LucaCappelletti94_connetto-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=LucaCappelletti94_connetto-rs)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -51,7 +51,7 @@ A per-check consistency token, Zanzibar's zookie, is not supported and owned by 
 
 The drawing below is the whole system coloured by build status. It is too dense to read inline, so open it in the browser and zoom.
 
-[![Architecture diagram](docs/architecture/architecture-diagram.svg)](https://raw.githubusercontent.com/LucaCappelletti94/connetto-rs/main/docs/architecture/architecture-diagram.svg)
+[![Architecture diagram](docs/architecture/architecture-diagram.svg)](https://raw.githubusercontent.com/connetto-rs/connetto-rs/main/docs/architecture/architecture-diagram.svg)
 
 ## Layout
 

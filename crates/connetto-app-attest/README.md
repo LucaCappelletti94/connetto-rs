@@ -1,7 +1,7 @@
 # connetto-app-attest
 
-[![Tests](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/connetto-rs/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
+[![Tests](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/LICENSE)
 
 Apple App Attest for connetto's device enrolment (R74 decision 35). `attest` asks Apple to vouch that a genuine copy of the app, signed under its App ID, made a request whose SHA-256 is the client data hash. It is the workspace's one crate allowed `unsafe` code.
 

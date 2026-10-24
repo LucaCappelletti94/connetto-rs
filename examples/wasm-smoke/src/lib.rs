@@ -95,6 +95,8 @@ pub mod build {
     };
     use connetto_core::SchemaBundle;
     use connetto_core::traits::{ReplicaKeyStore as _, Transport};
+    use connetto_web::auth::{BuilderKeyStore, IdbKeyStore};
+    use std::rc::Rc;
 
     use crate::BrowserSocket;
 
@@ -166,6 +168,20 @@ pub mod build {
             .await
             .expect("the in-memory store never fails");
         store
+    }
+
+    /// The share keys' store a suite's durable build passes, over the real
+    /// `IndexedDB` key store the browser profile shares, because a durable build
+    /// keeps its share keys beside the replica.
+    ///
+    /// # Panics
+    ///
+    /// When the key store cannot open, which only a browser without `IndexedDB`
+    /// can refuse.
+    pub async fn share_store() -> BuilderKeyStore {
+        BuilderKeyStore::new(Rc::new(
+            IdbKeyStore::open().await.expect("open the key store"),
+        ))
     }
 
     /// Dial the browser stack's sync endpoint, once per call.

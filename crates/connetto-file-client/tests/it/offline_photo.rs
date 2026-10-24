@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
-use connetto_client::{ClientBuilder, Gate, Grant, HeldCredential, SyncSchema};
+use connetto_client::{ClientBuilder, Gate, Grant, HeldCredential, MemoryRefreshStore, SyncSchema};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::transport::LoopbackTransport;
 use connetto_file_client::{ContentClient, FsStore, ReqwestHttp, Resolved};
@@ -437,6 +437,7 @@ where
     .durable(
         super::support::At(path.to_path_buf()),
         super::support::FixedKey,
+        MemoryRefreshStore::default(),
     )
     .with_gate(Gate::off())
     .connect_with_pump()

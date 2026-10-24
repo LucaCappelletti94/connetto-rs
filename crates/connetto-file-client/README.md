@@ -1,7 +1,7 @@
 # connetto-file-client
 
-[![Tests](https://github.com/LucaCappelletti94/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/connetto-rs/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
+[![Tests](https://github.com/connetto-rs/connetto-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/connetto-rs/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/connetto-rs/connetto-rs/blob/main/LICENSE)
 [![docs.rs](https://docs.rs/connetto-file-client/badge.svg)](https://docs.rs/connetto-file-client)
 [![crates.io](https://img.shields.io/crates/v/connetto-file-client.svg)](https://crates.io/crates/connetto-file-client)
 

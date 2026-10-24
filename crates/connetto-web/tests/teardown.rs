@@ -12,11 +12,16 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{UnsyncedWrite, WriterRef, cipher::ReplicaKey};
+use std::rc::Rc;
+
+use connetto_client::cipher::ReplicaKey;
+use connetto_client::share_keys::share_key_record;
+use connetto_client::{Grant, ShareKeySet, ShareKeyStore, UnsyncedWrite, WriterRef};
+use connetto_core::CapabilitySubject;
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
-use connetto_web::auth::{IdbKeyStore, PendingWork, provision_replica_key};
+use connetto_web::auth::{BuilderKeyStore, IdbKeyStore, PendingWork, provision_replica_key};
 use connetto_web::storage::{
     PendingWipe, ReplicaStorage, WipeError, WipeProgress, hub_meta_db_name, mark_wipe_pending,
     take_pending_wipes, tier_db_name, wipe_replica,
@@ -92,6 +97,15 @@ fn pending_wipe(name: &str) -> PendingWipe {
     PendingWipe::new(name, None)
 }
 
+/// One share set for a test identity, distinct per identity so the wipe's
+/// isolation claim is about a specific value and not about an empty read.
+fn share_set(subject: &str) -> ShareKeySet {
+    ShareKeySet::new::<String>(vec![(
+        Grant::new(format!("connetto-share-grant-{subject}")),
+        CapabilitySubject::new(subject),
+    )])
+}
+
 /// Leave no trace of `name` from an earlier run, so each test starts from nothing
 /// rather than from whatever the last one left in this origin's OPFS.
 async fn reset(storage: &ReplicaStorage, keys: &IdbKeyStore, name: &str) {
@@ -158,6 +172,48 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
         read_marker(&storage, bob, &bob_key),
         MARKER,
         "the other identity's replica still decrypts under its own key"
+    );
+}
+
+/// The share keys ride the replica key's protection, so a wipe of one identity
+/// erases them with it while a second identity keeps its set.
+#[wasm_bindgen_test]
+async fn a_wipe_erases_the_share_keys_of_the_identity_it_names_only() {
+    let storage = ReplicaStorage::install().await;
+    let keys = Rc::new(IdbKeyStore::open().await.expect("open the key store"));
+    let alice = "e3-share-wipe-alice.sqlite";
+    let bob = "e3-share-wipe-bob.sqlite";
+    reset(&storage, &keys, alice).await;
+    reset(&storage, &keys, bob).await;
+
+    // Each identity signs in durable with its own share set beside its key.
+    let adapter = BuilderKeyStore::new(Rc::clone(&keys));
+    let alice_set = share_set("e3-share-alice");
+    let bob_set = share_set("e3-share-bob");
+    ShareKeyStore::save(&adapter, &share_key_record(alice), &alice_set)
+        .await
+        .expect("save alice's share keys");
+    ShareKeyStore::save(&adapter, &share_key_record(bob), &bob_set)
+        .await
+        .expect("save bob's share keys");
+
+    wipe_replica(&storage, keys.as_ref(), alice, None, &work(&[]), false)
+        .await
+        .expect("wipe alice");
+
+    assert_eq!(
+        ShareKeyStore::load(&adapter, &share_key_record(alice))
+            .await
+            .expect("load alice's share keys"),
+        None,
+        "alice's share keys are shredded with her replica"
+    );
+    assert_eq!(
+        ShareKeyStore::load(&adapter, &share_key_record(bob))
+            .await
+            .expect("load bob's share keys"),
+        Some(bob_set),
+        "bob's share keys survive alice's wipe"
     );
 }
 

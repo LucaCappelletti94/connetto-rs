@@ -18,8 +18,13 @@ use tokio::task::JoinHandle;
 const BOUND: Duration = Duration::from_millis(500);
 
 /// How long a stage that must abort is given, which no transport keeping a
-/// bound of its own could answer inside.
+/// bound of its own could answer inside, and how long a local server is
+/// given to finish once its request is answered or aborted.
 const CEILING: Duration = Duration::from_secs(4);
+
+/// How long the whole test may take, in case the runner starves the trickled
+/// link and an attempt the watchdog aborts has to start again.
+const BUDGET: Duration = Duration::from_secs(30);
 
 /// A body past any socket buffer, so a server that stops reading stalls the
 /// pulls the watchdog observes.
@@ -66,24 +71,36 @@ async fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// Drains a chunked body, taking `step` bytes at a time and pausing `pause`
-/// between reads, and answers how many payload bytes arrived, or nothing when
-/// what arrived is not a whole body.
+/// between reads, and answers the largest gap between two of its reads with
+/// how many payload bytes arrived, or nothing when what arrived is not a
+/// whole body.
 ///
 /// Both parameters are what a test sets its link rate with. A pause inside the
 /// bound keeps the pulls coming, and a step that leaves the socket buffers
 /// drainable in a few reads keeps the buffered tail inside the bound as well.
-async fn drain_body(stream: &mut TcpStream, step: usize, pause: Duration) -> Option<usize> {
+/// The read gap is the link's own stall, which a test checks when the
+/// watchdog aborts to tell a starved link from an aborted moving one.
+async fn drain_body(
+    stream: &mut TcpStream,
+    step: usize,
+    pause: Duration,
+) -> (Duration, Option<usize>) {
     let mut buffer = vec![0_u8; step];
     let mut body = Vec::new();
+    let mut last = Instant::now();
+    let mut slowest = Duration::ZERO;
     while !body.ends_with(b"0\r\n\r\n") {
         let read = match stream.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
+        let now = Instant::now();
+        slowest = slowest.max(now.duration_since(last));
+        last = now;
         body.extend_from_slice(&buffer[..read]);
         tokio::time::sleep(pause).await;
     }
-    chunked_payload(&body)
+    (slowest, chunked_payload(&body))
 }
 
 /// How many payload bytes a whole chunked body carries, framing removed, and
@@ -113,14 +130,15 @@ async fn write_reply(stream: &mut TcpStream, reply: &str) {
     let _ = stream.flush().await;
 }
 
-/// A server that reads a request at the trickle rate and then answers it.
-fn trickling_server(listener: TcpListener) -> JoinHandle<Option<usize>> {
+/// A server that reads a request at the trickle rate and then answers it,
+/// keeping the largest gap between its own reads for the test to check.
+fn trickling_server(listener: TcpListener) -> JoinHandle<(Duration, Option<usize>)> {
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
-        let received = drain_body(&mut stream, TRICKLE_READ, TRICKLE_PAUSE).await;
+        let drained = drain_body(&mut stream, TRICKLE_READ, TRICKLE_PAUSE).await;
         write_reply(&mut stream, NO_CONTENT).await;
-        received
+        drained
     })
 }
 
@@ -187,29 +205,71 @@ async fn abort_of<T>(
 /// An upload that keeps moving is never aborted, however long it runs, and
 /// this one runs several times the bound at a rate a total deadline of one
 /// bound would have failed.
+///
+/// The trickled link is a task the runner may starve, and a starved link is a
+/// dead one as far as the watchdog can tell, so the test redoes an attempt the
+/// watchdog aborts when the server's own reads took the bound
+/// between two of them. That gap, on the same monotonic clock the watchdog
+/// keeps, is what tells a starved link from a transport that aborted one
+/// that was still moving.
 #[tokio::test]
 async fn a_trickling_upload_is_never_aborted() {
-    let (listener, address) = local_listener().await;
-    let server = trickling_server(listener);
-    let started = Instant::now();
+    let budget_end = Instant::now() + BUDGET;
+    loop {
+        let (listener, address) = local_listener().await;
+        let mut server = trickling_server(listener);
+        let started = Instant::now();
 
-    let status = transport()
-        .put(&chunk_url(address), vec![7_u8; TRICKLED])
+        let Ok(answer) = tokio::time::timeout(
+            budget_end.duration_since(Instant::now()),
+            transport().put(&chunk_url(address), vec![7_u8; TRICKLED]),
+        )
         .await
-        .map(|reply| reply.status)
-        .expect("a moving upload is never aborted");
+        else {
+            panic!("the runner starved the trickled link for the whole {BUDGET:?}")
+        };
 
-    assert_eq!(status, 204, "the server answered the chunk");
-    assert!(
-        started.elapsed() > BOUND,
-        "the upload must outlast the bound for this to prove anything, took {:?}",
-        started.elapsed()
-    );
-    assert_eq!(
-        server.await.expect("server"),
-        Some(TRICKLED),
-        "every payload byte arrived, framing aside"
-    );
+        match answer {
+            Ok(reply) => {
+                assert_eq!(reply.status, 204, "the server answered the chunk");
+                assert!(
+                    started.elapsed() > BOUND,
+                    "the upload must outlast the bound for this to prove anything, took {:?}",
+                    started.elapsed()
+                );
+                let (_slowest, payload) = tokio::time::timeout(CEILING, &mut server)
+                    .await
+                    .expect("the server is done once it answered the chunk")
+                    .expect("server");
+                assert_eq!(
+                    payload,
+                    Some(TRICKLED),
+                    "every payload byte arrived, framing aside"
+                );
+                return;
+            }
+            Err(HttpFailure::Transport(ReqwestHttpError::Idle { .. })) => {
+                let link_starved = match tokio::time::timeout(CEILING, &mut server).await {
+                    Ok(Ok((slowest, _payload))) => slowest >= BOUND,
+                    Ok(Err(join)) => panic!("the trickling server panicked: {join}"),
+                    Err(_) => {
+                        server.abort();
+                        true
+                    }
+                };
+                if link_starved {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                panic!(
+                    "the trickled link moved at least every {BOUND:?}, so the transport must not have aborted it"
+                );
+            }
+            Err(other) => {
+                panic!("a moving upload is never aborted, it got {other}")
+            }
+        }
+    }
 }
 
 /// A server that stops reading stalls the send, and the send aborts.
@@ -230,7 +290,7 @@ async fn a_stalled_status_wait_aborts_after_the_bound() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
-        drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
+        let _ = drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
         core::future::pending::<()>().await;
     });
 
@@ -278,7 +338,7 @@ async fn a_redirect_reply_is_answered_rather_than_followed() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
-        drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
+        let _ = drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
         write_reply(&mut stream, &reply).await;
     });
 
@@ -319,7 +379,7 @@ async fn a_followed_redirect_is_refused_by_the_address_it_landed_on() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
-        drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
+        let _ = drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
         write_reply(&mut stream, &reply).await;
     });
 
@@ -367,7 +427,7 @@ async fn a_streamed_body_never_lands_on_the_address_a_hop_named() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept");
         read_head(&mut stream).await;
-        drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
+        let _ = drain_body(&mut stream, TRICKLE_READ, Duration::ZERO).await;
         write_reply(&mut stream, &reply).await;
     });
 

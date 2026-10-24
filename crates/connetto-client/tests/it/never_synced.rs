@@ -15,7 +15,9 @@ use std::future::{Future, ready};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, DataDir, SyncSchema};
+use connetto_client::{
+    ClientBuilder, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore, SyncSchema,
+};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
 };
@@ -187,7 +189,11 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open the replica");
@@ -263,7 +269,11 @@ async fn device_private_rows_do_not_wait_on_a_server() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open the replica");
@@ -312,7 +322,11 @@ async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open the replica");
@@ -384,7 +398,11 @@ async fn a_query_watched_with_no_server_answers_and_then_subscribes() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server");
@@ -450,7 +468,11 @@ async fn a_run_that_starts_before_its_server_ends_up_subscribed() {
         )
         .with_sleeper(|d| tokio::time::sleep(d))
         .signed_in(credential)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .connect_with_pump()
         .await
         .expect("connect with the reconnect driver");
@@ -496,7 +518,11 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server");
@@ -581,7 +607,11 @@ async fn a_pin_survives_a_restart_with_no_server() {
             super::support::NeverDial::<Script>::default(),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await
         .expect("open with no server");
@@ -604,7 +634,11 @@ async fn a_pin_survives_a_restart_with_no_server() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen");
@@ -649,7 +683,11 @@ async fn a_subscription_past_its_grace_is_not_re_declared() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open with no server");
@@ -716,7 +754,11 @@ async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() 
             super::support::NeverDial::<Script>::default(),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await
         .expect("open with no server");
@@ -738,7 +780,11 @@ async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() 
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen");
@@ -786,7 +832,11 @@ async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
             super::support::NeverDial::<Script>::default(),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .open_driven()
         .await
         .expect("open with no server");
@@ -807,7 +857,11 @@ async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
         super::support::NeverDial::<Script>::default(),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("reopen");

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use connetto_client::{
     AccessTokenSource, ClientBuilder, ClientError, ClientEvent, DataDir, Grant, HeldCredential,
-    ReconnectPolicy, ReplicaKey,
+    MemoryRefreshStore, ReconnectPolicy, ReplicaKey,
 };
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
@@ -100,6 +100,7 @@ async fn first_boot_with_a_queued_row(
     .durable(
         DataDir::new(dir.to_path_buf()),
         super::support::key_store_with(cred, key.clone()).await,
+        MemoryRefreshStore::default(),
     )
     .connect_driven()
     .await
@@ -172,6 +173,7 @@ async fn each_identity_opens_its_own_replica() {
     .durable(
         data_dir(),
         super::support::key_store_with(&bob, bob_key.clone()).await,
+        MemoryRefreshStore::default(),
     )
     .connect_driven()
     .await
@@ -206,6 +208,7 @@ async fn each_identity_opens_its_own_replica() {
     .durable(
         data_dir(),
         super::support::key_store_with(&bob, alice_key.clone()).await,
+        MemoryRefreshStore::default(),
     )
     .connect_driven()
     .await;
@@ -226,6 +229,7 @@ async fn each_identity_opens_its_own_replica() {
     .durable(
         data_dir(),
         super::support::key_store_with(&alice, alice_key.clone()).await,
+        MemoryRefreshStore::default(),
     )
     .connect_driven()
     .await

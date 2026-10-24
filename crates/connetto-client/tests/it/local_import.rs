@@ -12,7 +12,7 @@
 
 use connetto_client::{
     ArchiveAttachment, ClientBuilder, ClientError, ConnettoConnection, DataDir, ExportScope,
-    ImportChoices, Keep, SyncSchema,
+    ImportChoices, Keep, MemoryRefreshStore, SyncSchema,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -85,7 +85,11 @@ async fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("open replica");

@@ -15,6 +15,7 @@ use connetto_client::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{ReplicaKeyStore, Transport};
+use connetto_web::auth::{BuilderKeyStore, IdbKeyStore};
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use connetto_web::workers::{
     BlobSink, BlobSource, DB_ALIVE_LOCK, request_export, serve_export_requests,
@@ -24,6 +25,7 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
 use std::io::{BufReader, Read};
+use std::rc::Rc;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -117,6 +119,14 @@ fn once<T: Transport + 'static>(
     FirstThen::new(transport, || core::future::ready(Err("spent")))
 }
 
+/// The share keys' store a durable build passes beside the fixture replica
+/// keys, over the real `IndexedDB` key store the worker uses.
+async fn share_store() -> BuilderKeyStore {
+    BuilderKeyStore::new(Rc::new(
+        IdbKeyStore::open().await.expect("open the key store"),
+    ))
+}
+
 /// The replica at `url` under `key`, created when `fresh`, connected over
 /// `transport`.
 async fn connect_at(
@@ -137,6 +147,7 @@ async fn connect_at(
                 exists: !fresh,
             },
             Holding(key),
+            share_store().await,
         )
         .with_gate(Gate::off())
         .connect_driven()
