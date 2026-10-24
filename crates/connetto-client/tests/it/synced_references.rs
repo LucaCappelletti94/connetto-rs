@@ -101,6 +101,7 @@ async fn server(fixture: &Fixture) -> Server {
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_writable(RuntimeWritableCatalog::builder().writable("notes").build())
             .with_replication(["folders", "notes"])
+            .with_policies(POLICIES)
             .with_session(SessionConfig::new().with_schema_version(Some(schema().version()))),
         snapshot,
         auth,

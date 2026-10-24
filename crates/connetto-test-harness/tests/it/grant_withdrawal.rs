@@ -6,24 +6,32 @@
 //! executor in `connetto-server`'s `openfga_live`. What is proven here is the
 //! rest of the sentence: the device stops holding the row.
 //!
-//! **The subscription deliberately carries no membership term.** A term is
-//! served incrementally by the membership move (`R27` decision 2) and the
-//! server suppresses the replacement for exactly that case, so a term here
-//! would prove the other path and pass without the grant ever being consulted.
+//! The subscription carries the policy's term through the read rule the
+//! materializer folds at registration, so the withdrawal arrives as the
+//! membership move (`R27` decision 2). The move takes the rows off the
+//! device live, and the resync it suppresses is the absence asserted at the
+//! end of the test.
 //!
 //! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
 use std::time::Duration;
 
-use connetto_core::messages::{BulkMessage, ControlMessage, FullResyncReason};
+use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::IncomingFrame;
 use connetto_server::Position;
 use connetto_test_harness::fanout::membership_term_fixture;
 use connetto_test_harness::{Client, Fixture, snapshot_rows};
 
+use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value as WireValue};
+
+type Wire = WireValue<String, Vec<u8>>;
+
 /// Long enough for a container round trip, short enough to fail rather than
 /// hang when the replacement never comes.
 const DELIVERY: Duration = Duration::from_secs(30);
+
+/// Silence short enough to trust, long enough not to be a container hiccup.
+const QUIET: Duration = Duration::from_secs(5);
 
 /// Everything the subscription can see, so what arrives is the authorization
 /// answer rather than a filter the client wrote.
@@ -42,6 +50,18 @@ async fn settle_past(client: &mut Client, before: u64) {
             Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(_))) => {
                 client.expect_snapshot("docs").await;
             }
+            // The hidden membership subscription's snapshot (R27 step 5)
+            // is the server's own bookkeeping.
+            Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
+                assert!(
+                    patch.sub_id.starts_with("connetto-membership:"),
+                    "a snapshot patch on the real subscription, got {}",
+                    patch.sub_id
+                );
+            }
+            // The hidden subscription's own live frames settle alongside.
+            Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch)))
+                if patch.sub_id.starts_with("connetto-membership:") => {}
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
                 let at = Position::from_cursor_bytes(patch.cursor.as_bytes())
                     .expect("a live cursor carries a position")
@@ -92,19 +112,71 @@ async fn a_withdrawn_grant_takes_the_row_off_the_device() {
         .exec("DELETE FROM team_members WHERE team_id = 1 AND member = 'alice'")
         .await;
 
-    let (reason, replacement) = alice
-        .try_resync("docs", DELIVERY)
-        .await
-        .expect("a grant taken away has to reach the device, or it reads rows it may not");
-    assert_eq!(
-        reason,
-        FullResyncReason::AuthorizationChange,
-        "the client is told why, so an application can tell a permission change \
-         from a truncated table"
+    // The move takes the rows off live, and every row the device held is one
+    // of the deletions it carries.
+    let mut withdrawn = [false, false];
+    let deadline = tokio::time::Instant::now() + DELIVERY;
+    while !withdrawn.iter().all(|done| *done) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "the move's frames arrive within the delivery window, got {withdrawn:?}"
+        );
+        let frame = tokio::time::timeout(remaining, alice.recv())
+            .await
+            .expect("the move's frames arrive");
+        match frame {
+            Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch)))
+                if !patch.sub_id.starts_with("connetto-membership:") =>
+            {
+                for id in deleted_ids(&patch.patchset_zstd) {
+                    match id {
+                        0 => withdrawn[0] = true,
+                        90 => withdrawn[1] = true,
+                        other => {
+                            panic!("a row the device never held was withdrawn, got {other}")
+                        }
+                    }
+                }
+            }
+            Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(resync))) => {
+                panic!(
+                    "the move suppresses the replacement the withdrawal would \
+                     otherwise cause, got {resync:?}"
+                )
+            }
+            Some(IncomingFrame::Bulk(_) | IncomingFrame::Control(_)) => {}
+            other => panic!("expected a live patch from the move, got {other:?}"),
+        }
+    }
+
+    // The move serves the withdrawal, so the resync it suppresses never
+    // comes.
+    assert!(
+        alice.try_resync("docs", QUIET).await.is_none(),
+        "the move suppresses the replacement the withdrawal would otherwise cause"
     );
-    assert_eq!(
-        snapshot_rows(&replacement),
-        0,
-        "the replacement carries what the caller may see now, which is nothing"
-    );
+}
+
+/// The ids a patchset deletes, read off the delete ops.
+fn deleted_ids(patchset_zstd: &[u8]) -> Vec<i32> {
+    let bytes = zstd::decode_all(patchset_zstd).expect("decompress the patch");
+    let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&bytes).expect("parse the patch")
+    else {
+        panic!("expected a patchset payload");
+    };
+    set.iter()
+        .filter_map(|op| match op {
+            PatchsetOp::Delete { pk, .. } => Some(int_of(&pk[0])),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An integer key straight off the wire.
+fn int_of(value: &Wire) -> i32 {
+    match value {
+        Wire::Integer(id) => i32::try_from(*id).expect("an item id fits"),
+        other => panic!("expected an integer key, got {other:?}"),
+    }
 }

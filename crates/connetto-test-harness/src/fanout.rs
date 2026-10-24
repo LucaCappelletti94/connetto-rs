@@ -844,13 +844,17 @@ async fn provision_with(
         // is the one run that compares nothing.
         Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga, upkeep),
     };
+    // The binary always carries the deployment's caller pairing, so a fixture
+    // that names none gets the canonical one.
+    let caller = caller.unwrap_or_else(caller_mapping);
     let config = ServerConfig::new(engine_ddl.clone(), fixture.admin_url())
+        .with_policies(shape.policies())
         .with_writable(
             RuntimeWritableCatalog::builder()
                 .writable(shape.data_table())
                 .build(),
         )
-        .with_translation(translator, caller)
+        .with_translation(translator, Some(caller))
         .with_replication(shape.published().iter().copied());
     let config = match guard {
         Some(guard) => config.with_guard(guard),

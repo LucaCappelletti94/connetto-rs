@@ -1511,9 +1511,12 @@ type HarnessManager = SessionManager<
 
 /// How to wire a harness server.
 pub struct ServerConfig {
-    /// The Postgres catalog DDL the materializer, write target, and CDC catalog
-    /// are all built from.
+    /// The catalog DDL the write target, snapshot source, and CDC catalog read
+    /// as given. Only the materializer reads the policies beside it.
     pg_ddl: String,
+    /// The row policies beside `pg_ddl` in the materializer's catalog, so the
+    /// engine folds the read rule the shipped server folds.
+    policies: Option<String>,
     /// Which tables accept client mutations, and their version columns.
     writable: RuntimeWritableCatalog,
     /// The admin conninfo the CDC stream connects with. It needs `REPLICATION`.
@@ -1544,6 +1547,7 @@ impl ServerConfig {
     pub fn new(pg_ddl: impl Into<String>, admin_url: impl Into<String>) -> Self {
         Self {
             pg_ddl: pg_ddl.into(),
+            policies: None,
             admin_url: admin_url.into(),
             writable: RuntimeWritableCatalog::default(),
             session: SessionConfig::default(),
@@ -1553,6 +1557,13 @@ impl ServerConfig {
             replication_tables: Vec::new(),
             signer: BoxSigner::noop(),
         }
+    }
+
+    /// The row policies beside the catalog DDL, which only the materializer reads.
+    #[must_use]
+    pub fn with_policies(mut self, policies: impl Into<String>) -> Self {
+        self.policies = Some(policies.into());
+        self
     }
 
     /// Which tables accept client mutations, and their version columns.
@@ -1710,6 +1721,7 @@ pub async fn spawn_server(
 ) -> Server {
     let ServerConfig {
         pg_ddl,
+        policies,
         writable,
         admin_url,
         session,
@@ -1724,12 +1736,14 @@ pub async fn spawn_server(
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
         start_replication_on(&admin_pool, &table_refs).await;
     }
-    // Every catalog below reads `pg_ddl` as given. The caller hands the same
-    // text to the snapshot and the authorization it built, so a table carries
-    // one id in all of them.
+    // The materializer alone reads the policies beside `pg_ddl`, because a folded read rule reads the policy text the engine holds.
     let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
-    let mut materializer_builder = Materializer::builder(&pg_ddl)
+    let materializer_ddl = match policies {
+        Some(policies) => std::borrow::Cow::Owned(format!("{pg_ddl}\n{policies}")),
+        None => std::borrow::Cow::Borrowed(&pg_ddl),
+    };
+    let mut materializer_builder = Materializer::builder(&materializer_ddl)
         .with_write_catalog(writable)
         .with_read_connector(engine_connector);
     if let Some(translator) = translator {
@@ -2289,7 +2303,7 @@ impl Client {
     ///
     /// # Panics
     ///
-    /// Panics when the transport returns a receive error, or when a frame that is neither a `LivePatch` nor a control frame arrives.
+    /// Panics when the transport returns a receive error, or when a frame that is neither a `LivePatch`, a control frame, nor a snapshot patch of the hidden membership subscription arrives.
     pub async fn try_live(&mut self, timeout: Duration) -> Option<LivePatch> {
         if let Some(patch) = self.live_backlog.pop_front() {
             return Some(patch);
@@ -2302,6 +2316,12 @@ impl Client {
             };
             match frame.expect("recv frame") {
                 Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => return Some(patch),
+                // The hidden membership subscription's snapshot (R27 step 5) is the server's own bookkeeping, not a delivery.
+                Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => assert!(
+                    patch.sub_id.starts_with("connetto-membership:"),
+                    "a snapshot patch on a real subscription, got {}",
+                    patch.sub_id
+                ),
                 Some(IncomingFrame::Control(_)) => {}
                 other => panic!("expected a live patch, got {other:?}"),
             }

@@ -2,9 +2,12 @@
 //!
 //! A grant here is a row of a membership table: `items` is visible to a member
 //! of the row's team, so withdrawing access produces **no event at all on the
-//! table the client subscribes to**. Nothing on the change path can hang a
-//! decision on it, which is why the server has to notice the grant itself and
-//! replace what the caller holds.
+//! table the client subscribes to**. Nothing on the change path of `items` can
+//! hang a decision on it, which is why the server has to notice the grant
+//! itself. A member's subscription carries the policy's membership term, so
+//! the server follows the membership through a hidden subscription and takes
+//! the rows off live. A key holder's subscription carries no term, so a share
+//! row it gains or loses replaces what it holds.
 //!
 //! Driven through the real client against the real server, and every assertion
 //! reads the replica rather than a frame: what makes this a leak rather than a
@@ -169,15 +172,41 @@ where
     .expect("a snapshot must complete");
 }
 
-/// Pump until one live patch has been applied.
-async fn pump_to_live<T>(conn: &mut ConnettoConnection<T>)
+/// Pump until one live patch of `sub` has been applied.
+async fn pump_to_live<T>(conn: &mut ConnettoConnection<T>, sub: &str)
 where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    pump_until(conn, |event| matches!(event, ClientEvent::LivePatch { .. }))
-        .await
-        .expect("a live patch must arrive");
+    pump_until(
+        conn,
+        |event| matches!(event, ClientEvent::LivePatch { sub_id, .. } if sub_id == sub),
+    )
+    .await
+    .expect("a live patch must arrive");
+}
+
+/// Pump until the hidden subscription the server opens on `member_table` for
+/// a membership term has delivered its snapshot.
+async fn pump_to_membership<T>(conn: &mut ConnettoConnection<T>, member_table: &str)
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let mut opened: Option<String> = None;
+    pump_until(conn, |event| match event {
+        ClientEvent::MembershipOpened {
+            sub_id,
+            member_table: table,
+        } if table == member_table => {
+            opened = Some(sub_id.clone());
+            false
+        }
+        ClientEvent::SnapshotEnd { sub_id } => opened.as_ref() == Some(sub_id),
+        _ => false,
+    })
+    .await
+    .expect("the membership term's hidden subscription must open");
 }
 
 /// Pump until the server replaces this subscription, returning the reason it
@@ -253,6 +282,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     let mut withdrawn = connect_as(server.attach(), WITHDRAWN).await;
     withdrawn.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut withdrawn).await;
+    pump_to_membership(&mut withdrawn, "team_members").await;
 
     // A row of the team, written after the stream is live. Its arrival also
     // proves the membership above has reached the store, because the stream
@@ -260,7 +290,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (41, 'someone', 1, 'shared')")
         .await;
-    pump_to_live(&mut withdrawn).await;
+    pump_to_live(&mut withdrawn, SUB).await;
     assert_eq!(
         ids(&mut withdrawn),
         vec![41],
@@ -272,6 +302,7 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
     let mut settled = connect_as(server.attach(), SETTLED).await;
     settled.subscribe(SUB, QUERY).await.expect("subscribe");
     pump_to_snapshot_end(&mut settled).await;
+    pump_to_membership(&mut settled, "team_members").await;
     assert_eq!(ids(&mut settled), vec![41], "both members see the row");
 
     fixture
@@ -279,10 +310,21 @@ async fn a_withdrawn_grant_takes_the_rows_off_the_device() {
             "DELETE FROM team_members WHERE member = '{WITHDRAWN}'"
         ))
         .await;
+    // The membership move takes the row off live, so no replacement is owed.
+    let mut replaced = None;
+    pump_until(&mut withdrawn, |event| match event {
+        ClientEvent::FullResync { reason, .. } => {
+            replaced = Some(reason.clone());
+            false
+        }
+        ClientEvent::LivePatch { sub_id, .. } => sub_id == SUB,
+        _ => false,
+    })
+    .await
+    .expect("the withdrawal has to reach the client");
     assert_eq!(
-        pump_to_resync(&mut withdrawn).await,
-        Some(FullResyncReason::AuthorizationChange),
-        "the withdrawal has to reach the client, naming its real cause"
+        replaced, None,
+        "the membership move serves the withdrawal, so the subscription is not replaced"
     );
     assert_eq!(
         ids(&mut withdrawn),
@@ -351,6 +393,7 @@ async fn three_bearers(
         .await
         .expect("subscribe");
     pump_to_snapshot_end(&mut owner).await;
+    pump_to_membership(&mut owner, "paper_shares").await;
     assert_eq!(
         paper_ids(&mut owner),
         vec![1, 2, 3],

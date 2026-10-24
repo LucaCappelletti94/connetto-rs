@@ -23,6 +23,11 @@ use connetto_test_harness::{
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 
+/// The row policy beside the catalog, for the materializer's folded read rule.
+const POLICIES: &str = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+     CREATE POLICY notes_p ON notes \
+     USING (owner = current_setting('app.user_id', true));";
+
 /// Two of alice's rows in a table the change stream carries.
 async fn provision(fixture: &Fixture) {
     fixture
@@ -55,6 +60,7 @@ async fn spawn(fixture: &Fixture) -> connetto_test_harness::Server {
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
     spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
+            .with_policies(POLICIES)
             .with_writable(RuntimeWritableCatalog::builder().build())
             .with_replication(["notes"]),
         snapshot,

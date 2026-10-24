@@ -29,6 +29,17 @@ const PG_DDL: &str = "\
 CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT);\
 CREATE TABLE note_shares (note_id INT, viewer TEXT, PRIMARY KEY (note_id, viewer));";
 
+/// The row policies beside the catalog, for the materializer's folded read rule.
+const POLICIES: &str = "\
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+CREATE POLICY notes_p ON notes USING ( \
+   owner = current_setting('app.user_id', true) \
+   OR EXISTS (SELECT 1 FROM note_shares s WHERE s.note_id = notes.id \
+              AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')))); \
+ALTER TABLE note_shares ENABLE ROW LEVEL SECURITY; \
+CREATE POLICY shares_read ON note_shares FOR SELECT USING ( \
+   viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')));";
+
 const REPLICA_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
 
 /// The key alice grants over notes 1 and 3, and nothing else.
@@ -99,7 +110,9 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let server = spawn_server(
-        ServerConfig::new(PG_DDL, fixture.admin_url()).with_replication(["notes"]),
+        ServerConfig::new(PG_DDL, fixture.admin_url())
+            .with_policies(POLICIES)
+            .with_replication(["notes"]),
         PgSnapshotSource::from_ddl(writer_pool.clone(), PG_DDL).expect("snapshot source"),
         HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth")),
         writer_pool,
