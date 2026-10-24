@@ -88,7 +88,6 @@ pub mod reconnect;
 pub mod replica;
 pub mod share_keys;
 mod subscriptions;
-mod synced_schema;
 
 #[cfg(feature = "peer")]
 pub use bluetooth::{
@@ -190,10 +189,6 @@ pub enum ClientError {
     /// Applying a server patch to the local replica failed.
     #[error("apply error: {0}")]
     Apply(String),
-    /// The replica's schema did not parse as SQLite, so its synced tables'
-    /// references could not be removed.
-    #[error("replica schema: {0}")]
-    Schema(String),
     /// A local database operation failed.
     #[error(transparent)]
     Db(#[from] diesel::result::Error),
@@ -3308,7 +3303,7 @@ fn install_replica_schema(
     config: &ClientConfig,
 ) -> Result<(), ClientError> {
     if let Some(ddl) = sqlite_ddl {
-        db.batch_execute(&synced_schema::without_references(ddl)?)?;
+        db.batch_execute(ddl)?;
     }
     // The views are what the map has to agree with.
     check_policy_tables(db, &config.policy_tables)?;

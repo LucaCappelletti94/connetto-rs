@@ -11,6 +11,7 @@ fn main() {
         std::path::Path::new("../../dioxus-desktop-demo/schema.sql"),
         std::path::Path::new("../../dioxus-desktop-demo/policies.sql"),
         None,
+        &[],
     )
     .expect("translate the demo's schema");
 

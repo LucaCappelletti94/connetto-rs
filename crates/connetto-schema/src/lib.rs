@@ -12,7 +12,8 @@
 //! and its server agree on the version iff the pg2sqlite that built each of
 //! them emitted the same replica DDL for the same sources.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use connetto_core::bots::BotRegistryIdSql;
@@ -33,10 +34,13 @@ use pg2sqlite::prelude::{
     Pg2Sqlite, Pg2SqliteOptions, Script, SessionVariableMapping, UuidRepresentation,
 };
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, CreateTable, CreateView, ObjectNamePart, Statement,
+    AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, CreateView, Expr,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement,
+    TableConstraint, Value, ValueWithSpan, visit_expressions, visit_relations,
 };
 use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::{Location, Token};
 use thiserror::Error;
 
 diesel::table! {
@@ -71,6 +75,22 @@ pub enum SchemaError {
     /// The step ran outside a cargo build script.
     #[error("OUT_DIR is unset, so the bundle cannot be written from here")]
     MissingOutDir,
+    /// The shared table list names a table the synced schema does not declare.
+    #[error("the shared table list names `{table}`, which the synced schema does not declare")]
+    SharedTableUndeclared {
+        /// The listed name.
+        table: String,
+    },
+    /// A listed table's rows differ by caller, so one copy cannot serve every
+    /// account on a device.
+    #[error("`{table}` cannot be shared, because its policy `{policy}` reads the caller")]
+    SharedTableReadsCaller {
+        /// The listed table.
+        table: String,
+        /// The policy on it that reads the caller, directly or through a
+        /// table it reads.
+        policy: String,
+    },
 }
 
 /// The tables the schema document creates, in document order.
@@ -165,6 +185,132 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
     out
 }
 
+/// The listed tables, as the schema declares them, that a device may store
+/// once for every account.
+///
+/// A table qualifies only when every caller reads the same rows of it, since
+/// a withdrawal reaches its caller as a plain delete and would take a row out
+/// of the one copy another account still reads. A deployment policy reading
+/// any session setting but the bot list reads the caller, and so does one
+/// reading a table whose own policy does, because Postgres applies that
+/// table's policy inside the subquery.
+///
+/// # Errors
+///
+/// [`SchemaError::SharedTableUndeclared`] for a name the synced schema does
+/// not declare, [`SchemaError::SharedTableReadsCaller`] for a table whose
+/// rows differ by caller, and [`SchemaError::Translate`] when a document does
+/// not parse.
+pub fn shared_tables<Id: BotRegistryIdSql>(
+    schema_sql: &str,
+    policies_sql: &str,
+    tables: &[&str],
+) -> Result<Vec<String>, SchemaError> {
+    let schema_sql = with_registry::<Id>(schema_sql);
+    let declared = schema_tables(&schema_sql)?;
+    let mut per_caller = per_caller_tables(&[&schema_sql, policies_sql])?;
+    let mut shared: Vec<String> = Vec::new();
+    for listed in tables {
+        let table = declared
+            .iter()
+            .find(|declared| declared.eq_ignore_ascii_case(listed))
+            .ok_or_else(|| SchemaError::SharedTableUndeclared {
+                table: (*listed).to_owned(),
+            })?;
+        if let Some(policy) = per_caller.remove(&table.to_lowercase()) {
+            return Err(SchemaError::SharedTableReadsCaller {
+                table: table.clone(),
+                policy,
+            });
+        }
+        if !shared.contains(table) {
+            shared.push(table.clone());
+        }
+    }
+    Ok(shared)
+}
+
+/// Every table whose rows differ by caller, lowercased, mapped to the policy
+/// that makes them differ.
+fn per_caller_tables(documents: &[&str]) -> Result<BTreeMap<String, String>, SchemaError> {
+    /// What one policy reads.
+    struct Reads {
+        table: String,
+        policy: String,
+        caller: bool,
+        tables: BTreeSet<String>,
+    }
+    let mut policies = Vec::new();
+    for document in documents {
+        for statement in parse(document, "a source document")? {
+            let Statement::CreatePolicy(policy) = statement else {
+                continue;
+            };
+            let Some(table) = table_name(&policy.table_name) else {
+                continue;
+            };
+            let mut reads = Reads {
+                table: table.to_lowercase(),
+                policy: policy.name.value,
+                caller: false,
+                tables: BTreeSet::new(),
+            };
+            for expr in policy.using.iter().chain(&policy.with_check) {
+                reads.caller |= reads_caller(expr);
+                let _ = visit_relations(expr, |relation| {
+                    if let Some(name) = table_name(relation) {
+                        reads.tables.insert(name.to_lowercase());
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+            policies.push(reads);
+        }
+    }
+    let mut per_caller = BTreeMap::new();
+    loop {
+        let known = per_caller.len();
+        for reads in &policies {
+            if !per_caller.contains_key(&reads.table)
+                && (reads.caller || reads.tables.iter().any(|t| per_caller.contains_key(t)))
+            {
+                per_caller.insert(reads.table.clone(), reads.policy.clone());
+            }
+        }
+        if per_caller.len() == known {
+            return Ok(per_caller);
+        }
+    }
+}
+
+/// Whether `expr` reads a session setting other than the bot list, which is
+/// how a policy reads the caller's identity or the keys it holds.
+fn reads_caller(expr: &Expr) -> bool {
+    visit_expressions(expr, |expr| match expr {
+        Expr::Function(function) if reads_a_caller_setting(function) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// Whether `function` is `current_setting` over anything but the bot list.
+fn reads_a_caller_setting(function: &Function) -> bool {
+    if !table_name(&function.name).is_some_and(|name| name.eq_ignore_ascii_case("current_setting"))
+    {
+        return false;
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return true;
+    };
+    !matches!(
+        list.args.first(),
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(setting),
+            ..
+        })))) if setting == BOT_LIST_SETTING
+    )
+}
+
 /// Translate the two Postgres source documents with connetto's fixed options
 /// and return the bundle they produce.
 ///
@@ -174,7 +320,9 @@ pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
 /// constants. `K` names the capability key type, which fixes the subjects
 /// setting and separator the mapping holds. The documents are translated in
 /// the order schema, policies and the [`cap_policies`] the pair generates, so
-/// the replica holds the cap its Postgres source holds. The replica DDL is
+/// the replica holds the cap its Postgres source holds. The schema reaches the
+/// replica translation without its references, which the server alone
+/// enforces, while the bundle keeps the source as written. The replica DDL is
 /// applied to a throwaway in-memory database first, so a translation SQLite
 /// refuses is an error here rather than a boot-time failure on the client.
 ///
@@ -188,7 +336,7 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
 ) -> Result<SchemaBundle, SchemaError> {
     let schema_sql = with_registry::<Id>(schema_sql);
     let options = options::<K>();
-    let mut translator = parsed_documents(&schema_sql, policies_sql)?;
+    let mut translator = parsed_documents(&without_references(&schema_sql)?, policies_sql)?;
     let cap = cap_policies_inner(&schema_sql, policies_sql)?;
     if !cap.is_empty() {
         translator = translator
@@ -218,13 +366,136 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     ))
 }
 
+/// `schema_sql` with every column `REFERENCES` and table `FOREIGN KEY` clause
+/// removed.
+///
+/// A replica is a partial copy, so visibility, paging and eviction all leave
+/// a child without its parent, and SQLite enforcing the server's references
+/// there could only refuse what the server already accepted (R92). A
+/// statement declaring one is rendered back from its parsed form without it,
+/// an `ALTER TABLE` adding nothing else is dropped, and every other statement
+/// passes through as its source text.
+fn without_references(schema_sql: &str) -> Result<String, SchemaError> {
+    let unparsable = |err: ParserError| {
+        SchemaError::Translate(format!("the schema document does not parse: {err}"))
+    };
+    let mut parser = Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(schema_sql)
+        .map_err(unparsable)?;
+    let lines = line_starts(schema_sql);
+    let mut out = String::with_capacity(schema_sql.len());
+    loop {
+        while parser.consume_token(&Token::SemiColon) {}
+        let start = parser.peek_token_ref();
+        if start.token == Token::EOF {
+            return Ok(out);
+        }
+        let from = offset(schema_sql, &lines, start.span.start);
+        let mut statement = parser.parse_statement().map_err(unparsable)?;
+        match drop_references(&mut statement) {
+            Dropped::Nothing => {
+                let to = offset(schema_sql, &lines, parser.get_current_token().span.end);
+                out.push_str(&schema_sql[from..to]);
+            }
+            Dropped::Some => out.push_str(&statement.to_string()),
+            Dropped::All => continue,
+        }
+        out.push_str(";\n");
+    }
+}
+
+/// What removing a statement's references left of it.
+enum Dropped {
+    /// It declared none.
+    Nothing,
+    /// It declared some and keeps the rest.
+    Some,
+    /// It declared nothing else.
+    All,
+}
+
+/// Remove the references `statement` declares.
+fn drop_references(statement: &mut Statement) -> Dropped {
+    let mut dropped = false;
+    match statement {
+        Statement::CreateTable(table) => {
+            table.constraints.retain(|constraint| {
+                let reference = matches!(constraint, TableConstraint::ForeignKey(_));
+                dropped |= reference;
+                !reference
+            });
+            for column in &mut table.columns {
+                dropped |= drop_column_references(column);
+            }
+        }
+        Statement::AlterTable(alter) => {
+            alter.operations.retain_mut(|operation| match operation {
+                AlterTableOperation::AddConstraint {
+                    constraint: TableConstraint::ForeignKey(_),
+                    ..
+                } => {
+                    dropped = true;
+                    false
+                }
+                AlterTableOperation::AddColumn { column_def, .. } => {
+                    dropped |= drop_column_references(column_def);
+                    true
+                }
+                _ => true,
+            });
+            if alter.operations.is_empty() {
+                return Dropped::All;
+            }
+        }
+        _ => {}
+    }
+    if dropped {
+        Dropped::Some
+    } else {
+        Dropped::Nothing
+    }
+}
+
+/// Remove a column's `REFERENCES`, reporting whether it had one.
+fn drop_column_references(column: &mut ColumnDef) -> bool {
+    let before = column.options.len();
+    column
+        .options
+        .retain(|option| !matches!(option.option, ColumnOption::ForeignKey(_)));
+    column.options.len() != before
+}
+
+/// The byte offset each line of `text` starts at.
+fn line_starts(text: &str) -> Vec<usize> {
+    core::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect()
+}
+
+/// The byte offset of a tokenizer location, whose line and column both count
+/// from one and whose column counts characters.
+fn offset(text: &str, lines: &[usize], at: Location) -> usize {
+    let line = usize::try_from(at.line)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
+    let column = usize::try_from(at.column)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
+    let start = lines.get(line).copied().unwrap_or(text.len());
+    text[start..]
+        .char_indices()
+        .nth(column)
+        .map_or(text.len(), |(at, _)| start + at)
+}
+
 /// The build-script entry point.
 ///
 /// Reads the two Postgres source documents, translates the synced tier and,
 /// when `local_tier` is given, the demo's own local tier as a separate
 /// reference universe, validates both DDLs against a throwaway SQLite
-/// database, and writes `connetto-schema.rs` under `OUT_DIR`. It prints
-/// `cargo::rerun-if-changed` for every file it reads.
+/// database, checks `shared` under [`shared_tables`], and writes
+/// `connetto-schema.rs` under `OUT_DIR`. It prints `cargo::rerun-if-changed`
+/// for every file it reads.
 ///
 /// The application that ships the schema includes the file and reads the
 /// bundle through the module it defines:
@@ -243,19 +514,22 @@ pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
 /// SQL the deployment applies beside its schema and policies.
 /// # Errors
 ///
-/// As [`translate`], plus [`SchemaError::MissingOutDir`] outside a build
-/// script and [`SchemaError::Sqlite`] for a refused local tier.
+/// As [`translate`] and [`shared_tables`], plus [`SchemaError::MissingOutDir`]
+/// outside a build script and [`SchemaError::Sqlite`] for a refused local
+/// tier.
 pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema: &Path,
     policies: &Path,
     local_tier: Option<&Path>,
+    shared: &[&str],
 ) -> Result<(), SchemaError> {
     println!("cargo::rerun-if-changed={}", schema.display());
     println!("cargo::rerun-if-changed={}", policies.display());
     let schema_sql = std::fs::read_to_string(schema)?;
     let policies_sql = std::fs::read_to_string(policies)?;
     let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
-    let mut bundle = translate::<K, Id>(&schema_sql, &policies_sql)?;
+    let mut bundle = translate::<K, Id>(&schema_sql, &policies_sql)?
+        .with_shared_tables(shared_tables::<Id>(&schema_sql, &policies_sql, shared)?);
     if let Some(local_tier) = local_tier {
         println!("cargo::rerun-if-changed={}", local_tier.display());
         let tier_sql = std::fs::read_to_string(local_tier)?;
@@ -455,17 +729,8 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
     } else {
         format!("&[\n            {tables}\n        ]")
     };
-    let views = bundle
-        .policy_views()
-        .iter()
-        .map(|view| raw_literal(view))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let views = if views.is_empty() {
-        "&[]".to_string()
-    } else {
-        format!("&[{views}]")
-    };
+    let views = borrowed_slice(bundle.policy_views());
+    let shared = borrowed_slice(bundle.shared_tables());
     format!(
         "// Generated by connetto_schema::emit. Do not edit.\n\
          #[doc(hidden)]\n\
@@ -484,6 +749,8 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
          pub const POLICY_TABLES: &[(&str, &str)] = {tables};\n\
          /// Every view the translation emitted.\n\
          pub const POLICY_VIEWS: &[&str] = {views};\n\
+         /// The tables a device stores once for every account.\n\
+         pub const SHARED_TABLES: &[&str] = {shared};\n\
          /// The schema bundle this build translated from its own Postgres\n\
          /// sources. The version is the hash of exactly these contents.\n\
          #[must_use]\n\
@@ -496,6 +763,7 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
              POLICY_VIEWS.iter().copied(),\n\
              LOCAL_TIER_DDL,\n\
          )\n\
+         .with_shared_tables(SHARED_TABLES.iter().copied())\n\
          }}\n\
          }}\n",
         raw_literal(bundle.schema_source()),
@@ -503,6 +771,16 @@ fn render(bundle: &SchemaBundle, cap: &str) -> String {
         raw_literal(bundle.replica_ddl()),
         raw_literal(cap),
     )
+}
+
+/// `names` as a borrowed slice literal of raw strings.
+fn borrowed_slice(names: &[String]) -> String {
+    let names = names
+        .iter()
+        .map(|name| raw_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("&[{names}]")
 }
 
 /// Wrap `text` in a Rust raw string literal, adding `#`s until the closing
@@ -782,5 +1060,111 @@ mod tests {
             source.contains("pub const POLICY_VIEWS: &[&str] = &[];"),
             "zero views still emit a borrowed slice: {source}"
         );
+    }
+
+    /// A deployment schema with a public table, a constant-policy table, an
+    /// owned table, a keyed table and a table whose policy reads the owned one.
+    const SHARING_SCHEMA: &str = "CREATE TABLE words (id INT PRIMARY KEY, word TEXT); \
+                                  CREATE TABLE posts (id INT PRIMARY KEY, published BOOLEAN); \
+                                  CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT); \
+                                  CREATE TABLE papers (id INT PRIMARY KEY, viewer TEXT); \
+                                  CREATE TABLE tags (id INT PRIMARY KEY, note_id INT);";
+
+    /// The policies [`SHARING_SCHEMA`] carries.
+    fn sharing_policies() -> String {
+        let keys = <String as CapabilityKey>::SETTING;
+        format!(
+            "ALTER TABLE posts ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY posts_p ON posts FOR SELECT USING (published); \
+             ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY notes_p ON notes FOR ALL USING \
+               (owner = current_setting('app.user_id', true)); \
+             ALTER TABLE papers ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY papers_p ON papers FOR SELECT USING \
+               (viewer = ANY(string_to_array(current_setting('{keys}', true), ','))); \
+             ALTER TABLE tags ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY tags_p ON tags FOR SELECT USING \
+               (EXISTS (SELECT 1 FROM notes n WHERE n.id = tags.note_id));"
+        )
+    }
+
+    fn shared(tables: &[&str]) -> Result<Vec<String>, SchemaError> {
+        shared_tables::<connetto_core::bots::TextIds>(SHARING_SCHEMA, &sharing_policies(), tables)
+    }
+
+    /// A table every caller reads in full is shareable, whether it carries no
+    /// policy of its own or one naming neither the caller nor its keys.
+    #[test]
+    fn caller_independent_tables_are_shareable() {
+        assert_eq!(
+            shared(&["Words", "posts"]).expect("both are shareable"),
+            ["words", "posts"]
+        );
+    }
+
+    /// A policy reading the caller makes the table's rows differ by account.
+    #[test]
+    fn a_table_whose_policy_reads_the_caller_is_refused() {
+        assert!(matches!(
+            shared(&["words", "notes"]),
+            Err(SchemaError::SharedTableReadsCaller { table, policy })
+                if table == "notes" && policy == "notes_p"
+        ));
+    }
+
+    /// A policy reading the keys the caller holds is refused the same way.
+    #[test]
+    fn a_table_whose_policy_reads_the_keys_is_refused() {
+        assert!(matches!(
+            shared(&["papers"]),
+            Err(SchemaError::SharedTableReadsCaller { table, policy })
+                if table == "papers" && policy == "papers_p"
+        ));
+    }
+
+    /// Postgres applies the read table's own policy inside a policy's
+    /// subquery, so reading a per-caller table makes this one per-caller too.
+    #[test]
+    fn a_table_whose_policy_reads_a_per_caller_table_is_refused() {
+        assert!(matches!(
+            shared(&["tags"]),
+            Err(SchemaError::SharedTableReadsCaller { table, policy })
+                if table == "tags" && policy == "tags_p"
+        ));
+    }
+
+    /// A name the synced schema does not declare is refused rather than
+    /// silently shared as nothing.
+    #[test]
+    fn an_undeclared_table_is_refused() {
+        assert!(matches!(
+            shared(&["drafts"]),
+            Err(SchemaError::SharedTableUndeclared { table }) if table == "drafts"
+        ));
+    }
+
+    /// The replica a translation produces carries no synced reference, and
+    /// it is the replica the same schema written without references produces,
+    /// while the source the server enforces keeps its keys.
+    #[test]
+    fn the_replica_translation_drops_references_and_keeps_the_rest() {
+        let with = "CREATE TABLE folders (id INT PRIMARY KEY, code TEXT UNIQUE); \
+                    CREATE TABLE notes (id INT PRIMARY KEY, \
+                      folder_id INT NOT NULL REFERENCES folders(id) ON DELETE CASCADE, \
+                      code TEXT, label TEXT DEFAULT 'x' CHECK (label <> ''), \
+                      CONSTRAINT to_code FOREIGN KEY (code) REFERENCES folders(code)); \
+                    CREATE TABLE pins (id INT PRIMARY KEY, note_id INT); \
+                    ALTER TABLE pins ADD CONSTRAINT to_note FOREIGN KEY (note_id) REFERENCES notes(id);";
+        let without = "CREATE TABLE folders (id INT PRIMARY KEY, code TEXT UNIQUE); \
+                       CREATE TABLE notes (id INT PRIMARY KEY, folder_id INT NOT NULL, \
+                         code TEXT, label TEXT DEFAULT 'x' CHECK (label <> '')); \
+                       CREATE TABLE pins (id INT PRIMARY KEY, note_id INT);";
+        let bundle = translate::<String, connetto_core::bots::TextIds>(with, "")
+            .expect("translates with references");
+        let plain = translate::<String, connetto_core::bots::TextIds>(without, "")
+            .expect("translates without references");
+        assert_eq!(bundle.replica_ddl(), plain.replica_ddl());
+        assert!(bundle.schema_source().contains("REFERENCES folders(id)"));
+        assert!(bundle.schema_source().contains("REFERENCES notes(id)"));
     }
 }
