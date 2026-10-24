@@ -82,7 +82,7 @@ A spawn announces its boot and keeps answering for it, because a broadcast is no
 
 Durable share-key records stay outside the encrypted replica under the secret store's gate and are reserved from account enumeration. Construction merges stored and builder pairs, excludes expired grants, and folds the store's protection into custody. Forgetting an identity clears its share-key record.
 
-Expiry remains active while connected, offline or dialing. A locked gate defers the secret-store write while local authorization loses the expired grant, and unlocking persists the deferred set. Replacement refusals preserve the accepted local set and observe the server's retry delay. An elapsed retry waits on any outstanding declaration fence without arming an immediate wake.
+Native and browser drivers prepare authorization before selecting waits and keep expiry, retry and correlated-answer deadlines active while connected, recovering or waiting for content. A locked gate defers secret persistence while expiry removes local authorization, and approval saves the deferred set. Refusals preserve the accepted local set and the server's retry floor, including when a declaration fence remains outstanding.
 
 The replica persists its cursor together with `cursor_subjects`, with `None` meaning unknown and `Some([])` meaning completed empty coverage. Key changes and authorization resends persist unknown before backing rows change, and overlapping subscriptions share one table clear per attach or replacement batch. A handshake or replacement acknowledgment cannot publish known coverage until every declaration fence and row delivery has completed.
 
