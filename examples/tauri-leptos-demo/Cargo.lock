@@ -946,7 +946,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "web-sys",
+ "wasm-bindgen",
  "webbrowser",
  "windows-native-keyring-store",
  "zbus",

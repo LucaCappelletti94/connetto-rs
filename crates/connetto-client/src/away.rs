@@ -132,15 +132,16 @@ fn instant_monotonic() -> Duration {
     std::time::Instant::now().duration_since(*REFERENCE)
 }
 
-/// The sleep-counting monotonic reading on the browser, in milliseconds since
-/// the page's time origin.
+/// The browser monotonic reading relative to the current global time origin.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn monotonic() -> Duration {
-    let millis = web_sys::window()
-        .and_then(|w| w.performance())
-        .map_or(0.0, |p| p.now());
-    // Millis since the time origin, a non-negative integer-valued float within
-    // u64, so the truncating cast loses nothing.
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = performance, js_name = now)]
+        fn performance_now() -> f64;
+    }
+    let millis = performance_now();
+    // Browser deadlines use whole milliseconds.
     debug_assert!(
         millis.is_finite() && millis >= 0.0,
         "performance.now is not a valid reading"

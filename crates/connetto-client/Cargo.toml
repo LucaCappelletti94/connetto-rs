@@ -301,7 +301,7 @@ sqlite-wasm-rs = { version = "0.5", default-features = false, features = [
 # Date.now() the wall, so the away/return re-check (R94) measures time away
 # without SystemTime, which panics on wasm.
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Performance"] }
+wasm-bindgen = "0.2"
 # The builder's uuidv4() installer mints a v4 id through the browser's
 # crypto.getRandomValues, which the uuid crate only wires up behind this
 # feature on wasm (the native getrandom path is the default there).
