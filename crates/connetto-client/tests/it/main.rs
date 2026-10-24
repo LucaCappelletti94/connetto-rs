@@ -113,6 +113,8 @@ mod synced_schema;
 #[cfg(feature = "native-auth")]
 mod teardown;
 
+mod tier_majors;
+
 mod truncate_resync;
 
 mod uuid_rls_default;

@@ -432,6 +432,7 @@ dependencies = [
 name = "connetto-core"
 version = "0.0.0"
 dependencies = [
+ "diesel",
  "futures-util",
  "rmp-serde",
  "rustls",

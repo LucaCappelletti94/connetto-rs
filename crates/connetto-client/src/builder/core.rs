@@ -375,6 +375,7 @@ pub(crate) fn build_config(
         .with_caller(CALLER_FUNCTION, caller)
         .with_schema_version(Some(schema.version()))
         .with_schema_major(Some(schema.major()))
+        .with_tier_plan(schema.tier_plan())
         .with_sql_functions(schema.sql_functions().clone())
         .with_policy_tables(schema.policy_tables().clone())
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
