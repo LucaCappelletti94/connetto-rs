@@ -626,6 +626,23 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_store_key_is_gated_and_rides_the_launch_prompt() {
+        let (gate, fake) = gate(Script::default());
+        let shared = crate::shared_store_name(crate::REPLICA_PREFIX);
+        gate.write(KEY, "key").expect("store the replica key");
+        gate.write(&shared, "device")
+            .expect("store the shared store's key");
+        assert_eq!(fake.storage_of(&shared), Some(Storage::Gated));
+        gate.read(KEY).expect("open the replica");
+        gate.read(&shared).expect("attach the shared store");
+        assert_eq!(
+            fake.prompts(),
+            1,
+            "the shared store opens on the replica's approval"
+        );
+    }
+
+    #[test]
     fn a_launch_prompts_once_at_the_first_gated_read_and_the_ask_then_needs_none() {
         let (gate, fake) = gate(Script::default());
         gate.write(KEY, "key").expect("create raises no prompt");

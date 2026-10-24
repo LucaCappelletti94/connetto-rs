@@ -326,7 +326,7 @@ proptest! {
                 .expect("read the references");
         prop_assert_eq!(references[0].rows, 0);
         let stored: Vec<StoredSql> =
-            diesel::sql_query("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+            diesel::sql_query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
                 .bind::<diesel::sql_types::Text, _>(name)
                 .load(replica.conn())
                 .expect("read the stored table");

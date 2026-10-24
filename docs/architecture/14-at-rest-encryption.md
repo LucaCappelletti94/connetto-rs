@@ -260,13 +260,32 @@ The browser codec intercepts as a VFS shim, so a database must be opened through
 
 **Built (R92).** `PRAGMA foreign_keys = ON` follows R18's hardening on every open, reconnects included, through `SqliteConnection::set_foreign_keys_enabled` in `open_inner`, and before the first statement that writes a row. Enforcement is connection state, and native SQLite enforces by compile default while the browser build does not, so connetto sets it on both. It precedes the replica DDL, which runs with every synced `REFERENCES` and `FOREIGN KEY` clause removed (R92 decision 1), so it governs the device-local tier's references alone. Two transactions move every check to their commit with `PRAGMA defer_foreign_keys = ON`, which SQLite clears at the commit or the rollback. They are the archive import (`apply_import_with_bookkeeping`) and the relay hub's replay of a tab's tier mutation.
 
-**Built.** An attached database inherits the connection's derived key, not a key the `ATTACH` statement names. This was measured rather than assumed (see `Replica::with_tier` in `crates/connetto-client/src/replica.rs` and the tests in `crates/connetto-client/tests/encrypted_replica.rs`). Two consequences:
+**Built.** A bare `ATTACH` gives the attached database the connection's derived key. A database it creates takes the main database's key salt, and an existing one is read under the main database's derived key. Measured on both codecs (see `Replica::with_tier` in `crates/connetto-client/src/replica.rs` and the tests in `crates/connetto-client/tests/encrypted_replica.rs`). One consequence follows.
 
 A local tier must be first-booted through the replica connection, which is what `Replica::with_tier` asks for, so both databases share the same key salt. A tier file created by any other connection carries its own salt and will fail to decrypt through the replica connection. A later run says `with_existing_tier` and it works because the salt already matches from the first boot. **Built (R3):** the tier is named on the replica rather than attached afterwards, which is what makes a durable tier beside an unkeyed replica unrepresentable.
 
-`PRAGMA key` in raw hex form cannot re-key an attached database to a different key. Only a passphrase form re-derives from the attached file's own salt, and the per-replica key is raw bytes, not a passphrase.
+**Built (R11).** An attached database can carry a key of its own, given as the `KEY` clause's text `x'<64 hex digits>'`, which both codecs apply to that database alone as a raw key. `harden::attach_keyed_in_window` attaches that way, and it is how every identity's connection reaches the shared public store under the device-scoped key. The same bytes given as a blob literal are taken for a passphrase and run through the KDF into a different key, and `PRAGMA <schema>.key` after the attach is ignored by SQLCipher once the schema was read while sqlite3mc applies it to the live schema and fails it with `SQLITE_NOTADB`. Neither is used.
 
-**Browser constraint (Built).** `sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it (R43, `crates/connetto-web/tests/local_tier_one_handle.rs`). It inherits the replica connection's key and its enforcement of references with the attachment.
+**Browser constraint (Built).** `sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it (R43, `crates/connetto-web/tests/local_tier_one_handle.rs`). It inherits the replica connection's key and its enforcement of references with the attachment. The shared public store is attached to the same connection, under its own key (R11, designed).
+
+---
+
+## Codec and pragma API ownership
+
+R11's device-key slice may land with connetto's local codec statements. Their removal is required once [`diesel-sqlite-cipher`](https://github.com/LucaCappelletti94/diesel-sqlite-cipher) and Diesel's [typed SQLite pragmas](https://github.com/diesel-rs/diesel/pull/5259) are usable together in connetto's dependency pins on native and browser targets. The prerequisite includes borrowed quoted text and secret-safe query diagnostics. Compatible fork pins can satisfy it without a published Diesel release.
+
+| Owner | Required cleanup |
+|---|---|
+| `diesel-sqlite-cipher` | Replace `cipher.rs`'s `raw_key_literal`, `unlock_statement`, `CIPHER_PRAGMAS` and raw codec probes with typed codec operations. Remove the local key formatting and codec-specific pragma SQL. |
+| `diesel-sqlite-cipher` | Replace the raw keyed attachment statement inside `harden::attach_keyed_in_window`. Keep connetto's attachment permission window and resealing on success and failure. |
+| Diesel | Replace raw `journal_mode`, `case_sensitive_like` and `defer_foreign_keys` statements in `connetto-client/src/lib.rs`, and the `schema_cookie` and `harden::attached_count` pragma queries, with typed APIs. Remove obsolete pragma result structs and formatting. |
+| Diesel | Replace `table_info` in `connetto-web/src/relay.rs`'s `tier_columns` and its transaction's `defer_foreign_keys` statement with typed APIs. Remove obsolete pragma result structs and formatting. |
+
+Connetto retains key custody, store naming, unlock ordering, wrong-key validation, attachment hardening and browser VFS selection. Existing typed Diesel calls stay typed. Deployment DDL emitted by pg2sqlite remains pg2sqlite's responsibility. Remove obsolete helpers and comments throughout the consumers without retaining a parallel raw-SQL path.
+
+The local key statements can expose key material through Diesel instrumentation or debug query formatting. Zeroizing rendered text and binding the attachment key do not provide diagnostic redaction. Adoption must prove that key literals and binds stay absent from debug output, errors and instrumentation, including instrumentation installed at connection establishment.
+
+Completion requires native and headless-browser proof of encrypted replica opens, two identities reading and writing one independently keyed store, rejection of wrong keys without occupying the attachment name, and resealing after failed attachment. Preserve missing-codec rejection, codec compatibility, per-open connection settings and transaction-scoped foreign-key deferral.
 
 ---
 
