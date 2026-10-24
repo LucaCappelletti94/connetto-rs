@@ -8,8 +8,10 @@
 //! attach goes through [`attach_in_window`], which opens exactly what that site
 //! needs, attaches, and seals the connection again.
 
+use crate::cipher::{ReplicaKey, raw_key_literal};
 use diesel::RunQueryDsl;
 use diesel::result::QueryResult;
+use diesel::sql_types::Text;
 use diesel::sqlite::{SqliteConnection, SqliteLimit};
 
 /// What an attach window allows while it is open.
@@ -77,6 +79,44 @@ pub fn attach_in_window(
     permits: AttachPermits,
 ) -> QueryResult<()> {
     let attached = open_window(conn, permits).and_then(|()| conn.attach_database(path, schema));
+    let sealed = seal_attaches(conn);
+    attached.and(sealed)
+}
+
+/// Attach `path` as `schema` under its own `key` through the smallest window
+/// that admits it, as [`attach_in_window`] does.
+///
+/// For a database another connection's key must also open, which is the shared
+/// public store every identity attaches (R11). A bare attach applies the
+/// connection's own derived key, so it cannot reach a database keyed for the
+/// whole device. The key travels as the text form of its raw literal, which
+/// both codecs apply to the attached database alone, and SQLite reads the
+/// attached schema during the `ATTACH`, so a key the file does not decrypt
+/// under fails here rather than at the first query. In the browser `path` is a
+/// [`cipher_url`](crate::cipher::cipher_url), as a tier's is.
+///
+/// # Errors
+///
+/// The attach's own error, a key the file does not decrypt under among them,
+/// or a failure to seal afterwards.
+pub fn attach_keyed_in_window(
+    conn: &mut SqliteConnection,
+    path: &str,
+    schema: &str,
+    permits: AttachPermits,
+    key: &ReplicaKey,
+) -> QueryResult<()> {
+    let attached = open_window(conn, permits).and_then(|()| {
+        let literal = raw_key_literal(key);
+        // Raw SQL because the `KEY` clause belongs to the page codecs rather
+        // than to SQLite, so diesel's `attach_database` has no form for it.
+        diesel::sql_query("ATTACH DATABASE ? AS ? KEY ?")
+            .bind::<Text, _>(path)
+            .bind::<Text, _>(schema)
+            .bind::<Text, _>(literal.as_str())
+            .execute(conn)
+            .map(drop)
+    });
     let sealed = seal_attaches(conn);
     attached.and(sealed)
 }

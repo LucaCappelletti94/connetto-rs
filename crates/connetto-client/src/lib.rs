@@ -152,7 +152,7 @@ pub use reconnect::{FirstThen, ReconnectPolicy, Sleeper, TransportFactory};
 pub use replica::provision_replica_key;
 pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
-    device_key_record, encode_identity, is_reserved_record, replica_db_name,
+    device_key_record, encode_identity, is_reserved_record, replica_db_name, shared_store_name,
 };
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.

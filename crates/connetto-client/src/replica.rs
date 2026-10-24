@@ -236,11 +236,14 @@ impl<'a> Replica<'a, Encrypted> {
     /// when it is empty.
     ///
     /// This is the only way to first-boot one, and the reason is a property of
-    /// the page codec rather than a preference. A database created through an
-    /// `ATTACH` on a keyed connection inherits the main database's key salt, and
-    /// an `ATTACH` of an existing database applies the main database's derived
-    /// key regardless of any `KEY` clause, so a file created by some other
-    /// connection carries a different salt and will not decrypt here.
+    /// the page codec rather than a preference. The tier is attached bare, and
+    /// a bare `ATTACH` on a keyed connection gives the attached database the
+    /// main database's key. A file it creates takes the main database's key
+    /// salt, and an existing file is read under the main database's derived
+    /// key. A tier file created by some other connection carries a different
+    /// salt and will not decrypt here. A database keyed apart from the replica
+    /// is attached with its own key through
+    /// [`attach_keyed_in_window`](crate::harden::attach_keyed_in_window).
     #[must_use]
     pub fn with_tier(mut self, ddl: &'a str) -> Self {
         self.tier = Tier::Create {
@@ -440,6 +443,19 @@ const DEVICE_KEY_RECORD_PREFIX: &str = "connetto-device-key:";
 #[must_use]
 pub fn device_key_record(account: &str) -> String {
     format!("{DEVICE_KEY_RECORD_PREFIX}{account}")
+}
+
+/// The shared public store's name under `prefix`, which is both its file name
+/// and the record its device-scoped key goes under (R11 decision 4).
+///
+/// Derived from no identity, so every identity on the device reaches the same
+/// store and the same key, and no wipe of one identity's replica name reaches
+/// either. It never equals a replica name, which ends in a hash, nor a tier,
+/// which ends in `-tier`. The record is deliberately not reserved, so the key
+/// sits behind the unlock gate exactly as a replica key does.
+#[must_use]
+pub fn shared_store_name(prefix: &str) -> String {
+    format!("{prefix}-shared")
 }
 
 /// Encode `user_id` for [`IDENTITY_RECORD`], and for the credential row itself.
