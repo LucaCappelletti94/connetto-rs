@@ -22,7 +22,7 @@ pub use core::{
     ClientBuilder, CoreClient, CoreDurable, CorePump, CoreSignedIn, Located, ReplicaPlace,
 };
 pub use gate::Gate;
-pub use schema::SyncSchema;
+pub use schema::{SyncSchema, TierStepRefused};
 pub use sign_in::{AccountChoice, Auth, HeldCredential, SignInKind, StorageMarker, WebSignIn};
 #[cfg(feature = "native-auth")]
 pub use sign_in::{Keyring, KeyringAuth, StoredAuth};
