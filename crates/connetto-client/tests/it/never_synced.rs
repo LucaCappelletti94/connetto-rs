@@ -19,12 +19,14 @@ use connetto_client::{
     ClientBuilder, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore, SyncSchema,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
+    BulkMessage, ControlMessage, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
 use tempfile::tempdir;
+
+use super::support::handshake_ack as ack;
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
@@ -134,21 +136,6 @@ impl Transport for Script {
 #[derive(Debug, thiserror::Error)]
 #[error("the server is down")]
 struct FirstDialDown;
-
-fn ack() -> IncomingFrame {
-    IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "script".to_owned(),
-        session_token: "script".to_owned(),
-        resume_token: "script".to_owned(),
-        current_cursor: connetto_core::Cursor::from(Vec::new()),
-        schema_version: None,
-        initial_credits: 64,
-        writer: Some(connetto_core::messages::WriterGrant {
-            number: 1,
-            frontier: 0,
-        }),
-    }))
-}
 
 fn tier_schema() -> SyncSchema {
     SyncSchema::new(SchemaBundle::new(

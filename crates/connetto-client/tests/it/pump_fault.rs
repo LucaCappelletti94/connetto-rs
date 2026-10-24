@@ -5,7 +5,7 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, LivePatch, WriterGrant,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, LivePatch,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::connection::SimpleConnection;
@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tempfile::tempdir;
+
+use super::support::handshake_ack as ack;
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const BOUND: Duration = Duration::from_secs(5);
@@ -112,21 +114,6 @@ impl Transport for Script {
         self.closed.store(true, Ordering::Release);
         ready(Ok(()))
     }
-}
-
-fn ack() -> IncomingFrame {
-    IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "script".to_owned(),
-        session_token: "script".to_owned(),
-        resume_token: "script".to_owned(),
-        current_cursor: connetto_core::Cursor::from(Vec::new()),
-        schema_version: None,
-        initial_credits: 64,
-        writer: Some(WriterGrant {
-            number: 1,
-            frontier: 0,
-        }),
-    }))
 }
 
 async fn client() -> (
