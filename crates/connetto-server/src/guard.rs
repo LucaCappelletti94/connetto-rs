@@ -373,8 +373,7 @@ where
         let Some(bans) = self.bans.as_ref() else {
             return Ok(None);
         };
-        let now = chrono::Utc::now();
-        Ok(bans.check(user_id).await?.filter(|ban| ban.applies_at(now)))
+        Ok(bans.check(user_id).await?.filter(|ban| ban.applies))
     }
 
     /// Lift the ban on `user_id`, recording it, and report whether there was one.

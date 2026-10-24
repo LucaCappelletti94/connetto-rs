@@ -3478,7 +3478,6 @@ where
                 registration.public_key,
                 registration.name.clone(),
                 &list,
-                SystemTime::now(),
             )
             .await
         {

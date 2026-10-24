@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::authn::store::ResolvedIdentity;
 
@@ -66,7 +66,13 @@ pub struct VerifiedLogin {
     pub retained: RetainedProviderToken,
 }
 
-/// Provider tokens retained after login, refreshed lazily when about to be used.
+/// How long before its stated expiry a retained provider access token stops
+/// being usable, judged on the store's own clock (chapter 21).
+pub const PROVIDER_TOKEN_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Provider tokens retained after login, refreshed lazily when about to be
+/// used. The lifetime is the provider's own duration, unbound to any clock,
+/// because the store stamps the expiry from its own clock.
 #[derive(Debug, Clone)]
 pub struct RetainedProviderToken {
     /// The issuer these tokens belong to, so a refresh routes to its provider.
@@ -75,8 +81,22 @@ pub struct RetainedProviderToken {
     pub access_token: String,
     /// The provider refresh token, when the provider issued one.
     pub refresh_token: Option<String>,
-    /// When the access token expires, when the provider stated a lifetime.
-    pub expires_at: Option<SystemTime>,
+    /// The access token's lifetime, when the provider stated one.
+    pub expires_in: Option<Duration>,
+}
+
+/// A session's retained provider tokens, as a store reads them back, with the
+/// store's verdict on the access token's lifetime.
+#[derive(Debug, Clone)]
+pub struct StoredProviderToken {
+    /// The issuer these tokens belong to.
+    pub issuer: String,
+    /// The provider access token.
+    pub access_token: String,
+    /// The provider refresh token, when the provider issued one.
+    pub refresh_token: Option<String>,
+    /// Whether the access token can still be used, judged by the store.
+    pub still_valid: bool,
 }
 
 /// A multi-factor assurance bar and the request parameters that ask for it.

@@ -561,18 +561,16 @@ impl AuthStore for OutageStore {
     fn create_session(
         &self,
         identity: &connetto_server::ResolvedIdentity,
-        now: std::time::SystemTime,
     ) -> impl Future<Output = Result<connetto_server::IssuedSession<Self::Id>, AuthStoreError>> + Send
     {
-        self.0.create_session(identity, now)
+        self.0.create_session(identity)
     }
 
     fn session_is_live(
         &self,
         session_id: connetto_server::SessionId,
-        now: std::time::SystemTime,
     ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send {
-        self.0.session_is_live(session_id, now)
+        self.0.session_is_live(session_id)
     }
 
     #[expect(
@@ -582,7 +580,6 @@ impl AuthStore for OutageStore {
     async fn rotate_refresh(
         &self,
         _refresh_token: &str,
-        _now: std::time::SystemTime,
     ) -> Result<connetto_server::RefreshOutcome<Self::Id>, AuthStoreError> {
         Err(AuthStoreError::Backend("connection refused".to_owned()))
     }
@@ -610,16 +607,15 @@ impl AuthStore for OutageStore {
         &self,
         session_id: connetto_server::SessionId,
         token: &connetto_server::RetainedProviderToken,
-        now: std::time::SystemTime,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send {
-        self.0.set_retained_provider_token(session_id, token, now)
+        self.0.set_retained_provider_token(session_id, token)
     }
 
     fn retained_provider_token(
         &self,
         session_id: connetto_server::SessionId,
-    ) -> impl Future<Output = Result<Option<connetto_server::RetainedProviderToken>, AuthStoreError>>
-    + Send {
+    ) -> impl Future<Output = Result<Option<connetto_server::StoredProviderToken>, AuthStoreError>> + Send
+    {
         self.0.retained_provider_token(session_id)
     }
 }

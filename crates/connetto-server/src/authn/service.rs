@@ -174,7 +174,7 @@ impl<S: AuthStore> AuthService<S> {
     /// [`AuthError`] if the store or the mint fails.
     pub async fn login(&self, identity: &ResolvedIdentity) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
-        let issued = self.store.create_session(identity, now).await?;
+        let issued = self.store.create_session(identity).await?;
         self.finish_login(issued, now, |issued| {
             tracing::info!(
                 session = %issued.session_id,
@@ -197,9 +197,9 @@ impl<S: AuthStore> AuthService<S> {
         login: &VerifiedLogin,
     ) -> Result<TokenPair<S::Id>, AuthError> {
         let now = SystemTime::now();
-        let issued = self.store.create_session(&login.identity, now).await?;
+        let issued = self.store.create_session(&login.identity).await?;
         self.store
-            .set_retained_provider_token(issued.session_id, &login.retained, now)
+            .set_retained_provider_token(issued.session_id, &login.retained)
             .await?;
         self.finish_login(issued, now, |issued| {
             tracing::info!(
@@ -274,12 +274,7 @@ impl<S: AuthStore> AuthService<S> {
         let Some(retained) = self.store.retained_provider_token(session_id).await? else {
             return Ok(None);
         };
-        let now = SystemTime::now();
-        let still_valid = match retained.expires_at {
-            Some(expires_at) => now + Duration::from_secs(30) < expires_at,
-            None => true,
-        };
-        if still_valid {
+        if retained.still_valid {
             return Ok(Some(retained.access_token));
         }
         let (Some(refresh_token), Some(registry)) =
@@ -293,11 +288,11 @@ impl<S: AuthStore> AuthService<S> {
         let refreshed = provider.refresh_provider_token(refresh_token).await?;
         // Preserve the tenant-specific issuer resolved at login.
         let refreshed = RetainedProviderToken {
-            issuer: retained.issuer.clone(),
+            issuer: retained.issuer,
             ..refreshed
         };
         self.store
-            .set_retained_provider_token(session_id, &refreshed, now)
+            .set_retained_provider_token(session_id, &refreshed)
             .await?;
         Ok(Some(refreshed.access_token))
     }
@@ -317,8 +312,7 @@ impl<S: AuthStore> AuthService<S> {
         {
             return Err(AuthError::RateLimited(wait));
         }
-        let now = SystemTime::now();
-        let outcome = match self.store.rotate_refresh(refresh_token, now).await {
+        let outcome = match self.store.rotate_refresh(refresh_token).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // Only a credential failure counts. A store that is down fails
@@ -355,6 +349,7 @@ impl<S: AuthStore> AuthService<S> {
                 return Err(err.into());
             }
         };
+        let now = SystemTime::now();
         let access_token = self
             .authority
             .mint_access(&outcome.context, outcome.session_id, now)?;
@@ -508,7 +503,7 @@ where
                 Subject::Identity(session) => {
                     let live = self
                         .store
-                        .session_is_live(session.session_id, SystemTime::now())
+                        .session_is_live(session.session_id)
                         .await
                         .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
                     if !live {

@@ -5,7 +5,6 @@
 //! and revocation carry the typed id through.
 
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use connetto_server::{
     AuthConfig, AuthStore, IdentityResolver, InMemoryAuthStore, ResolveFuture, ResolvedIdentity,
@@ -59,14 +58,13 @@ fn store() -> InMemoryAuthStore<Uuid> {
 #[tokio::test]
 async fn in_memory_store_carries_a_typed_user_id() {
     let store = store();
-    let now = SystemTime::now();
 
     let first = store
-        .create_session(&identity("dave"), now)
+        .create_session(&identity("dave"))
         .await
         .expect("first session");
     let second = store
-        .create_session(&identity("dave"), now)
+        .create_session(&identity("dave"))
         .await
         .expect("second session");
 
@@ -79,7 +77,7 @@ async fn in_memory_store_carries_a_typed_user_id() {
 
     // A different identity resolves to a different typed id.
     let other = store
-        .create_session(&identity("erin"), now)
+        .create_session(&identity("erin"))
         .await
         .expect("other session");
     assert_ne!(other.context.user_id, first.context.user_id);
@@ -88,21 +86,20 @@ async fn in_memory_store_carries_a_typed_user_id() {
 #[tokio::test]
 async fn typed_id_survives_rotation_and_revocation() {
     let store = store();
-    let now = SystemTime::now();
 
     let issued = store
-        .create_session(&identity("frank"), now)
+        .create_session(&identity("frank"))
         .await
         .expect("create");
     assert!(
         store
-            .session_is_live(issued.session_id, now)
+            .session_is_live(issued.session_id)
             .await
             .expect("live check")
     );
 
     let rotated = store
-        .rotate_refresh(&issued.refresh_token, now)
+        .rotate_refresh(&issued.refresh_token)
         .await
         .expect("rotate");
     assert_eq!(rotated.context.user_id, issued.context.user_id);
@@ -114,7 +111,7 @@ async fn typed_id_survives_rotation_and_revocation() {
         .expect("revoke");
     assert!(
         !store
-            .session_is_live(issued.session_id, now)
+            .session_is_live(issued.session_id)
             .await
             .expect("post-revoke live check")
     );

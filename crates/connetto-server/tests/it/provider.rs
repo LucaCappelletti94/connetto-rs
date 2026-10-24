@@ -6,7 +6,7 @@
 //! OIDC provider so refresh and persistence run against real token responses.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::Utc;
 use connetto_core::Subject;
@@ -228,7 +228,7 @@ async fn service_with_real_provider() -> (
 async fn accessor_refreshes_an_expired_provider_token() {
     let (authority, service, mut login, _idp) = service_with_real_provider().await;
     login.retained.access_token = "stale".to_owned();
-    login.retained.expires_at = Some(SystemTime::now() - Duration::from_secs(60));
+    login.retained.expires_in = Some(Duration::ZERO);
     let pair = service.login_with_provider(&login).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
@@ -267,7 +267,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
 async fn accessor_returns_a_still_valid_token_unrefreshed() {
     let (authority, service, mut login, _idp) = service_with_real_provider().await;
     login.retained.access_token = "still-good".to_owned();
-    login.retained.expires_at = Some(SystemTime::now() + Duration::from_secs(3600));
+    login.retained.expires_in = Some(Duration::from_secs(3600));
     let pair = service.login_with_provider(&login).await.expect("login");
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))

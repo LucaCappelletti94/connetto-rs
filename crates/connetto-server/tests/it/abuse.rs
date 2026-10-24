@@ -48,6 +48,7 @@ use connetto_test_harness::{
     ConnettoDefaults, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
 };
 use diesel::prelude::*;
+use diesel::sql_query;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -642,14 +643,18 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     ))
     .await
     .expect("impose the live ban");
-    let lapsed = NewBan {
-        user_id: "frank".to_owned(),
-        session,
-        reason: "unresolvable_subscription 2 per 300s".to_owned(),
-        banned_at: chrono::Utc::now() - chrono::TimeDelta::hours(2),
-        expires_at: Some(chrono::Utc::now() - chrono::TimeDelta::hours(1)),
-    };
-    bans.impose(lapsed).await.expect("impose the lapsed ban");
+    // A backdated ban that already lapsed by the database clock. The clock
+    // expression is SQL the typed DSL cannot express, the documented exception.
+    let mut conn = fixture.admin().get().await.expect("owner connection");
+    sql_query(
+        "INSERT INTO connetto_bans (user_id, session, reason, banned_at, expires_at) \
+         VALUES ('frank', $1, 'unresolvable_subscription 2 per 300s', \
+                 now() - interval '2 hours', now() - interval '1 hour')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(session.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("impose the lapsed ban");
 
     assert!(
         !handshake_accepted(&manager, "erin", &["user:erin#one"]).await,

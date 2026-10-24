@@ -103,10 +103,10 @@ pub use authn::{
     IdentityResolver, InMemoryAuthStore, IssuedAuthCode, IssuedSession, LoginRedirect,
     OidcProviderConfig, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
     RefreshLifetimes, RefreshOutcome, ResolveError, ResolveFuture, ResolvedIdentity,
-    RetainedProviderToken, TokenAuthority, TokenError, TokenPair, VerifiedClaims, VerifiedLogin,
-    VerifiedSession,
+    RetainedProviderToken, SessionRow, StoredProviderToken, TokenAuthority, TokenError, TokenPair,
+    VerifiedClaims, VerifiedLogin, VerifiedSession,
 };
-pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
+pub use authn::{ConnettoStoreSchema, DbAuthStore};
 pub use builder::{
     BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
     ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,
