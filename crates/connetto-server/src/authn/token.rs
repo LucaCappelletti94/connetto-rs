@@ -494,8 +494,12 @@ impl TokenAuthority {
     }
 
     /// The shared check: pin the algorithm, issuer, audience and expiry.
+    ///
+    /// The expiry allows a token up to `SERVER_SKEW` past its `exp`, the
+    /// deployment's own clock skew (chapter 21, class G).
     fn validation(&self) -> Validation {
         let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.leeway = connetto_core::clock::SERVER_SKEW.as_secs();
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(&[self.audience.as_str()]);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);

@@ -36,12 +36,12 @@ async fn valid_write_ticket_verifies() {
     assert_eq!(decoded.ceiling, 1024 * 1024);
 }
 
-/// Proves: an expired ticket answers with a `TicketError::Expired` variant,
-/// which the HTTP layer maps to 404.
+/// Proves: an expiry beyond the server skew answers with a
+/// `TicketError::Expired` variant, which the HTTP layer maps to 404.
 #[tokio::test]
 async fn expired_ticket_is_refused() {
     let (signer, verifier) = make_signer();
-    let payload = payload_for(Verb::Read, 0, -1);
+    let payload = payload_for(Verb::Read, 0, -120);
     let token = signer.mint(&payload).unwrap();
     assert!(
         matches!(
@@ -49,6 +49,34 @@ async fn expired_ticket_is_refused() {
             Err(connetto_file_server::ticket::TicketError::Expired)
         ),
         "expired token must be refused with Expired"
+    );
+}
+
+/// Proves: a peer mints on its own clock, which may sit up to `SERVER_SKEW`
+/// behind ours, so a ticket stays usable that long past its expiry.
+#[tokio::test]
+async fn a_ticket_expired_within_server_skew_verifies() {
+    let (signer, verifier) = make_signer();
+    let payload = payload_for(Verb::Read, 0, -30);
+    let token = signer.mint(&payload).unwrap();
+    let decoded = verifier
+        .verify(&token)
+        .expect("a ticket at most SERVER_SKEW past its expiry must verify");
+    assert_eq!(decoded.file_id, payload.file_id);
+}
+
+/// Proves: the tolerance is bounded. Past the skew the ticket is refused.
+#[tokio::test]
+async fn a_ticket_expired_beyond_server_skew_is_refused() {
+    let (signer, verifier) = make_signer();
+    let payload = payload_for(Verb::Read, 0, -90);
+    let token = signer.mint(&payload).unwrap();
+    assert!(
+        matches!(
+            verifier.verify(&token),
+            Err(connetto_file_server::ticket::TicketError::Expired)
+        ),
+        "a ticket past expiry plus SERVER_SKEW must be refused"
     );
 }
 

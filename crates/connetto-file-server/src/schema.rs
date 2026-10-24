@@ -226,11 +226,13 @@ where
     fn cr_state_eq_deleting() -> Self::CRStateEq;
 
     /// Build `INSERT INTO manifests … ON CONFLICT DO NOTHING`.
+    ///
+    /// `created_at` takes the column's `DEFAULT NOW()`, so the row is stamped
+    /// by the database's own clock (chapter 21, class H).
     fn insert_manifest_stmt(
         file_id: Vec<u8>,
         total_len: i64,
         caller: String,
-        at: chrono::DateTime<chrono::Utc>,
     ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
     /// Batch-insert registry rows (pending) for the given hashes in one statement.
@@ -247,9 +249,10 @@ where
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)> + Send + 'static;
 
     /// Lock, in hash order, the registry rows whose only references will not
-    /// survive this cutoff, so a sweep never blocks uploads of live content.
+    /// survive the grace, so a sweep never blocks uploads of live content.
+    /// The cutoff is `now() - grace` in the statement (chapter 21, class H).
     fn lock_sweep_rows_stmt(
-        cutoff: chrono::DateTime<chrono::Utc>,
+        grace: i32,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
     /// Lock one manifest row and return its committed state.
@@ -318,13 +321,13 @@ where
     /// Build `INSERT INTO chunk_registry (chunk_hash, state) VALUES (?, 'deleting') ON CONFLICT DO NOTHING`, claiming an orphan for deletion the way the sweep marks one.
     fn claim_orphan_stmt(hash: Vec<u8>) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `DELETE FROM manifests WHERE NOT committed AND NOT lost AND created_at < cutoff RETURNING file_id`.
+    /// Build `DELETE FROM manifests WHERE NOT committed AND NOT lost AND created_at < now() - grace RETURNING file_id`.
     ///
     /// The `RETURNING` clause is the reason this returns a loadable type: the
     /// DELETE and the file-id collection must be atomic, which rules out a
     /// separate SELECT-then-DELETE.
     fn delete_orphaned_stmt(
-        cutoff: chrono::DateTime<chrono::Utc>,
+        grace: i32,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, Vec<u8>> + Send + 'static;
 
     /// Build `SELECT chunk_hash FROM manifest_chunks
@@ -561,7 +564,6 @@ macro_rules! connetto_file_tables {
                 file_id: Vec<u8>,
                 total_len: i64,
                 caller: String,
-                at: chrono::DateTime<chrono::Utc>,
             ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
             + diesel::query_builder::QueryId
             + Send
@@ -573,7 +575,6 @@ macro_rules! connetto_file_tables {
                         diesel::ExpressionMethods::eq($manifests::accepted_bytes, 0_i64),
                         diesel::ExpressionMethods::eq($manifests::committed, false),
                         diesel::ExpressionMethods::eq($manifests::uploaded_by, caller),
-                        diesel::ExpressionMethods::eq($manifests::created_at, at),
                     ))
                     .on_conflict_do_nothing()
             }
@@ -620,7 +621,7 @@ macro_rules! connetto_file_tables {
                 )
             }
             fn lock_sweep_rows_stmt(
-                cutoff: chrono::DateTime<chrono::Utc>,
+                grace: i32,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
                 diesel_async::AsyncPgConnection,
@@ -653,7 +654,14 @@ macro_rules! connetto_file_tables {
                                 ),
                                 diesel::BoolExpressionMethods::or(
                                     diesel::ExpressionMethods::eq($manifests::committed, true),
-                                    diesel::ExpressionMethods::ge($manifests::created_at, cutoff),
+                                    diesel::ExpressionMethods::ge(
+                                        $manifests::created_at,
+                                        diesel::dsl::sql::<diesel::sql_types::Timestamptz>(
+                                            "now() - make_interval(secs => ",
+                                        )
+                                        .bind::<diesel::sql_types::Integer, _>(grace)
+                                        .sql(")"),
+                                    ),
                                 ),
                             ),
                             $manifests::file_id,
@@ -880,7 +888,7 @@ macro_rules! connetto_file_tables {
                     .on_conflict_do_nothing()
             }
             fn delete_orphaned_stmt(
-                cutoff: chrono::DateTime<chrono::Utc>,
+                grace: i32,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
                 'q,
                 diesel_async::AsyncPgConnection,
@@ -895,7 +903,14 @@ macro_rules! connetto_file_tables {
                         ),
                         diesel::ExpressionMethods::eq($manifests::lost, false),
                     ),
-                    diesel::ExpressionMethods::lt($manifests::created_at, cutoff),
+                    diesel::ExpressionMethods::lt(
+                        $manifests::created_at,
+                        diesel::dsl::sql::<diesel::sql_types::Timestamptz>(
+                            "now() - make_interval(secs => ",
+                        )
+                        .bind::<diesel::sql_types::Integer, _>(grace)
+                        .sql(")"),
+                    ),
                 ))
                 .returning($manifests::file_id)
             }

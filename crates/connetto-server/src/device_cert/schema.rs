@@ -179,13 +179,10 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
         user: &'c Self::Id,
     ) -> Statement<'c, Vec<DeviceRow<Self::Descriptor>>>;
 
-    /// Every serial `issuer` signed for a revoked key that has not expired at
-    /// `now`, with when the key was revoked.
-    fn revoked_serials(
-        conn: &mut AsyncPgConnection,
-        issuer: KeyId,
-        now: SystemTime,
-    ) -> Statement<'_, Vec<Revoked>>;
+    /// Every serial `issuer` signed for a revoked key that has not lapsed
+    /// more than `DEVICE_SKEW` ago, the window a peer still accepts it
+    /// (chapter 21, class G), with when the key was revoked.
+    fn revoked_serials(conn: &mut AsyncPgConnection, issuer: KeyId) -> Statement<'_, Vec<Revoked>>;
 
     /// Advance `issuer`'s list number, answering the new one, which is 1 for an
     /// issuer with none yet.
@@ -348,10 +345,10 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
         })
     }
 
-    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
+    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
-            S::revoked_serials(&mut conn, issuer, now)
+            S::revoked_serials(&mut conn, issuer)
                 .await
                 .map_err(EnrolmentError::Query)
         })
@@ -711,7 +708,6 @@ macro_rules! connetto_enrolment_tables {
             fn revoked_serials(
                 conn: &mut diesel_async::AsyncPgConnection,
                 issuer: $crate::device_cert::KeyId,
-                now: std::time::SystemTime,
             ) -> $crate::device_cert::Statement<'_, Vec<$crate::device_cert::Revoked>> {
                 Box::pin(async move {
                     use diesel::{
@@ -729,7 +725,17 @@ macro_rules! connetto_enrolment_tables {
                         joined,
                         connetto_device_certificates::issuer
                             .eq(issuer.as_bytes().to_vec())
-                            .and(connetto_device_certificates::expires_at.gt($crate::ban::Instant::from(now)))
+                            .and(
+                                connetto_device_certificates::expires_at.gt(
+                                    diesel::dsl::sql::<diesel::sql_types::Timestamptz>(
+                                        "now() - make_interval(secs => ",
+                                    )
+                                    .bind::<diesel::sql_types::Double, _>(
+                                        $crate::db_clock::DEVICE_SKEW_SECS,
+                                    )
+                                    .sql(")"),
+                                ),
+                            )
                             .and(connetto_device_enrolments::revoked_at.is_not_null()),
                     );
                     let rows: Vec<(Vec<u8>, $crate::ban::Instant)> = RunQueryDsl::load(
@@ -808,15 +814,15 @@ macro_rules! connetto_enrolment_tables {
                     use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
                     use diesel_async::RunQueryDsl;
                     // The enrolment and its certificate live in different tables, so liveness
-                    // is its own EXISTS rather than a projection the diesel DSL cannot name.
+                    // is its own EXISTS, compared against the database's own `now()` (chapter 21,
+                    // class H).
                     let live: bool = diesel::select(diesel::dsl::exists(QueryDsl::filter(
                         QueryDsl::filter(
                             connetto_device_certificates::table,
                             connetto_device_certificates::key_id.eq(key.as_bytes().to_vec()),
                         ),
-                        connetto_device_certificates::expires_at.gt($crate::ban::Instant::from(
-                            std::time::SystemTime::now(),
-                        )),
+                        connetto_device_certificates::expires_at
+                            .gt($crate::db_clock::now()),
                     )))
                     .get_result(conn)
                     .await?;

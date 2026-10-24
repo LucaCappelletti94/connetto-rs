@@ -152,8 +152,9 @@ pub trait EnrolmentStore<Id>: Send + Sync + 'static {
     ) -> EnrolmentFuture<'a, Revocation>;
 
     /// Every serial `issuer` signed for a revoked key, whose certificate has
-    /// not expired at `now`.
-    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>>;
+    /// not lapsed more than `DEVICE_SKEW` ago, the window a peer still accepts
+    /// it (chapter 21, class G).
+    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>>;
 
     /// The next CRL Number of the issuer `issuer`, above every number handed
     /// out before, across restarts.
@@ -312,12 +313,17 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
         Box::pin(core::future::ready(Ok(self.revoke_now(user, key, at))))
     }
 
-    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
+    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>> {
         let state = self.state.lock();
+        // A peer still accepts a certificate up to `DEVICE_SKEW` past its
+        // `not_after`, so the list reaches that far into the past.
+        let cutoff = SystemTime::now()
+            .checked_sub(connetto_core::clock::DEVICE_SKEW)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
         let serials = state
             .grants
             .iter()
-            .filter(|grant| grant.issuer == issuer && grant.expires_at > now)
+            .filter(|grant| grant.issuer == issuer && grant.expires_at > cutoff)
             .filter_map(|grant| {
                 let at = state.rows.get(&grant.key)?.revoked_at?;
                 Some(Revoked {
@@ -665,7 +671,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         let now = SystemTime::now();
         let mut lists = Vec::new();
         for issuer in self.config.signing_issuers(now) {
-            let revoked = self.store.revoked_serials(issuer.key_id(), now).await?;
+            let revoked = self.store.revoked_serials(issuer.key_id()).await?;
             let number = self.store.next_list_number(issuer.key_id()).await?;
             // No list promises a next one later than the longest certificate
             // it could name stays valid.
