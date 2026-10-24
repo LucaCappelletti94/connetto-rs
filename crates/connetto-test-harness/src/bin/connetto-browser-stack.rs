@@ -18,7 +18,7 @@
 //!
 //! Bare, it runs the verified-topology step and then the default suites, one
 //! at a time through `wasm-pack test --headless --chrome`, each with
-//! `WASM_BINDGEN_TEST_TIMEOUT` and a shared `CARGO_TARGET_DIR` unless the
+//! `WASM_BINDGEN_TEST_TIMEOUT=180` and a shared `CARGO_TARGET_DIR` unless the
 //! caller set them. `--shard I/N` runs the suites whose position lands on `I`
 //! round-robin, so N shards cover the list once with no shared stack between
 //! them. `--build-only DIR` builds and copies the binaries a shard run needs
