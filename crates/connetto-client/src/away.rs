@@ -4,10 +4,13 @@
 //! Time away is the larger of a sleep-counting monotonic clock and the wall
 //! clock (decision 19): `Instant` stops during device sleep on Apple and on
 //! Linux and Android, so a phone asleep for an hour would read as minutes
-//! away. The sleep-counting reading is `CLOCK_BOOTTIME` on Linux and Android,
-//! `CLOCK_MONOTONIC` on Apple, and `performance.now()` in the browser. A wall
-//! clock stepped back cannot shorten time away below the monotonic reading,
-//! and one stepped forward costs at most one extra prompt.
+//! away. The sleep-counting reading is `CLOCK_BOOTTIME` on Linux and Android
+//! and `CLOCK_MONOTONIC` on Apple. The browser reading is `performance.now()`,
+//! which HR-Time does not promise to keep counting through a tab's suspend,
+//! and the wall reading the gate takes with it covers a browser whose
+//! monotonic clock stops. A wall clock stepped back cannot shorten time away
+//! below the monotonic reading, and one stepped forward costs at most one
+//! extra prompt.
 //!
 //! The client never reads a clock itself. The caller (connetto-dioxus, the
 //! browser worker, or an application) reads the clocks into a [`Moment`] and

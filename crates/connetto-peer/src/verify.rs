@@ -2,8 +2,8 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::{AttestationLevel, DeviceCertificate, KeyId};
 use parking_lot::RwLock;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
@@ -17,9 +17,6 @@ use crate::identity::{Clock, Trust};
 
 /// A kept CRL, owned, so a snapshot is a cheap `Arc` clone.
 pub(crate) type Crl = webpki::CertRevocationList<'static>;
-/// The tolerance a wall clock gets against the certificate windows, five
-/// minutes either way.
-pub(crate) const TOLERANCE: Duration = Duration::from_secs(300);
 
 /// A kept revocation list, beside what a verifier and a forward need.
 #[derive(Clone)]
@@ -124,7 +121,7 @@ impl PeerVerifier {
         // The wall clock first, then the window's edges, so a small skew
         // links while a real expiry refuses.
         let now = self.clock.now();
-        let attempts = [now, now - TOLERANCE, now + TOLERANCE];
+        let attempts = [now, now - DEVICE_SKEW, now + DEVICE_SKEW];
         let mut first: Option<webpki::Error> = None;
         let mut fatal: Option<webpki::Error> = None;
         for attempt in attempts {

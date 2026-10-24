@@ -3,6 +3,7 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::DeviceCertificate;
 use connetto_core::messages::{ControlMessage, DeviceSummary, EnrolRefusal, SignedList};
 use connetto_core::traits::Transport;
@@ -50,9 +51,6 @@ pub(crate) const CERTIFICATE_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_d
 
 /// Where the enrolment task receives the lists the server pushes.
 pub(crate) type ListInbox = mpsc::UnboundedReceiver<Vec<SignedList>>;
-
-/// How far a local clock may disagree before a certificate counts as outside its window.
-pub(crate) const TOLERANCE: Duration = Duration::from_mins(5);
 
 /// A server's answer to one enrolment request.
 #[derive(Debug)]
@@ -149,10 +147,10 @@ impl Standing {
             return Self::NoKey;
         };
         let (start, end) = (leaf.not_before(), leaf.not_after());
-        if now + TOLERANCE < start {
+        if now + DEVICE_SKEW < start {
             return Self::ClockOff;
         }
-        if now > end + TOLERANCE {
+        if now > end + DEVICE_SKEW {
             return Self::Expired;
         }
         if now >= half_life_leaf(leaf) {

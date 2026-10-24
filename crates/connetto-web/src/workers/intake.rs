@@ -1,4 +1,5 @@
 use core::future::Future;
+use core::time::Duration;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -6,28 +7,30 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{BroadcastChannel, MessageEvent};
 
+use connetto_client::SystemClock;
+use connetto_client::away::Clock as _;
 use connetto_core::custody::{Custody, NoGate};
 
 use crate::RelayHub;
 use crate::frames::{MessageTransport, MessageTransportError};
 
 /// Deadline for all hello-channel exchanges.
-const HELLO_TIMEOUT_MS: f64 = 15_000.0;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A boot's base allowance to report readiness, before progress can extend it.
-const BASE: f64 = 15_000.0;
+const BASE: Duration = Duration::from_secs(15);
 
 /// The floor every progress message pushes the deadline to. Matches the worker's own
 /// inactivity bound in `subscribe_and_boot`.
-const SILENCE: f64 = 15_000.0;
+const SILENCE: Duration = Duration::from_secs(15);
 
 /// The transport a tab rides to the DB worker.
 pub type TabWire = MessageTransport<BroadcastChannel>;
 
 enum HelloReady {
-    /// The deadline runs, as an absolute time the wait expires at.
+    /// The deadline runs, as the monotonic reading the wait expires at.
     Counting {
-        deadline: f64,
+        deadline: Duration,
     },
     /// The boot waits on the user, so the deadline does not run.
     AtUser,
@@ -66,10 +69,20 @@ impl From<IntakeError> for JsValue {
     }
 }
 
+/// Time since `started` on the monotonic clock every deadline here is set and checked
+/// against (chapter 21, class D), in the milliseconds [`IntakeError::Timeout`] reports.
+fn elapsed_ms(started: Duration) -> f64 {
+    SystemClock
+        .monotonic()
+        .saturating_sub(started)
+        .as_secs_f64()
+        * 1_000.0
+}
+
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
-    started: f64,
+    started: Duration,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
     loop {
@@ -80,9 +93,9 @@ async fn poll_hello_channel(
                 return Err(IntakeError::BootFailed { detail });
             }
             HelloReady::Counting { deadline } => {
-                if js_sys::Date::now() >= *deadline {
+                if SystemClock.monotonic() >= *deadline {
                     return Err(IntakeError::Timeout {
-                        elapsed_ms: js_sys::Date::now() - started,
+                        elapsed_ms: elapsed_ms(started),
                     });
                 }
             }
@@ -305,20 +318,20 @@ pub async fn await_db_worker_ready(known: &[super::boot::BootIdentity]) -> Resul
     await_db_worker_ready_bounded(super::HELLO_CHANNEL, known, BASE, SILENCE).await
 }
 
-/// Test-facing readiness wait on a channel of its own under a short `base_ms` and `silence_ms`.
+/// Test-facing readiness wait on a channel of its own under a short `base` and `silence`.
 pub(super) async fn await_db_worker_ready_bounded(
     channel_name: &str,
     known: &[super::boot::BootIdentity],
-    base_ms: f64,
-    silence_ms: f64,
+    base: Duration,
+    silence: Duration,
 ) -> Result<(), IntakeError> {
-    let started = js_sys::Date::now();
+    let started = SystemClock.monotonic();
     let channel = BroadcastChannel::new(channel_name).map_err(|err| IntakeError::ChannelOpen {
         operation: "hello channel",
         detail: format!("{err:?}"),
     })?;
     let state = Rc::new(RefCell::new(HelloReady::Counting {
-        deadline: js_sys::Date::now() + base_ms,
+        deadline: SystemClock.monotonic() + base,
     }));
     let mut initial = known.to_vec();
     if initial.is_empty() && channel_name == super::HELLO_CHANNEL {
@@ -351,7 +364,7 @@ pub(super) async fn await_db_worker_ready_bounded(
                     steps = UserSteps::default();
                     if matches!(*state, HelloReady::AtUser) {
                         *state = HelloReady::Counting {
-                            deadline: js_sys::Date::now() + base_ms,
+                            deadline: SystemClock.monotonic() + base,
                         };
                     }
                 }
@@ -361,7 +374,7 @@ pub(super) async fn await_db_worker_ready_bounded(
             {
                 // Progress only extends a running deadline; the user is what an AtUser boot waits on.
                 if let HelloReady::Counting { deadline } = &mut *state {
-                    let candidate = js_sys::Date::now() + silence_ms;
+                    let candidate = SystemClock.monotonic() + silence;
                     if candidate > *deadline {
                         *deadline = candidate;
                     }
@@ -383,7 +396,7 @@ pub(super) async fn await_db_worker_ready_bounded(
                 && matches!(*state, HelloReady::AtUser)
             {
                 *state = HelloReady::Counting {
-                    deadline: js_sys::Date::now() + base_ms,
+                    deadline: SystemClock.monotonic() + base,
                 };
             }
         })
@@ -419,13 +432,13 @@ pub async fn announce_tab(wire: &str) -> Result<(), IntakeError> {
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let _ = channel.post_message(&JsValue::from_str(&format!("tab:{wire}")));
-    let started = js_sys::Date::now();
+    let started = SystemClock.monotonic();
     while !attached.get() {
-        if js_sys::Date::now() - started >= HELLO_TIMEOUT_MS {
+        if SystemClock.monotonic().saturating_sub(started) >= HELLO_TIMEOUT {
             channel.set_onmessage(None);
             channel.close();
             return Err(IntakeError::Timeout {
-                elapsed_ms: js_sys::Date::now() - started,
+                elapsed_ms: elapsed_ms(started),
             });
         }
         sleep_ms(10).await;
@@ -481,12 +494,12 @@ fn decode_custody_reply(data: &JsValue) -> Option<Custody> {
 /// [`IntakeError::ChannelOpen`] when the hello channel cannot be opened, or
 /// [`IntakeError::Timeout`] when the worker does not answer within the deadline.
 pub async fn request_custody() -> Result<Custody, IntakeError> {
-    request_custody_bounded(HELLO_TIMEOUT_MS).await
+    request_custody_bounded(HELLO_TIMEOUT).await
 }
 
-/// Asks for custody under `deadline_ms`, so a test proves the expiry in milliseconds rather
+/// Asks for custody under `deadline`, so a test proves the expiry in milliseconds rather
 /// than waiting out the shipped deadline.
-pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody, IntakeError> {
+pub(super) async fn request_custody_bounded(deadline: Duration) -> Result<Custody, IntakeError> {
     let channel =
         BroadcastChannel::new(super::HELLO_CHANNEL).map_err(|err| IntakeError::ChannelOpen {
             operation: "hello channel",
@@ -502,15 +515,15 @@ pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody,
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let started = js_sys::Date::now();
+    let started = SystemClock.monotonic();
     let mut answered = result.get();
     while answered.is_none() {
-        if js_sys::Date::now() - started >= deadline_ms {
+        if SystemClock.monotonic().saturating_sub(started) >= deadline {
             channel.set_onmessage(None);
             channel.close();
             drop(on_message);
             return Err(IntakeError::Timeout {
-                elapsed_ms: js_sys::Date::now() - started,
+                elapsed_ms: elapsed_ms(started),
             });
         }
         // Asks posted before the intake existed are lost, so this repeats the ask.

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
 
+use connetto_core::clock::DEVICE_SKEW;
 #[cfg(feature = "peer")]
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::{
@@ -27,7 +28,7 @@ use connetto_peer::{CloseReason, DiscoveryEvent, EXCHANGE_BOUND, LinkError, Peer
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
+use super::{Answer, Held, KeptList, Standing, half_life};
 #[cfg(feature = "peer")]
 use crate::PeerError;
 #[cfg(feature = "peer")]
@@ -659,11 +660,11 @@ pub(super) fn next_look(held: Option<&Held>, now: SystemTime) -> Duration {
         // The expiry wake reaches the exact moment, so a link never outlives
         // the window by the look's slack (R76 decision 9), and the hourly look
         // still retries a renewal and catches a jumped clock.
-        Standing::Aging => (end + TOLERANCE)
+        Standing::Aging => (end + DEVICE_SKEW)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
-        Standing::ClockOff => (start - TOLERANCE)
+        Standing::ClockOff => (start - DEVICE_SKEW)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),

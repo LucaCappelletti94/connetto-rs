@@ -56,6 +56,7 @@
 //! one control frame that still waits its turn in the queue, because it
 //! describes rows the tab has not received yet.
 
+use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -68,11 +69,12 @@ use crate::frames::{
 };
 use crate::workers::blob_io::BlobSource;
 use crate::workers::helpers::sleep_ms;
+use connetto_client::away::Clock as _;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer, WriterGrant,
-    WriterRequest, subscription_is_aggregate, subscription_tables,
+    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer, SystemClock,
+    WriterGrant, WriterRequest, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
@@ -103,14 +105,14 @@ const ZSTD_LEVEL: i32 = 3;
 
 /// Staged content older than this lost its mutation at the hub; the blob is
 /// dropped when the tab next stages or writes.
-const STALE_CONTENT_MS: f64 = 15_000.0;
+const STALE_CONTENT: Duration = Duration::from_secs(15);
 
 /// Staged blobs a single tab may hold at once, oldest dropped first.
 const MAX_STAGED_CONTENT: usize = 8;
 
 /// Longest a tab's resolve question waits on a ticket round trip before the
 /// hub answers `Unavailable`.
-const RESOLVE_WAIT_MS: i32 = 15_000;
+const RESOLVE_WAIT: Duration = Duration::from_secs(15);
 
 /// The delivery-credit window the hub advertises and enforces per tab,
 /// matching the server's `initial_credits`. Only bulk frames (`LivePatch`,
@@ -348,8 +350,8 @@ struct StagedContent {
     file_id: FileId,
     mime: connetto_file_core::MimeClass,
     blob: web_sys::Blob,
-    /// `Date::now()` at arrival, milliseconds.
-    taken: f64,
+    /// The monotonic reading at arrival.
+    taken: Duration,
 }
 
 /// One item waiting on a tab's outbound queue.
@@ -521,12 +523,12 @@ struct HubState {
     resyncing: HashMap<String, FullResyncReason>,
 
     /// Resolves waiting on a server ticket answer, each with the tab and
-    /// request to answer and the `Date::now` instant its wait ends.
+    /// request to answer and the `performance.now` instant its wait ends.
     pending_resolve: Vec<PendingHubResolve>,
 
     /// The worker's armed resend of writes the server deferred, with the
-    /// `Date::now` instant it falls due, so arriving frames never restart it.
-    resend: Option<(ResendTimer, f64)>,
+    /// monotonic reading it falls due at, so arriving frames never restart it.
+    resend: Option<(ResendTimer, Duration)>,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -535,8 +537,8 @@ struct PendingHubResolve {
     tab: TabId,
     request_id: u64,
     ticket: PendingConnectionResolve,
-    /// `Date::now` milliseconds by which the tab hears at the latest.
-    deadline: f64,
+    /// The monotonic reading by which the tab hears at the latest.
+    deadline: Duration,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -3468,9 +3470,9 @@ fn take_staged(state: &mut HubState, id: TabId, changeset: &[u8]) -> Option<Stag
     if tab.staged.is_empty() {
         return None;
     }
-    let now = js_sys::Date::now();
+    let now = SystemClock.monotonic();
     tab.staged
-        .retain(|staged| now - staged.taken < STALE_CONTENT_MS);
+        .retain(|staged| now.saturating_sub(staged.taken) < STALE_CONTENT);
     let named = changeset_blob_values(changeset);
     if named.is_empty() {
         return None;
@@ -3545,9 +3547,9 @@ where
                 tracing::warn!(tab = %id, "a stage message carried no blob");
                 return Ok(());
             };
-            let now = js_sys::Date::now();
+            let now = SystemClock.monotonic();
             tab.staged
-                .retain(|staged| now - staged.taken < STALE_CONTENT_MS);
+                .retain(|staged| now.saturating_sub(staged.taken) < STALE_CONTENT);
             if tab.staged.len() >= MAX_STAGED_CONTENT {
                 tracing::warn!(
                     tab = %id,
@@ -3593,7 +3595,7 @@ where
                         tab: id,
                         request_id,
                         ticket,
-                        deadline: js_sys::Date::now() + f64::from(RESOLVE_WAIT_MS),
+                        deadline: SystemClock.monotonic() + RESOLVE_WAIT,
                     });
                 }
                 Some(ResolveStart::Answered(Resolved::Remote { url })) => {
@@ -3747,22 +3749,11 @@ fn route_resolves(state: &mut HubState, event: &ClientEvent) {
 /// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
 /// deadline the sweep has not yet collected.
 fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
-    let now = js_sys::Date::now();
-    // The floor is 1 ms and the ceiling is RESOLVE_WAIT_MS, the widest wait
-    // this file ever queues, so the value is always in i32 range.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "clamped to [1.0, RESOLVE_WAIT_MS = 15_000]; sub-ms rounding is deliberate"
-    )]
-    let ms = pending
+    let now = SystemClock.monotonic();
+    pending
         .iter()
-        .map(|resolve| {
-            (resolve.deadline - now)
-                .clamp(1.0, f64::from(RESOLVE_WAIT_MS))
-                .ceil() as i32
-        })
-        .min();
-    ms
+        .map(|resolve| wait_ms(resolve.deadline, now))
+        .min()
 }
 
 /// Milliseconds until the worker's armed resend falls due, `None` when none is
@@ -3775,24 +3766,22 @@ where
 {
     let armed = worker.resend_timer();
     if armed != state.resend.map(|(timer, _)| timer) {
-        state.resend = armed.map(|timer| {
-            (
-                timer,
-                js_sys::Date::now() + timer.wait().as_secs_f64() * 1000.0,
-            )
-        });
+        state.resend = armed.map(|timer| (timer, SystemClock.monotonic() + timer.wait()));
     }
     let (_, deadline) = state.resend?;
-    let ms = (deadline - js_sys::Date::now())
-        .clamp(1.0, f64::from(i32::MAX))
-        .ceil();
-    debug_assert!(ms.is_finite(), "a resend deadline is a finite instant");
-    // Clamped into [1, i32::MAX] above, so the cast drops only the fraction the ceil already removed.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "clamped into i32 range and rounded up before the cast"
-    )]
-    Some(ms as i32)
+    Some(wait_ms(deadline, SystemClock.monotonic()))
+}
+
+/// The whole milliseconds from `now` to `deadline`, rounded up and at least 1,
+/// so a timer armed on it never fires before the deadline and never spins on
+/// one already past. A wait beyond `i32::MAX` milliseconds is capped there.
+fn wait_ms(deadline: Duration, now: Duration) -> i32 {
+    let millis = deadline
+        .saturating_sub(now)
+        .as_micros()
+        .div_ceil(1_000)
+        .max(1);
+    i32::try_from(millis).unwrap_or(i32::MAX)
 }
 
 /// Answers `Unavailable` to every resolve whose wait ran out.
@@ -3800,7 +3789,7 @@ fn expire_resolves(state: &mut HubState) {
     if state.pending_resolve.is_empty() {
         return;
     }
-    let now = js_sys::Date::now();
+    let now = SystemClock.monotonic();
     let mut settled = Vec::new();
     let mut waiting = Vec::new();
     for resolve in std::mem::take(&mut state.pending_resolve) {
