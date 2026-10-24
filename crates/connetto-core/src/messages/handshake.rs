@@ -11,7 +11,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::writer::{WriterGrant, WriterRequest};
-use crate::{cursor::Cursor, schema::SchemaVersion};
+use crate::{
+    cursor::Cursor,
+    schema::{Major, SchemaVersion},
+};
 
 /// One grant on a handshake: a connetto-signed token asserting that the bearer
 /// is a named subject, either a person or a key.
@@ -81,10 +84,18 @@ pub struct Handshake {
     /// as long as its enrolment can still vouch for them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_through: Option<u64>,
+    /// The application schema major this client was built against. The server
+    /// refuses a connection whose major is not its own with
+    /// [`crate::messages::FatalErrorReason::MajorMismatch`], and a proxy in
+    /// front of several servers routes on it. Absent only from a client built
+    /// before majors existed, which every server refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_major: Option<Major>,
 }
 
 impl Handshake {
-    /// Build a handshake presenting nothing: no grant and no resume state.
+    /// Build a handshake presenting nothing: no grant, no resume state and no
+    /// major.
     pub fn new(protocol_version: u32, client_id: impl Into<String>) -> Self {
         Self {
             protocol_version,
@@ -95,7 +106,15 @@ impl Handshake {
             cursor_subjects: None,
             writer: WriterRequest::Issue,
             settled_through: None,
+            schema_major: None,
         }
+    }
+
+    /// Present the application schema major this client was built against.
+    #[must_use]
+    pub fn with_major(mut self, major: Major) -> Self {
+        self.schema_major = Some(major);
+        self
     }
 
     /// Present one more grant.

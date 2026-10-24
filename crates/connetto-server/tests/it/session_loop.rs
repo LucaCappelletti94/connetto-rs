@@ -19,7 +19,7 @@ use connetto_core::messages::{
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION};
+use connetto_core::{Cursor, Major, PROTOCOL_VERSION};
 use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionError,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, loopback,
@@ -787,4 +787,79 @@ async fn a_mismatched_protocol_version_is_told_and_ends_the_run() {
         matches!(error, SessionError::Protocol(_)),
         "the run ends with the violation, got {error:?}"
     );
+}
+
+/// A handshake built against another application schema major is refused
+/// with both majors, whether it is older, newer, or from before majors
+/// existed, and one at the server's own major is served (R31).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_at_another_major_is_refused_with_both_majors() {
+    let fixture = Fixture::acquire().await;
+    let server_major = Major::new(2).expect("two is a major");
+    let manager = || {
+        let materializer = Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer");
+        ManagerBuilder::new(
+            materializer,
+            SeedSnapshot,
+            RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+            Arc::new(TestGrantChecker),
+            NoConnector,
+            pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+                .expect("build write target"),
+        )
+        .with_session(SessionConfig::new().with_schema_major(Some(server_major)))
+        .build()
+    };
+
+    for client_major in [Major::new(1), Major::new(3), None] {
+        let (server_transport, mut client) = loopback();
+        let server = tokio::spawn(manager().serve(server_transport));
+        let handshake = Handshake::new(PROTOCOL_VERSION, "client-a");
+        let handshake = match client_major {
+            Some(major) => handshake.with_major(major),
+            None => handshake,
+        };
+        client
+            .send_control(ControlMessage::Handshake(handshake))
+            .await
+            .expect("send the handshake");
+        let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+            panic!("expected the leading challenge");
+        };
+        let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
+            panic!("a client at major {client_major:?} is refused");
+        };
+        assert_eq!(
+            fatal.reason,
+            FatalErrorReason::MajorMismatch {
+                server: server_major,
+                client: client_major,
+            }
+        );
+        let error = server
+            .await
+            .expect("join server")
+            .expect_err("the mismatch ends the run");
+        assert!(
+            matches!(error, SessionError::MajorMismatch { server, client } if server == server_major && client == client_major),
+            "the run ends naming both majors, got {error:?}"
+        );
+    }
+
+    let (server_transport, mut client) = loopback();
+    let _server = tokio::spawn(manager().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-a").with_major(server_major),
+        ))
+        .await
+        .expect("send the handshake");
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("a client at the server's major is served");
+    };
 }

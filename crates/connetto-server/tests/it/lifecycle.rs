@@ -8,12 +8,12 @@
 
 use std::time::{Duration, Instant};
 
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, HandshakeAck, Subscribe,
     SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Major, PROTOCOL_VERSION};
 use connetto_server::builder::{
     Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema, TokenKeys,
 };
@@ -36,6 +36,11 @@ use super::e2e::{
 
 /// How long the readiness probe and the frame waits give the server.
 pub(super) const BOUND: Duration = Duration::from_secs(30);
+
+/// The major both `PG_DDL` and `OWNED_PG_DDL` declare, for hand-built handshakes.
+pub(super) fn served_major() -> Major {
+    Major::declared_in(PG_DDL).expect("the served schema declares its major")
+}
 
 /// The one-construction-path server over `fixture`, the way the binary
 /// translates its environment: the owner and reader roles, the schema
@@ -193,7 +198,9 @@ pub(super) async fn live_session_as(
         .expect("the axum adapter answers the WebSocket handshake");
     client
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, client_id).with_grant(Grant::new(token)),
+            Handshake::new(PROTOCOL_VERSION, client_id)
+                .with_major(served_major())
+                .with_grant(Grant::new(token)),
         ))
         .await
         .expect("send the handshake");

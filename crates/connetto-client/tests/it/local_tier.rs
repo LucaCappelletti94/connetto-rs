@@ -36,6 +36,8 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
 /// The local tier schema, attached as an ephemeral in-memory database.
 const NOTES_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Test table for orders in the fixture.
@@ -211,14 +213,17 @@ async fn connect_with_tier(
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let bundle = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(NOTES_DDL),
-    ));
+    let bundle = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(NOTES_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     ClientBuilder::new(bundle, super::support::Once::new(transport))
         .signed_in(super::support::held("token"))
         .connect_driven()

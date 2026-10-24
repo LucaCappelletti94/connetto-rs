@@ -103,6 +103,13 @@ impl SyncSchema {
         self.bundle.version()
     }
 
+    /// The application schema major the handshake declares and the replica
+    /// records (R31).
+    #[must_use]
+    pub const fn major(&self) -> connetto_core::Major {
+        self.bundle.major()
+    }
+
     /// The RLS split the sync boundaries rename through.
     #[must_use]
     pub fn policy_tables(&self) -> &PolicyTables {

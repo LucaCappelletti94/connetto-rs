@@ -20,7 +20,7 @@ workspace = true
 # wasm. The browser relay uses it between the tab client and the worker
 # relay before the MessagePort glue exists, and native tests wire sessions
 # with it.
-loopback = ["dep:tokio", "dep:thiserror"]
+loopback = ["dep:tokio"]
 # Native async WebSocket transport. Off by default so the core stays
 # dependency-light and WASM-friendly; enabled by the server and the native
 # client, never by the browser client. The `rustls` lines back the `wss`
@@ -44,7 +44,7 @@ native-transport = [
 diesel-pg = ["dep:diesel"]
 # Fakes the client and browser test suites share, chiefly a transport that answers
 # a handshake and nothing else. Test-only: no production build enables it.
-test-support = ["dep:thiserror"]
+test-support = []
 # The stdout destination a native program installs (R12). Off by default: a
 # library emits through `tracing` and installs nothing, so only a program pays
 # for a subscriber. Browser programs install `connetto_web::logging` instead.
@@ -52,11 +52,11 @@ logging = ["dep:tracing-subscriber"]
 # Program configuration read from the environment, for the reference binaries.
 # Off by default for the same reason `logging` is: a library reads no
 # environment and opens no file, so only a program pays for it.
-env = ["dep:thiserror"]
+env = []
 # Device certificates (R74): the identity a native device proves to its peers,
 # issued by the server and checked by every native side. Native only, since
 # browsers never enrol, so the browser build never links `ring` through it.
-device-cert = ["dep:thiserror", "dep:rcgen", "dep:x509-parser", "dep:time"]
+device-cert = ["dep:rcgen", "dep:x509-parser", "dep:time"]
 
 [dependencies]
 serde.workspace = true
@@ -72,7 +72,7 @@ uuid = { version = "1", default-features = false }
 # built around them are wiped on drop. No entropy backend, so the browser wasm
 # build is unaffected.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
-thiserror = { workspace = true, optional = true }
+thiserror.workspace = true
 # The loopback pair needs only the sync primitives, which compile on wasm.
 # The native transport feature adds the net stack on top.
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }

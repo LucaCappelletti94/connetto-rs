@@ -44,11 +44,11 @@ use keyring_core::Entry;
 use openidconnect::reqwest;
 use serde_json::json;
 
-pub(super) const PG_DDL: &str =
-    "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
+pub(super) const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, \
+    status TEXT);";
 pub(super) const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub(super) const OWNED_PG_DDL: &str =
-    "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
+    "-- connetto:major 1\nCREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
 /// The policy document the `owned` fixture's server derives its model from.
 ///
@@ -2211,7 +2211,9 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
         .expect("ws handshake");
     client
         .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, "ticket-probe").with_grant(Grant::new(token)),
+            Handshake::new(PROTOCOL_VERSION, "ticket-probe")
+                .with_major(super::lifecycle::served_major())
+                .with_grant(Grant::new(token)),
         ))
         .await
         .expect("post handshake");

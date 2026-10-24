@@ -1172,16 +1172,22 @@ const SPLIT_DDL: &str = "CREATE TABLE physical_t (id INTEGER PRIMARY KEY); \
     CREATE TRIGGER t_insert INSTEAD OF INSERT ON t \
     BEGIN INSERT INTO physical_t (id) VALUES (NEW.id); END;";
 
+/// The schema source the split bundle declares, which names its major.
+const SOURCE: &str = "-- connetto:major 1";
+
 /// The split schema's bundle: the view `t` over its physical table.
 fn split_bundle() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SPLIT_DDL,
-        vec![("t".to_owned(), "physical_t".to_owned())],
-        vec!["t".to_owned()],
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SPLIT_DDL,
+            vec![("t".to_owned(), "physical_t".to_owned())],
+            vec!["t".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A replica in its own directory, opened offline under the split schema.

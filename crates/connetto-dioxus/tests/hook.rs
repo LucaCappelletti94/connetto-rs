@@ -31,19 +31,25 @@ fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
 }
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
 
 /// The client schema over [`SQLITE_DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(connetto_core::schema::SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        connetto_core::schema::SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 diesel::table! {

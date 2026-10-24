@@ -124,14 +124,17 @@ fn ack_control() -> ControlMessage {
 }
 /// The schema every build in this file carries.
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            "-- connetto:major 1\nCREATE TABLE items (id INT PRIMARY KEY, label TEXT);",
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A dialer that hands out at most one scripted transport and counts its

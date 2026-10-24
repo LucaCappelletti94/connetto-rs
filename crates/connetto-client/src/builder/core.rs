@@ -374,6 +374,7 @@ pub(crate) fn build_config(
         .with_login(login)
         .with_caller(CALLER_FUNCTION, caller)
         .with_schema_version(Some(schema.version()))
+        .with_schema_major(Some(schema.major()))
         .with_sql_functions(schema.sql_functions().clone())
         .with_policy_tables(schema.policy_tables().clone())
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
@@ -459,11 +460,11 @@ where
 /// use connetto_client::{ClientBuilder, SyncSchema};
 /// use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// // `connect_with_pump` returns a future. Await it on your platform's
 /// // executor, and drive the pump future it hands back.
 /// let _pending = ClientBuilder::new(
@@ -481,11 +482,11 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, MemoryKeyStore, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
 ///     SyncSchema::new(bundle),
 ///     || core::future::pending::<Result<LoopbackTransport, LoopbackError>>(),
@@ -497,11 +498,11 @@ where
 /// # use connetto_client::{ClientBuilder, Gate, SyncSchema};
 /// # use connetto_core::{LoopbackError, LoopbackTransport, SchemaBundle};
 /// # let bundle = SchemaBundle::new(
-/// #     "SCHEMA", "POLICIES", "DDL",
+/// #     "-- connetto:major 1", "POLICIES", "DDL",
 /// #     Vec::<(String, String)>::new(),
 /// #     Vec::<String>::new(),
 /// #     None::<&str>,
-/// # );
+/// # ).expect("the source declares major 1");
 /// let builder = ClientBuilder::new(
 ///     SyncSchema::new(bundle),
 ///     || core::future::pending::<Result<LoopbackTransport, LoopbackError>>(),

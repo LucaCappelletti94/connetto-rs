@@ -25,7 +25,8 @@ use web_sys::DedicatedWorkerGlobalScope;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const REPLICA_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+const REPLICA_DDL: &str = "-- connetto:major 1
+CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
 /// A port nothing in this suite binds, so the connect attempt genuinely fails
@@ -40,7 +41,8 @@ fn builder() -> WebClientBuilder {
         Vec::<(&str, &str)>::new(),
         Vec::<&str>::new(),
         Some(TIER_DDL),
-    );
+    )
+    .expect("the source declares major 1");
     WebClientBuilder::new(NOWHERE, SyncSchema::new(bundle))
         .with_upstream("r20-upstream", "SELECT * FROM items")
         .with_content_namespace("r68-offline-content")

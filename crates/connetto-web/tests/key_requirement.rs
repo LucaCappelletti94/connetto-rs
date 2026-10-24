@@ -25,19 +25,25 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 const REPLICA_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const UNKEYED_TIER_DDL: &str = "CREATE TABLE scratch (body TEXT)";
 
 /// A client schema over `ddl`, with `tier` as its device-private tier.
 fn schema(ddl: &str, tier: Option<&str>) -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        ddl,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        tier,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            tier,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// The replica at exactly `url`, fresh or already there as the test says.

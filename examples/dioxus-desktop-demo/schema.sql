@@ -12,6 +12,8 @@
 -- translates it through pg2sqlite into the replica's own DEFAULT (uuidv4()),
 -- which mints the key when a local write omits it. Both ends mint version 4.
 -- The quantity is non-null because every client schema already declares it so.
+-- The application schema major R31 routes and refuses connections by.
+-- connetto:major 1
 CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), quantity BIGINT NOT NULL CHECK (quantity >= 0), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 
 -- The lines of an order, keyed by the order and the line number together. It is

@@ -56,9 +56,8 @@ type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, Pg
 
 /// The deployment's Postgres tables, beside the registry tables connetto
 /// appends.
-const DEPLOYMENT_DDL: &str = "\
-CREATE TABLE orders (id INT PRIMARY KEY, label TEXT); \
-CREATE TABLE membership (installation TEXT PRIMARY KEY, member TEXT NOT NULL);";
+const DEPLOYMENT_DDL: &str = "-- connetto:major 1\nCREATE TABLE orders (id INT PRIMARY KEY, \
+    label TEXT); CREATE TABLE membership (installation TEXT PRIMARY KEY, member TEXT NOT NULL);";
 
 /// The deployment's rule on its membership table: the writer administers the
 /// row's owner.
