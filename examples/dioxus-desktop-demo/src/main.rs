@@ -65,10 +65,11 @@ use connetto_client::{
     KeyringAuth, NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning,
     decode_identity,
 };
-use connetto_core::messages::FatalErrorReason;
+use connetto_core::messages::{FatalErrorReason, FullResyncReason, SyncStatus};
 use connetto_dioxus::{use_away_input, use_live};
 use connetto_dioxus_desktop_demo::{
-    Order, Photo, mime_from_extension, orders, photo_file_id, photos, short_hex, stage_photo_row,
+    Note, Order, Photo, mime_from_extension, notes, orders, photo_file_id, photos, short_hex,
+    stage_photo_row,
 };
 use connetto_file_client::{
     Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FileId, FsStore,
@@ -190,6 +191,22 @@ fn demo_quantity() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     i64::try_from(millis % 9).unwrap_or(0) * 5 + 5
+}
+
+/// A device-unique integer id for a local-only `notes` row. `notes` stays on
+/// integer keys (device-private, never synced), so the client authors the id.
+/// The id is the millisecond clock above 21 random bits, so notes list in the
+/// order they were written and two windows of one device saving in the same
+/// millisecond collide about once in two million.
+fn fresh_note_id() -> i64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let millis = i64::try_from(millis).unwrap_or(0);
+    debug_assert!(millis < 1 << 42, "the shifted clock would overflow an i64");
+    let bytes: [u8; 16] = rosetta_uuid::Uuid::new_v4().into();
+    let tag = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")) >> 11;
+    (millis << 21) | i64::from(tag)
 }
 
 type Ws = NativeTransport;
@@ -591,6 +608,17 @@ fn status_label(event: &ClientEvent) -> Option<String> {
     match event {
         ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
         ClientEvent::Reconnected => Some("reconnected".to_owned()),
+        ClientEvent::SyncStatus(status) => Some(match status {
+            SyncStatus::Connected => "online".to_owned(),
+            SyncStatus::Offline => "offline".to_owned(),
+        }),
+        ClientEvent::NonFatal { related_to, detail } => Some(match related_to {
+            Some(id) => format!("non-fatal on {id}: {detail}"),
+            None => format!("non-fatal: {detail}"),
+        }),
+        ClientEvent::FullResync { sub_id, reason } => {
+            Some(format!("{sub_id}: full resync, {}", resync_reason(reason)))
+        }
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
@@ -628,6 +656,26 @@ fn status_label(event: &ClientEvent) -> Option<String> {
             Some("session expired, sign out and sign in again".to_owned())
         }
         _ => None,
+    }
+}
+
+/// The human-readable form of why a subscription's rows were replaced
+/// wholesale.
+fn resync_reason(reason: &FullResyncReason) -> String {
+    match reason {
+        FullResyncReason::CursorOutsideRetention => {
+            "the cursor left the retention window".to_owned()
+        }
+        FullResyncReason::AuthorizationChange => "a grant moved".to_owned(),
+        FullResyncReason::TableTruncated { table } => {
+            format!("table {table} was emptied")
+        }
+        FullResyncReason::SnapshotInterrupted => {
+            "the snapshot read failed part way through".to_owned()
+        }
+        FullResyncReason::CursorBeyondHistory => {
+            "the cursor is past the retained history".to_owned()
+        }
     }
 }
 
@@ -1652,6 +1700,7 @@ fn App() -> Element {
                 }
             }
 
+            NotesPanel {}
             PhotosPanel {}
             RetentionPanel { footprint }
             ExportPanel {}
@@ -2124,6 +2173,87 @@ fn PhotosPanel() -> Element {
             PinControls {}
             RefusedUploads { refused: feed.refused }
             LostBytes { retired: feed.retired }
+        }
+    }
+}
+
+/// The device-private notes pane: a live query against the tier table, which
+/// never leaves the device, so the demo holds and can export the tier beside
+/// the synced replica.
+#[component]
+fn NotesPanel() -> Element {
+    let client = use_context::<ConnettoClient<Ws>>();
+    let notes_query = use_live::<_, _, Note>(&client, notes::table.order(notes::id.asc()));
+    let display_notes: Vec<Note> = notes_query.value().read().iter().cloned().collect();
+    let notes_error = notes_query.error().read().clone();
+    let mut note_text: Signal<String> = use_signal(String::new);
+    let save_client = client;
+
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; \
+                    padding: 10px 14px; margin-bottom: 16px;",
+            h2 {
+                style: "margin-top: 0; font-size: 1em;",
+                "notes, device only"
+            }
+            p {
+                style: "color: #666; font-size: 0.9em;",
+                "Kept in the device-private tier: these rows never sync, and the \
+                 export below carries them beside the synced replica."
+            }
+            div {
+                style: "display: flex; gap: 8px; margin-bottom: 8px;",
+                input {
+                    r#type: "text",
+                    placeholder: "a note that stays on this device",
+                    value: "{note_text}",
+                    oninput: move |event| note_text.set(event.value()),
+                }
+                button {
+                    onclick: move |_| {
+                        let body = note_text.read().clone();
+                        if body.is_empty() {
+                            return;
+                        }
+                        let client = save_client.clone();
+                        spawn(async move {
+                            let id = fresh_note_id();
+                            let result = client
+                                .with_conn(move |conn| {
+                                    diesel::insert_into(notes::table)
+                                        .values((notes::id.eq(id), notes::body.eq(&body)))
+                                        .execute(conn.conn())
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                tracing::error!(error = ?err, "note save failed");
+                            }
+                        });
+                    },
+                    "Save note"
+                }
+            }
+            if let Some(err) = notes_error {
+                p { style: "color: #b00;", "notes error: {err}" }
+            }
+            table {
+                style: "border-collapse: collapse; min-width: 320px;",
+                thead {
+                    tr {
+                        th { style: "border: 1px solid #999; padding: 4px 12px;", "id" }
+                        th { style: "border: 1px solid #999; padding: 4px 12px;", "body" }
+                    }
+                }
+                tbody {
+                    for note in display_notes {
+                        tr { key: "{note.id}",
+                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{note.id}" }
+                            td { style: "border: 1px solid #ccc; padding: 4px 12px;", "{note.body}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }

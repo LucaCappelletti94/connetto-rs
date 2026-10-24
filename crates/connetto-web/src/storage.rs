@@ -214,6 +214,19 @@ pub fn tier_db_name(replica: &str) -> String {
     format!("{replica}-tier")
 }
 
+/// The relay hub's own state database beside the replica `name`, the file the
+/// hub attaches for its per-tab watermarks.
+///
+/// Derived rather than configured, the way [`tier_db_name`] is, so the file
+/// and the key it opens under have one scope. The state is ciphertext under
+/// the replica's own key, so a second identity on the same device meets its
+/// own file rather than one its key cannot unlock, and a data wipe reaches
+/// it from the one name its pending-delete record keeps.
+#[must_use]
+pub fn hub_meta_db_name(replica: &str) -> String {
+    format!("{replica}-hub-meta")
+}
+
 /// The pool entry and key record of `credential_name`'s replica under an
 /// application's `prefix`.
 ///
@@ -242,8 +255,9 @@ pub fn replica_name<Id: serde::Serialize + ?Sized>(
     ))
 }
 
-/// Data teardown that destroys the replica's key, then deletes the replica, its
-/// device-private tier, and its content namespace.
+/// Data teardown that destroys the replica's key, then deletes the replica,
+/// its device-private tier, the relay hub's state database, and its content
+/// namespace.
 ///
 /// The browser mirror of `connetto_client::teardown::wipe_replica`, and the
 /// crypto-shredding half of the logout grid. Deleting the pool entry alone
@@ -260,8 +274,12 @@ pub fn replica_name<Id: serde::Serialize + ?Sized>(
 /// that opens it, and the next boot for this identity would mint a fresh key,
 /// meet the surviving file and fail to unlock it.
 ///
+/// The hub's state database goes too, at [`hub_meta_db_name`], for the same
+/// reason as the tier. It shares the key being destroyed, and left behind it
+/// would outlive the key that opens it.
+///
 /// The content namespace goes last, after the replica, so the order is key,
-/// tier, replica, content. It is `None` for a deployment with no content, and it
+/// tier, hub state, replica, content. It is `None` for a deployment with no content, and it
 /// cannot be recomputed from the replica name, so the pending-wipe record
 /// carries it. An environmental failure removing it defers to a later boot
 /// through [`WipeProgress::ContentPending`] while the replica stays destroyed,
@@ -299,6 +317,9 @@ where
         .delete_db(&tier_db_name(name))
         .map_err(|err| WipeError::Storage(err.to_string()))?;
     storage
+        .delete_db(&hub_meta_db_name(name))
+        .map_err(|err| WipeError::Storage(err.to_string()))?;
+    storage
         .delete_db(name)
         .map_err(|err| WipeError::Storage(err.to_string()))?;
     match content_namespace {
@@ -310,7 +331,7 @@ where
 /// How far a [`wipe_replica`] got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WipeProgress {
-    /// The replica, its tier, and any content namespace are all gone.
+    /// The replica, its tier, its hub state, and any content namespace are all gone.
     Complete,
     /// The replica and its tier are gone, but the content namespace could not be
     /// removed for an environmental reason and is left for a later boot to retry.
