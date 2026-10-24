@@ -1326,12 +1326,13 @@ where
         // The resolve and fetch waits ride a timer here rather than parking a
         // handler: when one fires, the sweep answers only the waits that have
         // truly elapsed and the loop keeps serving everything else in between.
-        let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
-        let fetch_ms = fetch_deadline_ms(&self.state.pending_fetch);
-        let ticket_ms = match (resolve_ms, fetch_ms) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let ticket_ms = earliest_wait_ms(
+            self.state
+                .pending_resolve
+                .iter()
+                .map(|resolve| resolve.deadline)
+                .chain(self.state.pending_fetch.iter().map(|fetch| fetch.deadline)),
+        );
         let ticket_wait = async {
             match ticket_ms {
                 Some(ms) => sleep_ms(ms).await,
@@ -4311,25 +4312,12 @@ fn route_fetch_tickets(
     settled
 }
 
-/// Milliseconds until the earliest resolve wait must answer, `None` when no
-/// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
-/// deadline the sweep has not yet collected.
-fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
+/// Milliseconds until the earliest of the monotonic `deadlines` falls due,
+/// `None` when there are none. Never zero, so a cycle never busy-spins on an
+/// elapsed deadline the sweep has not yet collected.
+fn earliest_wait_ms(deadlines: impl Iterator<Item = Duration>) -> Option<i32> {
     let now = SystemClock.monotonic();
-    pending
-        .iter()
-        .map(|resolve| wait_ms(resolve.deadline, now))
-        .min()
-}
-
-/// Milliseconds until the earliest fetch wait must answer, `None` when no
-/// fetch waits. Bounded the same way the resolve deadline is.
-fn fetch_deadline_ms(pending: &[PendingHubFetch]) -> Option<i32> {
-    let now = SystemClock.monotonic();
-    pending
-        .iter()
-        .map(|fetch| wait_ms(fetch.deadline, now))
-        .min()
+    deadlines.map(|deadline| wait_ms(deadline, now)).min()
 }
 
 /// Resolve with the worker's keepalive deadline once it falls due, never when

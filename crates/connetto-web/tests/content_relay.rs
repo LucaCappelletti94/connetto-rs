@@ -2,37 +2,23 @@
 //! commit with the mutation that names them, mismatches are refused, and
 //! resolution answers from the worker's store, the server ticket, or nowhere.
 
-use core::convert::Infallible;
-use core::future::{Future, ready};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientBuilder, FirstThen, Grant, HeldCredential, SyncSchema};
-use connetto_core::Cursor;
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
-    BulkMessage, CONTENT_TICKET_REFUSED, ContentTicketGrant, ControlMessage, Handshake,
-    HandshakeAck, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError, WriterGrant,
+    ContentTicketGrant, ControlMessage, MutationReject, MutationRejectReason,
 };
-use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
-use connetto_file_core::{FileId, FileIdHasher, MimeClass};
-use connetto_web::content_wire::{ContentFrame, WireResolve, mime_code};
-use connetto_web::relay::{HubReconnect, RelayHub};
+use connetto_file_core::FileId;
+use connetto_web::content_wire::{ContentFrame, WireResolve};
+use connetto_web::relay::RelayHub;
 use connetto_web::workers::DB_ALIVE_LOCK;
 use connetto_web::{InternalInbound, MessageTransport, locks};
-use diesel::Connection;
-use diesel::connection::SimpleConnection;
 use futures_channel::mpsc;
 use futures_util::StreamExt;
-use js_sys::{Array, Uint8Array};
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+use js_sys::Uint8Array;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{DedicatedWorkerGlobalScope, MessagePort};
+use web_sys::MessagePort;
 
 #[expect(
     dead_code,
@@ -41,14 +27,17 @@ use web_sys::{DedicatedWorkerGlobalScope, MessagePort};
 #[path = "content_archive/support.rs"]
 mod support;
 
+#[path = "content_relay/fixture.rs"]
+mod fixture;
+
+use fixture::{
+    Tickets, blob_of, captured_insert, declared_id, relay_tab, send_mutation, stage, uploads_of,
+};
 use support::{install_content_transport, timeout_ms, until};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
 const TEST_LOCK: &str = "connetto-content-relay-test";
-/// The scripted tab's client id, from which the hub derives its watermark key.
-const TAB_CLIENT_ID: &str = "6f1c9d2e-8a4b-4c5d-9e6f-0a1b2c3d4e5f";
 
 /// Distinct bytes per test: a relay a finished test left running keeps driving
 /// its own outbox against whatever `fetch` the current test installed.
@@ -59,219 +48,13 @@ const LOCAL_PHOTO: &[u8] = b"a photograph resolved back over the lane before upl
 const REMOTE_PHOTO: &[u8] = b"a photograph resolved to its server address after upload";
 const HELD_PHOTO: &[u8] = b"a photograph committed while another file's ticket is held";
 
-/// How the fake upstream answers content tickets.
-#[derive(Clone)]
-enum Tickets {
-    Grants,
-    Refused,
-    /// Every request goes unanswered and lands on the shared list, for a
-    /// test that releases one later.
-    Held(Rc<RefCell<Vec<String>>>),
-}
-
-struct Upstream {
-    incoming: mpsc::UnboundedReceiver<IncomingFrame>,
-    answers: mpsc::UnboundedSender<IncomingFrame>,
-    mutations: Rc<Cell<u32>>,
-    tickets: Tickets,
-}
-
-impl Upstream {
-    /// A live upstream answering the handshake, counting forwarded mutations,
-    /// and answering every content ticket per `tickets`.
-    fn live(mutations: Rc<Cell<u32>>, tickets: Tickets) -> Self {
-        let (answers, incoming) = mpsc::unbounded();
-        answers
-            .unbounded_send(IncomingFrame::Control(ControlMessage::HandshakeAck(
-                HandshakeAck {
-                    connection_id: "r69c-relay".to_owned(),
-                    session_token: "r69c-relay".to_owned(),
-                    resume_token: "r69c-relay".to_owned(),
-                    current_cursor: Cursor::new(Vec::new()),
-                    schema_version: None,
-                    initial_credits: 64,
-                    writer: Some(WriterGrant {
-                        number: 1,
-                        frontier: 0,
-                    }),
-                },
-            )))
-            .expect("queue handshake");
-        Self {
-            incoming,
-            answers,
-            mutations,
-            tickets,
-        }
-    }
-
-    /// A sender onto this upstream's inbound queue, for a test that injects
-    /// an answer of its own after the connection has moved into the hub.
-    fn answers(&self) -> mpsc::UnboundedSender<IncomingFrame> {
-        self.answers.clone()
-    }
-}
-
-impl Transport for Upstream {
-    type Error = Infallible;
-
-    fn send_control(
-        &mut self,
-        message: ControlMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
-        if let ControlMessage::ContentTicketRequest(request) = message {
-            let reply = match &self.tickets {
-                Tickets::Grants => Some(ControlMessage::ContentTicketGrant(ContentTicketGrant {
-                    request_id: request.request_id.clone(),
-                    url: format!(
-                        "https://content.invalid/files/{}/intent?t=r69c",
-                        FileId::from_bytes(request.file_id)
-                    ),
-                })),
-                Tickets::Refused => Some(ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request.request_id.clone()),
-                    detail: CONTENT_TICKET_REFUSED.to_owned(),
-                })),
-                Tickets::Held(held) => {
-                    held.borrow_mut().push(request.request_id);
-                    None
-                }
-            };
-            if let Some(reply) = reply {
-                self.answers
-                    .unbounded_send(IncomingFrame::Control(reply))
-                    .expect("queue ticket");
-            }
-        }
-        ready(Ok(()))
-    }
-
-    fn send_bulk(&mut self, message: BulkMessage) -> impl Future<Output = Result<(), Self::Error>> {
-        if matches!(message, BulkMessage::MutationPatch(_)) {
-            self.mutations.set(self.mutations.get() + 1);
-        }
-        ready(Ok(()))
-    }
-
-    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
-        Ok(self.incoming.next().await)
-    }
-
-    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
-    }
-}
-
-/// The client schema over [`DDL`].
-fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
-}
-
-/// A dialer handing out `transport` once and nothing after.
-fn once<T: Transport + 'static>(
-    transport: T,
-) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
-    FirstThen::new(transport, || core::future::ready(Err("spent")))
-}
-
-/// A content-aware hub on a live fake upstream plus the tab transport on
-/// the other end of a real message channel, already handshaken.
-///
-/// Also hands back the mutation counter, and a sender onto the upstream's
-/// inbound queue for tests that inject an answer the fake never scripts.
-async fn relay_tab(
-    store_name: &str,
-    key: [u8; 32],
-    tickets: Tickets,
-) -> (
-    RelayHub,
-    Rc<Cell<u32>>,
-    MessageTransport<MessagePort>,
-    mpsc::UnboundedSender<IncomingFrame>,
-) {
-    let mutations = Rc::new(Cell::new(0u32));
-    let upstream = Upstream::live(Rc::clone(&mutations), tickets.clone());
-    let answers = upstream.answers();
-    let worker = ClientBuilder::new(schema(), once(upstream))
-        .signed_in(
-            HeldCredential::new(Grant::new("user:r69c"), "r69c")
-                .expect("a string identity serializes"),
-        )
-        .connect_driven()
-        .await
-        .expect("connect relay replica");
-    let scope = js_sys::global()
-        .dyn_into::<DedicatedWorkerGlobalScope>()
-        .expect("dedicated worker");
-    let store = BrowserStore::install(&scope, store_name)
-        .await
-        .expect("install store");
-    let content = ContentArchive::new(store, key);
-    let (hub, pump, _notices) = RelayHub::with_reconnect_and_content(
-        worker,
-        ":memory:",
-        HubReconnect {
-            factory: {
-                let mutations = Rc::clone(&mutations);
-                let tickets = tickets.clone();
-                move || {
-                    ready(Ok::<_, Infallible>(Upstream::live(
-                        Rc::clone(&mutations),
-                        tickets.clone(),
-                    )))
-                }
-            },
-            // A refused ticket retries on this timer. An instant sleeper
-            // turns that backoff into a busy loop that starves the worker,
-            // so the fixture sleeps for real, capped to keep tests bounded.
-            sleeper: |delay: core::time::Duration| async move {
-                let ms = delay.as_millis().clamp(1, 500);
-                timeout_ms(i32::try_from(ms).expect("capped above")).await;
-            },
-            policy: ReconnectPolicy::new(),
-            upstream: Vec::new(),
-        },
-        content,
-        BrowserHttp::new(),
-    )
-    .expect("content relay");
-    spawn_local(async move {
-        pump.await.expect("relay pump");
-    });
-    let channel = web_sys::MessageChannel::new().expect("message channel");
-    hub.attach_with_content(MessageTransport::<MessagePort>::new(channel.port1()));
-    let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        TAB_CLIENT_ID,
-    )))
-    .await
-    .expect("post handshake");
-    let ack = tokio::select! {
-        frame = tab.recv() => frame.expect("transport").expect("open"),
-        () = timeout_ms(2_000) => panic!("the hub never answered the handshake"),
-    };
-    assert!(
-        matches!(ack, IncomingFrame::Control(ControlMessage::HandshakeAck(_))),
-        "the hub's first answer is the ack, got {ack:?}"
-    );
-    (hub, mutations, tab, answers)
-}
-
 /// The same relay with a scripted grant or refusal for every ticket.
 async fn relay_with_tab(
     store_name: &str,
     key: [u8; 32],
     grants: bool,
 ) -> (RelayHub, Rc<Cell<u32>>, MessageTransport<MessagePort>) {
-    let (hub, mutations, tab, _answers) = relay_tab(
+    let (hub, mutations, tab, _answers, _store) = relay_tab(
         store_name,
         key,
         if grants {
@@ -284,26 +67,6 @@ async fn relay_with_tab(
     (hub, mutations, tab)
 }
 
-fn blob_of(bytes: &[u8]) -> web_sys::Blob {
-    let arr = Uint8Array::from(bytes);
-    web_sys::Blob::new_with_u8_array_sequence(&Array::of1(&arr)).expect("blob from bytes")
-}
-
-fn declared_id(bytes: &[u8]) -> FileId {
-    let mut hasher = FileIdHasher::new();
-    hasher.update(bytes);
-    hasher.finalize()
-}
-
-fn stage(tab: &MessageTransport<MessagePort>, file_id: FileId, blob: &web_sys::Blob) {
-    let frame = ContentFrame::Stage {
-        file_id: *file_id.as_bytes(),
-        mime: mime_code(MimeClass::Jpeg),
-    };
-    tab.post_internal(&frame.to_json(), Some(blob))
-        .expect("post stage");
-}
-
 fn resolve(tab: &MessageTransport<MessagePort>, request_id: u64, file_id: FileId) {
     let frame = ContentFrame::Resolve {
         request_id,
@@ -311,39 +74,6 @@ fn resolve(tab: &MessageTransport<MessagePort>, request_id: u64, file_id: FileId
     };
     tab.post_internal(&frame.to_json(), None)
         .expect("post resolve");
-}
-
-/// The changeset of one `photos` insert declaring `content_id`, captured from
-/// a throwaway replica the way a tab's own capture would produce it.
-fn captured_insert(content_id: &[u8]) -> Vec<u8> {
-    use diesel_sqlite_session::SqliteSessionExt;
-    let mut hex = String::new();
-    for byte in content_id {
-        std::fmt::write(&mut hex, format_args!("{byte:02x}")).expect("string append");
-    }
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open");
-    conn.batch_execute(DDL).expect("schema");
-    let mut session = conn.create_session().expect("session");
-    session.attach_all().expect("attach");
-    conn.batch_execute(&format!("INSERT INTO photos VALUES (1, x'{hex}')"))
-        .expect("insert");
-    session.changeset().expect("changeset")
-}
-
-async fn send_mutation(tab: &mut MessageTransport<MessagePort>, seq: u64, changeset: &[u8]) {
-    tab.send_control(ControlMessage::MutationHeader(MutationHeader {
-        client_seq: seq,
-        op_count: 1,
-        provenance: None,
-    }))
-    .await
-    .expect("post header");
-    tab.send_bulk(BulkMessage::MutationPatch(MutationPatch {
-        client_seq: seq,
-        patchset_zstd: zstd::encode_all(changeset, 3).expect("compress"),
-    }))
-    .await
-    .expect("post patchset");
 }
 
 async fn recv_control(
@@ -379,14 +109,6 @@ fn blob_bytes(blob: &web_sys::Blob) -> Vec<u8> {
     Uint8Array::new(&buffer).to_vec()
 }
 
-fn uploads_of(uploaded: &RefCell<Vec<Vec<u8>>>, photo: &[u8]) -> usize {
-    uploaded
-        .borrow()
-        .iter()
-        .filter(|body| body.as_slice() == photo)
-        .count()
-}
-
 /// A staged file plus a row naming its id: the hub commits the manifest with
 /// the mutation, forwards it once, and the driver uploads the bytes.
 #[wasm_bindgen_test]
@@ -398,7 +120,7 @@ async fn a_staged_file_and_its_row_reach_the_hub_as_one_mutation() {
     let (_hub, mutations, mut tab) = relay_with_tab("r69c-staged-commit", [11; 32], true).await;
     let file_id = declared_id(COMMIT_PHOTO);
     stage(&tab, file_id, &blob_of(COMMIT_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || uploads_of(&uploaded, COMMIT_PHOTO) == 1).await,
         "the staged file must upload"
@@ -428,7 +150,7 @@ async fn a_declaration_that_is_not_the_blob_is_refused_and_uploads_nothing() {
     // names that same lie, so pairing succeeds and the recomputed hash fails.
     let lie = FileId::from_bytes([9; 32]);
     stage(&tab, lie, &blob_of(REFUSE_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(lie.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, lie.as_bytes())).await;
     let mut reject = None;
     for _ in 0..8 {
         match recv_control(&mut tab, 1_000).await {
@@ -477,7 +199,7 @@ async fn content_that_no_mutation_names_uploads_nothing() {
     stage(&tab, declared_id(UNPAIRED_PHOTO), &blob_of(UNPAIRED_PHOTO));
     // The row names a three-byte value, not a file identity, so nothing
     // pairs and the mutation goes out as an ordinary one.
-    send_mutation(&mut tab, 1, &captured_insert(&[0xAA, 0xBB, 0xCC])).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, &[0xAA, 0xBB, 0xCC])).await;
     assert!(
         until(async || mutations.get() == 1).await,
         "the unnamed mutation is an ordinary one and must still forward"
@@ -521,7 +243,7 @@ async fn an_unsent_staged_file_resolves_to_its_own_bytes() {
     let mut inbox = tab.take_internal_inbox().expect("the lane is the tab's");
     let file_id = declared_id(LOCAL_PHOTO);
     stage(&tab, file_id, &blob_of(LOCAL_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || mutations.get() == 1).await,
         "the row commits"
@@ -551,7 +273,7 @@ async fn an_uploaded_file_resolves_to_a_server_address() {
     let mut inbox = tab.take_internal_inbox().expect("the lane is the tab's");
     let file_id = declared_id(REMOTE_PHOTO);
     stage(&tab, file_id, &blob_of(REMOTE_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || uploads_of(&uploaded, REMOTE_PHOTO) == 1).await,
         "the file must finish uploading before the resolve"
@@ -611,7 +333,7 @@ async fn the_hub_answers_around_a_ticket_that_never_arrives() {
     let serial = locks::hold_lock(TEST_LOCK).await;
     let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
     let held: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let (_hub, mutations, mut tab, answers) = relay_tab(
+    let (_hub, mutations, mut tab, answers, _store) = relay_tab(
         "r69c-resolve-held",
         [17; 32],
         Tickets::Held(Rc::clone(&held)),
@@ -636,7 +358,7 @@ async fn the_hub_answers_around_a_ticket_that_never_arrives() {
 
     stage(&tab, declared_id(HELD_PHOTO), &blob_of(HELD_PHOTO));
     let file_id = declared_id(HELD_PHOTO);
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || mutations.get() == 1).await,
         "a mutation commits while another resolve waits on its ticket"
