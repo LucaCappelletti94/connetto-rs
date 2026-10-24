@@ -24,6 +24,7 @@ pub struct SyncSchema {
     unrecorded: HashSet<String>,
     /// Both tiers as one main-schema DDL, for a relay tab's mirror.
     mirror_ddl: Option<String>,
+    shared_store: bool,
 }
 
 impl SyncSchema {
@@ -43,6 +44,7 @@ impl SyncSchema {
             sql_functions: uuidv4_installer(),
             unrecorded: HashSet::new(),
             mirror_ddl: None,
+            shared_store: true,
         }
     }
 
@@ -64,6 +66,37 @@ impl SyncSchema {
         self
     }
 
+    /// Enable the device-wide public store.
+    #[must_use]
+    pub fn with_shared_store(mut self, enabled: bool) -> Self {
+        self.shared_store = enabled;
+        self
+    }
+
+    /// The shared-file initialization programs when this connection shares rows.
+    #[must_use]
+    pub fn shared_layout(&self) -> Option<&connetto_core::schema::SharedLayout> {
+        if self.shared_store && self.mirror_ddl.is_none() {
+            self.bundle.shared_layout()
+        } else {
+            None
+        }
+    }
+
+    /// The physical tables whose rows live in the shared file.
+    pub fn shared_tables(&self) -> impl Iterator<Item = &str> {
+        self.bundle
+            .shared_tables()
+            .iter()
+            .map(|logical| self.policy_tables.physical(logical).unwrap_or(logical))
+    }
+
+    /// Connection-scoped statements for the unshared layout.
+    #[must_use]
+    pub fn connection_ddl(&self) -> &str {
+        self.bundle.connection_ddl()
+    }
+
     /// The same schema as a relay tab's mirror runs it, both tiers in the
     /// main schema.
     ///
@@ -73,6 +106,7 @@ impl SyncSchema {
     /// relay speaks for presents.
     #[must_use]
     pub fn relay_mirror(mut self) -> Self {
+        self.shared_store = false;
         if let Some(tier) = self.bundle.local_tier_ddl() {
             self.mirror_ddl = Some(format!("{}\n{tier}", self.bundle.replica_ddl()));
         }

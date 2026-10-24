@@ -41,7 +41,7 @@ pub use percent::{percent_decode, percent_encode};
 pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
 pub use schema::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
-    CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaBundle, SchemaVersion, UUID_FUNCTION,
+    CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaBundle, SchemaVersion, SharedLayout, UUID_FUNCTION,
     WRITE_EXEMPTION_FUNCTION, schema_hash,
 };
 pub use session_id::{SessionId, SessionIdParseError};

@@ -240,6 +240,18 @@ pub(super) async fn open_worker<Id>(
                 .map_err(BootError::KeyStore)?,
         )
     };
+    if config.schema.shared_layout().is_some() {
+        let shared = place
+            .locate(&connetto_client::shared_store_name(
+                connetto_client::REPLICA_PREFIX,
+            ))
+            .map_err(BootError::ReplicaOpen)?;
+        if !shared.exists() {
+            crate::auth::provision_replica_key(key_store.as_ref(), shared.record())
+                .await
+                .map_err(BootError::KeyStore)?;
+        }
+    }
     let content_root_key = key.as_ref().map(|key| *key.as_bytes());
     let worker = core
         .signed_in(resolved.credential)

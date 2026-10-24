@@ -87,6 +87,7 @@ mod multicast;
 pub mod reconnect;
 pub mod replica;
 pub mod share_keys;
+mod shared_replay;
 mod subscriptions;
 
 #[cfg(feature = "peer")]
@@ -845,6 +846,9 @@ pub(crate) struct ClientConfig {
     /// land, so reporting anything stronger would claim protection connetto
     /// does not yet provide.
     custody: Custody,
+    shared_layout: Option<Arc<connetto_core::schema::SharedLayout>>,
+    shared_tables: HashSet<String>,
+    connection_ddl: Option<Arc<str>>,
 }
 
 impl ClientConfig {
@@ -863,7 +867,21 @@ impl ClientConfig {
             subjects: None,
             tuning: SyncTuning::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
+            shared_layout: None,
+            shared_tables: HashSet::new(),
+            connection_ddl: None,
         }
+    }
+
+    /// Fold the device's storage layout into the open configuration.
+    fn with_storage_schema(mut self, schema: &SyncSchema) -> Self {
+        self.shared_layout = schema.shared_layout().cloned().map(Arc::new);
+        if self.shared_layout.is_some() {
+            self.shared_tables = schema.shared_tables().map(str::to_lowercase).collect();
+        }
+        self.connection_ddl =
+            (!schema.connection_ddl().is_empty()).then(|| Arc::from(schema.connection_ddl()));
+        self
     }
 
     /// The login grant, when somebody is signed in.
@@ -1600,6 +1618,7 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
 /// SQL never names it, since bare table names resolve across attached
 /// databases and duplicate names across tiers are a generation-time error.
 const LOCAL_SCHEMA: &str = "connetto_local";
+const SHARED_SCHEMA: &str = "connetto_shared";
 
 /// A table name row from an attached schema's catalog.
 #[derive(diesel::QueryableByName)]
@@ -1705,12 +1724,14 @@ fn check_policy_tables(
     db: &mut SqliteConnection,
     tables: &PolicyTables,
 ) -> Result<(), ClientError> {
-    let present: HashSet<String> = sqlite_catalog::table
-        .select(sqlite_catalog::name)
-        .filter(sqlite_catalog::kind.eq("view"))
-        .load::<String>(db)?
+    let rows: Vec<SchemaTableRow> = diesel::sql_query(
+        "SELECT name FROM main.sqlite_schema WHERE type = 'view' \
+         UNION SELECT name FROM temp.sqlite_schema WHERE type = 'view'",
+    )
+    .load(db)?;
+    let present: HashSet<String> = rows
         .into_iter()
-        .map(|name| name.to_lowercase())
+        .map(|row| row.name.to_lowercase())
         .collect();
     let declared = tables.views();
     if &present == declared {
@@ -3295,16 +3316,59 @@ pub struct ConnettoConnection<T: Transport> {
     list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
 }
 
+/// Attach the shared store when the build shares tables, then run the program
+/// for the files this open finds fresh, or the reopen program when neither is.
+fn install_storage_layout<S: ReplicaStorage>(
+    db: &mut SqliteConnection,
+    replica: &Replica<'_, S>,
+    sqlite_ddl: Option<&str>,
+    config: &ClientConfig,
+) -> Result<(), ClientError> {
+    use diesel::OptionalExtension as _;
+    let Some(layout) = &config.shared_layout else {
+        if let Some(ddl) = sqlite_ddl {
+            db.batch_execute(ddl)?;
+        } else if let Some(ddl) = &config.connection_ddl {
+            db.batch_execute(ddl)?;
+        }
+        return Ok(());
+    };
+    match (replica.shared_store(), replica.key()) {
+        (Some((path, key)), _) => harden::attach_keyed_in_window(
+            db,
+            path,
+            SHARED_SCHEMA,
+            harden::AttachPermits::CreateAndWrite,
+            key,
+        )?,
+        // Nothing at rest, so the shared store lives as long as the connection.
+        (None, None) => {
+            harden::attach_in_window(db, ":memory:", SHARED_SCHEMA, harden::AttachPermits::Write)?;
+        }
+        (None, Some(_)) => return Err(ClientError::ReplicaKeyMissing),
+    }
+    let fresh_shared = diesel::sql_query(
+        "SELECT 1 AS present FROM connetto_shared.sqlite_schema WHERE type = 'table' LIMIT 1",
+    )
+    .get_result::<Present>(db)
+    .optional()?
+    .is_none();
+    if fresh_shared {
+        db.set_auto_vacuum(Some(SHARED_SCHEMA), AutoVacuumMode::Incremental)?;
+    }
+    db.transaction::<_, ClientError, _>(|db| {
+        db.batch_execute(layout.sql(sqlite_ddl.is_some(), fresh_shared))?;
+        Ok(())
+    })?;
+    check_recorded_tables(db, SHARED_SCHEMA, &config.unrecorded_tables)
+}
+
 /// The schema and metadata tables an open installs, in dependency order.
 #[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
-    sqlite_ddl: Option<&str>,
     config: &ClientConfig,
 ) -> Result<(), ClientError> {
-    if let Some(ddl) = sqlite_ddl {
-        db.batch_execute(ddl)?;
-    }
     // The views are what the map has to agree with.
     check_policy_tables(db, &config.policy_tables)?;
     // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
@@ -3390,10 +3454,13 @@ where
     #[cfg(feature = "native-auth")]
     pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
         // The stand-in has no schema, so the build's policy views are absent by design.
-        let config = self
+        let mut config = self
             .config
             .clone()
             .with_policy_tables(PolicyTables::default());
+        config.shared_layout = None;
+        config.shared_tables.clear();
+        config.connection_ddl = None;
         Self::open(&Replica::in_memory(), "", &config, None)
     }
 
@@ -3463,7 +3530,8 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        install_replica_schema(&mut db, sqlite_ddl, config)?;
+        install_storage_layout(&mut db, replica, sqlite_ddl, config)?;
+        install_replica_schema(&mut db, config)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
@@ -5164,6 +5232,12 @@ where
     #[must_use]
     pub fn policy_tables(&self) -> &PolicyTables {
         &self.config.policy_tables
+    }
+
+    /// The physical tables held in the device-wide public store.
+    #[must_use]
+    pub fn shared_tables(&self) -> &HashSet<String> {
+        &self.config.shared_tables
     }
 
     /// Who this connection answers its policy views as, which a relay states
@@ -7207,6 +7281,7 @@ where
         // The coverage the cursor carries, materialized before the closure so
         // the pair writes in the same statement as the cursor.
         let coverage = self.cursor_subjects.as_deref();
+        let shared = &self.config.shared_tables;
         let applied = self.db.transaction::<_, ClientError, _>(|conn| {
             // The cursor advances even when every op was withheld. A departure
             // this replica declined to act on is still an event it has seen,
@@ -7214,6 +7289,10 @@ where
             if let Some(bytes) = apply.as_deref() {
                 conn.apply_patchset(bytes, server_wins)
                     .map_err(|e| ClientError::Apply(e.to_string()))?;
+                // The native apply reaches `main` only.
+                if !shared.is_empty() {
+                    shared_replay::apply(conn, bytes, shared)?;
+                }
             }
             if let Some(cursor) = cursor {
                 persist_cursor_and_subjects(conn, cursor, coverage)?;

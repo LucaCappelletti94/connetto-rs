@@ -379,6 +379,7 @@ pub(crate) fn build_config(
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
         .with_tuning(*tuning)
         .with_custody(custody)
+        .with_storage_schema(schema)
 }
 
 /// The share keys the build folds into the base config after it, applied on
@@ -912,6 +913,8 @@ struct DurableResolved<T: Transport, C> {
     located: Located,
     /// The device-private tier, when the build has one.
     ddl: Option<String>,
+    /// The device-wide public file and its independent key.
+    shared: Option<(Located, ReplicaKey)>,
     /// The custody the stores' claims fold into.
     custody: Custody,
     /// The away-and-return gate and its mechanism, when the gate is on.
@@ -969,11 +972,13 @@ where
             key,
             located,
             ddl,
+            shared,
             custody,
             gate,
             share_key_store,
         } = self.resolve().await?;
-        let replica = open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref())?;
+        let replica =
+            open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref(), shared)?;
         run_core(
             &replica,
             base,
@@ -1009,6 +1014,19 @@ where
             None if located.exists => return Err(ClientError::ReplicaKeyMissing),
             None => mint_key(&self.key_store, &located.record).await?,
         };
+        let shared = if self.base.schema.shared_layout().is_some() {
+            let located = self
+                .place
+                .locate(&crate::shared_store_name(REPLICA_PREFIX))?;
+            let key = match self.key_store.load(&located.record).await? {
+                Some(key) => key,
+                None if located.exists => return Err(ClientError::ReplicaKeyMissing),
+                None => mint_key(&self.key_store, &located.record).await?,
+            };
+            Some((located, key))
+        } else {
+            None
+        };
         let mut claims = self.claims;
         claims.push(self.key_store.protection());
         claims.push(self.share_key_store.protection());
@@ -1030,6 +1048,7 @@ where
             key,
             located,
             ddl,
+            shared,
             custody,
             gate,
             share_key_store,
@@ -1084,12 +1103,17 @@ fn open_encrypted_replica<'a>(
     key: &ReplicaKey,
     fresh: bool,
     ddl: Option<&'a String>,
+    shared: Option<(Located, ReplicaKey)>,
 ) -> Result<Replica<'a, Encrypted>, ClientError> {
     let replica = Replica::encrypted_file(location, Some(key.clone()))?;
-    Ok(match (fresh, ddl) {
+    let replica = match (fresh, ddl) {
         (true, Some(ddl)) => replica.with_tier(ddl),
         (false, Some(_)) => replica.with_existing_tier(),
         (_, None) => replica,
+    };
+    Ok(match shared {
+        Some((located, key)) => replica.with_shared_store(located.url, key),
+        None => replica,
     })
 }
 
@@ -1138,6 +1162,7 @@ where
             token_source,
             key,
             located,
+            shared,
             custody,
             share_key_store,
             ..
@@ -1149,7 +1174,11 @@ where
             caller: Some(caller),
             custody,
             token_source,
-            replica: DrivenReplica::Encrypted { located, key },
+            replica: DrivenReplica::Encrypted {
+                located,
+                key,
+                shared: shared.map(Box::new),
+            },
             share_key_store: Some(share_key_store),
         })
     }
@@ -1160,7 +1189,11 @@ enum DrivenReplica {
     /// In process, with the device-private tier when the schema has one.
     InMemory,
     /// The located file under its key.
-    Encrypted { located: Located, key: ReplicaKey },
+    Encrypted {
+        located: Located,
+        key: ReplicaKey,
+        shared: Option<Box<(Located, ReplicaKey)>>,
+    },
 }
 
 /// The owned inputs every driven terminal runs, so the connect and the open
@@ -1221,9 +1254,19 @@ where
                 )
                 .await
             }
-            DrivenReplica::Encrypted { located, key } => {
+            DrivenReplica::Encrypted {
+                located,
+                key,
+                shared,
+            } => {
                 let fresh = !located.exists;
-                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                let replica = open_encrypted_replica(
+                    &located.url,
+                    &key,
+                    fresh,
+                    tier.as_ref(),
+                    shared.map(|shared| *shared),
+                )?;
                 offline_connect_core(
                     &replica,
                     &base.schema,
@@ -1262,9 +1305,19 @@ where
                     share_key_store,
                 )
             }
-            DrivenReplica::Encrypted { located, key } => {
+            DrivenReplica::Encrypted {
+                located,
+                key,
+                shared,
+            } => {
                 let fresh = !located.exists;
-                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                let replica = open_encrypted_replica(
+                    &located.url,
+                    &key,
+                    fresh,
+                    tier.as_ref(),
+                    shared.map(|shared| *shared),
+                )?;
                 open_driven_core(
                     &replica,
                     &base.schema,
