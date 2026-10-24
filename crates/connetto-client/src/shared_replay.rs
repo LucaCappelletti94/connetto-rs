@@ -538,21 +538,53 @@ mod tests {
         differential(&frame, NOTES, Some(NOTES), |_| Vec::new(), same_notes);
     }
 
+    fn seeded_notes(schema: &str) -> Vec<String> {
+        vec![format!(
+            "INSERT INTO {schema}.notes VALUES (1, 'one', 'first'), (2, 'two', 'second'), (3, 'three', NULL)"
+        )]
+    }
+
     #[test]
-    fn sparse_update_matches_native() {
+    fn updates_to_stored_rows_match_native() {
         let schema = notes_schema();
+        let update = |id: i64, column: usize, value: &str| {
+            PatchUpdate::from(schema.clone())
+                .set(0, id)
+                .expect("key")
+                .set(column, value)
+                .expect("value")
+        };
         let frame: Vec<u8> = Patchset::new()
-            .insert(insert(&schema, 1, "one", "first"))
-            // Carry the key and only the body; the title stays as it was.
-            .update(
-                PatchUpdate::from(schema.clone())
-                    .set(0, 1i64)
-                    .expect("key")
-                    .set(2, "updated")
-                    .expect("body"),
-            )
+            .update(update(1, 2, "updated"))
+            .update(update(3, 1, "retitled"))
+            // An update naming a key that is not stored changes nothing.
+            .update(update(99, 2, "ghost"))
             .build();
-        differential(&frame, NOTES, Some(NOTES), |_| Vec::new(), same_notes);
+        differential(&frame, NOTES, Some(NOTES), seeded_notes, same_notes);
+    }
+
+    #[test]
+    fn a_captured_changeset_matches_native() {
+        let mut source = new_conn();
+        source
+            .batch_execute(&format!("CREATE TABLE notes {NOTES}"))
+            .expect("create the source table");
+        for statement in seeded_notes("main") {
+            source.batch_execute(&statement).expect("seed the source");
+        }
+        let mut session = source.create_session().expect("a capture session");
+        session.attach_all().expect("capture every table");
+        source
+            .batch_execute(
+                "UPDATE notes SET title = 'renamed' WHERE id = 1;
+                 DELETE FROM notes WHERE id = 2;
+                 UPDATE notes SET body = 'filled' WHERE id = 3;
+                 INSERT INTO notes VALUES (4, 'four', 'fourth');",
+            )
+            .expect("change the source");
+        let frame = session.changeset().expect("the captured changeset");
+        drop(session);
+        differential(&frame, NOTES, Some(NOTES), seeded_notes, same_notes);
     }
 
     #[test]
