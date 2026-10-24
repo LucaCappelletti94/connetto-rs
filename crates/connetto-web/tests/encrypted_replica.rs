@@ -165,7 +165,7 @@ async fn a_process_without_the_key_cannot_read_the_opfs_replica() {
     let mut unkeyed = SqliteConnection::establish(name).expect("open the file with no codec");
     assert!(
         unkeyed
-            .batch_execute("SELECT count(*) FROM sqlite_schema;")
+            .batch_execute("SELECT count(*) FROM sqlite_master;")
             .is_err(),
         "no key at all must not read the replica either"
     );

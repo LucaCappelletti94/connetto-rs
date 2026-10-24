@@ -134,11 +134,11 @@ pub(crate) fn schema_columns(
         #[diesel(sql_type = diesel::sql_types::Text)]
         name: String,
     }
-    // sqlite_schema and pragma_table_info are SQLite system objects with no
+    // sqlite_master and pragma_table_info are SQLite system objects with no
     // Diesel table! schema; the schema name is determined at runtime, so the
     // typed DSL cannot express these queries.
     let tables: Vec<NameRow> = diesel::sql_query(format!(
-        "SELECT name FROM {}.sqlite_schema WHERE type = 'table' ORDER BY name",
+        "SELECT name FROM {}.sqlite_master WHERE type = 'table' ORDER BY name",
         quote_ident(schema)
     ))
     .load(db)?;
@@ -257,10 +257,10 @@ pub(crate) fn fingerprint(
 ) -> Result<String, ClientError> {
     let mut digest = Sha256::new();
     for (schema, include) in schemas {
-        // sqlite_schema is a SQLite system table with no Diesel table! schema;
+        // sqlite_master is a SQLite system table with no Diesel table! schema;
         // the schema name is determined at runtime.
         let rows: Vec<SchemaRow> = diesel::sql_query(format!(
-            "SELECT name, sql FROM {}.sqlite_schema \
+            "SELECT name, sql FROM {}.sqlite_master \
              WHERE type = 'table' AND sql IS NOT NULL ORDER BY name",
             quote_ident(schema)
         ))

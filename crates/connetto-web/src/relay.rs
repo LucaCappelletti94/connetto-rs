@@ -4377,7 +4377,7 @@ fn snapshot_patchset(
         sql: Option<String>,
     }
     let rows: Vec<SchemaRow> = sql_query(format!(
-        "SELECT name, sql FROM {schema}.sqlite_schema \
+        "SELECT name, sql FROM {schema}.sqlite_master \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
     ))
     .load(&mut *conn)?;
@@ -4425,7 +4425,7 @@ fn snapshot_patchset(
 /// `CREATE TABLE` statement, so replaying it builds the empty twin inside the
 /// attached database.
 ///
-/// `sqlite_schema` stores the original DDL text, so the name token follows
+/// `sqlite_master` stores the original DDL text, so the name token follows
 /// `CREATE TABLE` in one of the four SQLite quoting forms or bare. Returns
 /// `None` when the text does not match that shape.
 fn qualify_ddl(ddl: &str, table: &str) -> Option<String> {
