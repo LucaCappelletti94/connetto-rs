@@ -1309,7 +1309,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
- "wasm-bindgen",
+ "web-sys",
  "webbrowser",
  "windows-native-keyring-store",
  "zbus",
