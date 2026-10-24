@@ -3346,10 +3346,10 @@ fn install_storage_layout<S: ReplicaStorage>(
 ) -> Result<(), ClientError> {
     use diesel::OptionalExtension as _;
     let Some(layout) = &config.shared_layout else {
-        if let Some(ddl) = sqlite_ddl {
-            db.batch_execute(ddl)?;
-        } else if let Some(ddl) = &config.connection_ddl {
-            db.batch_execute(ddl)?;
+        // One transaction, because committing each of a replica schema's statements on its own
+        // takes seconds on the browser's OPFS storage.
+        if let Some(ddl) = sqlite_ddl.or(config.connection_ddl.as_deref()) {
+            db.transaction::<_, ClientError, _>(|db| Ok(db.batch_execute(ddl)?))?;
         }
         return Ok(());
     };
@@ -3551,7 +3551,7 @@ where
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         install_storage_layout(&mut db, replica, sqlite_ddl, config)?;
-        install_replica_schema(&mut db, config)?;
+        db.transaction(|db| install_replica_schema(db, config))?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
@@ -7671,6 +7671,34 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
         conn.set_custody(Custody::Verified);
         assert_eq!(conn.custody(), Custody::Verified);
+    }
+
+    /// A first boot whose schema fails partway leaves none of its earlier tables in the file.
+    #[test]
+    fn a_schema_failing_partway_leaves_no_table_behind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("partial.db");
+        let path_str = path.to_str().expect("path is utf-8");
+        let key = || ReplicaKey::from_bytes([0x42; ReplicaKey::LEN]);
+        let replica = Replica::encrypted_file(path_str, Some(key())).expect("replica");
+        let failing = "CREATE TABLE first (id INTEGER PRIMARY KEY);
+             CREATE TABLE first (id INTEGER PRIMARY KEY);";
+        let config = ClientConfig::new("partial-test");
+        assert!(
+            ConnettoConnection::<FakeTransport>::open(&replica, failing, &config, None).is_err(),
+            "a schema naming one table twice fails the open"
+        );
+        let mut db = SqliteConnection::establish(path_str).expect("reopen the file");
+        cipher::unlock(&mut db, &key()).expect("unlock");
+        let left = sqlite_catalog::table
+            .filter(sqlite_catalog::name.eq("first"))
+            .count()
+            .get_result::<i64>(&mut db)
+            .expect("read the catalogue");
+        assert_eq!(
+            left, 0,
+            "the first statement was rolled back with the second"
+        );
     }
 
     /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.
