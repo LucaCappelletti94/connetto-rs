@@ -594,7 +594,9 @@ impl RelayHub {
     ///
     /// `hub_meta` is the database attached for the hub's own durable state
     /// (the per-tab mutation watermarks): a sahpool-backed file name in the
-    /// DB worker, `:memory:` in tests. `local` is the device-local tier the
+    /// DB worker, derived per account at [`crate::storage::hub_meta_db_name`]
+    /// so each identity's state opens under its own key, `:memory:` in tests.
+    /// `local` is the device-local tier the
     /// hub serves alongside the worker replica, `None` when there are no
     /// local tables. Returns the handle, the pump future to spawn (it runs
     /// until the upstream session closes, the upstream fails, or every
@@ -614,7 +616,7 @@ impl RelayHub {
     ) -> Result<
         (
             Self,
-            impl Future<Output = Result<(), RelayError>>,
+            impl Future<Output = Result<(), RelayError>> + use<U>,
             UnboundedReceiver<HubNotice>,
         ),
         RelayError,
@@ -652,7 +654,7 @@ impl RelayHub {
     ) -> Result<
         (
             Self,
-            impl Future<Output = Result<(), RelayError>>,
+            impl Future<Output = Result<(), RelayError>> + use<U, F, S>,
             UnboundedReceiver<HubNotice>,
         ),
         RelayError,
@@ -685,7 +687,7 @@ impl RelayHub {
     ) -> Result<
         (
             Self,
-            impl Future<Output = Result<(), RelayError>>,
+            impl Future<Output = Result<(), RelayError>> + use<U, F, S>,
             UnboundedReceiver<HubNotice>,
         ),
         RelayError,
@@ -722,7 +724,7 @@ impl RelayHub {
     ) -> Result<
         (
             Self,
-            impl Future<Output = Result<(), RelayError>>,
+            impl Future<Output = Result<(), RelayError>> + use<U, F, S>,
             UnboundedReceiver<HubNotice>,
         ),
         RelayError,
@@ -757,7 +759,7 @@ impl RelayHub {
     ) -> Result<
         (
             Self,
-            impl Future<Output = Result<(), RelayError>>,
+            impl Future<Output = Result<(), RelayError>> + use<U, F, S, CS>,
             UnboundedReceiver<HubNotice>,
         ),
         RelayError,
