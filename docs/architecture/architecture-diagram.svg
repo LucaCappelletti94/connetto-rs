@@ -455,7 +455,7 @@
       <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
       <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
       <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#C62828">R76: Windows (slice 9d) and the mesh home run (9e)</text>
-      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R74: proof 5's Windows and Linux records</text>
+      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R74: proof 5's Windows record</text>
       <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R75 to R80 not started (chapter 19)</text>
     </g>
   </g>
